@@ -28,6 +28,8 @@ export interface UpdateProgress {
  * Update Service
  * Singleton service for managing app updates
  */
+const UPDATES_DISABLED: boolean = true;
+
 export class UpdateService {
   private updateCheckInProgress = false;
   private lastCheckTime: number | null = null;
@@ -39,6 +41,15 @@ export class UpdateService {
    * @returns Promise with update information
    */
   async checkForUpdates(force = false): Promise<UpdateInfo> {
+    // meetily-fork is built from source. The updater endpoint serves upstream
+    // releases, which would replace the fork, so never offer an update.
+    if (UPDATES_DISABLED) {
+      return {
+        available: false,
+        currentVersion: await getVersion(),
+      };
+    }
+
     // Prevent concurrent update checks
     if (this.updateCheckInProgress) {
       throw new Error('Update check already in progress');
