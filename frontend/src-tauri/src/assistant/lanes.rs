@@ -118,6 +118,13 @@ struct LaneState {
     /// rewording from a contradiction.
     fast_drafts: HashMap<String, ParsedCard>,
     catchup_used: bool,
+    /// Mid-call brief edits. Each lane's next turn carries the new text;
+    /// only a primary turn (not a fork) marks it seen, because only a
+    /// primary turn continues the lane's own session.
+    brief: String,
+    brief_version: u64,
+    fast_brief_seen: u64,
+    deep_brief_seen: u64,
     live_runs: Vec<TurnHandle>,
     cfg: Option<LaneConfig>,
 }
@@ -193,6 +200,44 @@ fn turn_prompt(delta: &str, trigger: &str, extra: Option<&str>) -> String {
 fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
 }
+
+#[derive(Clone, Copy)]
+enum Lane {
+    Fast,
+    Deep,
+}
+
+/// The brief update this lane has not seen yet, if any.
+fn take_brief_update(s: &mut LaneState, lane: Lane, fork: bool) -> Option<String> {
+    let version = s.brief_version;
+    let seen = match lane {
+        Lane::Fast => &mut s.fast_brief_seen,
+        Lane::Deep => &mut s.deep_brief_seen,
+    };
+    if *seen >= version {
+        return None;
+    }
+    if !fork {
+        *seen = version;
+    }
+    Some(s.brief.clone())
+}
+
+fn with_brief_update(update: Option<String>, prompt: String) -> String {
+    match update {
+        None => prompt,
+        Some(brief) if brief.trim().is_empty() => format!(
+            "The meeting brief was cleared. Work from the transcript alone.\n\n{}",
+            prompt
+        ),
+        Some(brief) => format!(
+            "The meeting brief was updated. This replaces the earlier one:\n{}\n\n{}",
+            brief.trim(),
+            prompt
+        ),
+    }
+}
+
 
 /// Spawns one lane turn. Deltas accumulate and, once SKIP can be ruled out,
 /// parse into a card and reach `stream_cb`. The finished turn's text (or the
@@ -428,6 +473,17 @@ impl AnswerLanes {
         }
     }
 
+    pub fn set_brief(&mut self, text: String) {
+        let mut s = self.state.lock().unwrap();
+        s.brief = text;
+        s.brief_version += 1;
+    }
+
+    /// The seeded trunk the lanes forked from, for the ask lane to fork too.
+    pub fn trunk_id(&self) -> Option<String> {
+        self.state.lock().unwrap().trunk_id.clone()
+    }
+
     /// A proactive or gated trigger: both lanes fire, fast streams, deep
     /// settles.
     pub fn answer(&mut self, question: String, kind: CardKind, log: &TranscriptLog, emit: EmitFn) {
@@ -470,14 +526,14 @@ impl AnswerLanes {
         };
 
         // Fast lane. It self-gates: SKIP renders nothing at all.
-        let fast_fork = {
+        let (fast_fork, fast_brief) = {
             let mut s = self.state.lock().unwrap();
             let fork = s.fast_in_flight;
             if !fork {
                 s.fast_cursor = fast_delta_cursor;
             }
             s.fast_in_flight = true;
-            fork
+            (fork, take_brief_update(&mut *s, Lane::Fast, fork))
         };
         let fast_turn = build_turn(LaneCall {
             lane_id: fast_id,
@@ -488,7 +544,7 @@ impl AnswerLanes {
             fork: fast_fork,
             cwd: cfg.cwd.clone(),
             add_dirs: Vec::new(),
-            prompt: turn_prompt(&fast_delta_text, &question, extra),
+            prompt: with_brief_update(fast_brief, turn_prompt(&fast_delta_text, &question, extra)),
             partial: true,
         });
         let stream_emit = emit.clone();
@@ -515,14 +571,14 @@ impl AnswerLanes {
         );
 
         // Deep lane, started at the same instant. It never waits on fast.
-        let deep_fork = {
+        let (deep_fork, deep_brief) = {
             let mut s = self.state.lock().unwrap();
             let fork = s.deep_in_flight;
             if !fork {
                 s.deep_cursor = deep_delta_cursor;
             }
             s.deep_in_flight = true;
-            fork
+            (fork, take_brief_update(&mut *s, Lane::Deep, fork))
         };
         let deep_turn = build_turn(LaneCall {
             lane_id: deep_id,
@@ -533,7 +589,7 @@ impl AnswerLanes {
             fork: deep_fork,
             cwd: cfg.cwd.clone(),
             add_dirs: cfg.deep_read_dirs.clone(),
-            prompt: turn_prompt(&deep_delta_text, &question, extra),
+            prompt: with_brief_update(deep_brief, turn_prompt(&deep_delta_text, &question, extra)),
             partial: true,
         });
         let settle_state = self.state.clone();
@@ -618,11 +674,11 @@ impl AnswerLanes {
         log::info!("assistant fast-only request past guards, spawning a turn: kind={:?}", kind);
 
         let card_id = uuid::Uuid::new_v4().to_string();
-        let fast_fork = {
+        let (fast_fork, fast_brief) = {
             let mut s = self.state.lock().unwrap();
             let fork = s.fast_in_flight;
             s.fast_in_flight = true;
-            fork
+            (fork, take_brief_update(&mut *s, Lane::Fast, fork))
         };
         let turn = build_turn(LaneCall {
             lane_id: fast_id,
@@ -633,7 +689,7 @@ impl AnswerLanes {
             fork: fast_fork,
             cwd: cfg.cwd.clone(),
             add_dirs: Vec::new(),
-            prompt: body,
+            prompt: with_brief_update(fast_brief, body),
             partial: true,
         });
 
@@ -891,4 +947,61 @@ mod tests {
             "a deep SKIP must not emit a settle card, the draft stands as is"
         );
     }
+    #[tokio::test]
+    async fn brief_update_reaches_each_lane_once() {
+        let (runner, calls) = skip_runner();
+        let mut lanes = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        let log = TranscriptLog::default();
+        let emit: EmitFn = Arc::new(|_| {});
+
+        lanes.set_brief("Learn their fees".to_string());
+        lanes.answer("q1".to_string(), CardKind::Answer, &log, emit.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lanes.answer("q2".to_string(), CardKind::Answer, &log, emit);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let calls = calls.lock().unwrap();
+        for lane in ["fast-1", "deep-1"] {
+            let turns: Vec<&ClaudeTurn> = calls.iter().filter(|t| t.resume.as_deref() == Some(lane)).collect();
+            assert_eq!(turns.len(), 2);
+            assert!(turns[0].prompt.contains("The meeting brief was updated"), "{} first turn", lane);
+            assert!(turns[0].prompt.contains("Learn their fees"));
+            assert!(!turns[1].prompt.contains("Learn their fees"), "{} second turn", lane);
+        }
+    }
+
+    #[tokio::test]
+    async fn brief_update_on_a_fork_is_resent_on_the_next_primary_turn() {
+        let (runner, calls) = skip_runner();
+        let mut lanes = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        let log = TranscriptLog::default();
+        let emit: EmitFn = Arc::new(|_| {});
+
+        lanes.answer("q1".to_string(), CardKind::Answer, &log, emit.clone());
+        lanes.set_brief("Focus on maintenance".to_string());
+        lanes.answer("q2".to_string(), CardKind::Answer, &log, emit.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        lanes.answer("q3".to_string(), CardKind::Answer, &log, emit);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let calls = calls.lock().unwrap();
+        let fast: Vec<&ClaudeTurn> = calls.iter().filter(|t| t.resume.as_deref() == Some("fast-1")).collect();
+        assert_eq!(fast.len(), 3);
+        assert!(!fast[0].prompt.contains("Focus on maintenance"));
+        assert!(fast[1].fork);
+        assert!(fast[1].prompt.contains("Focus on maintenance"));
+        assert!(!fast[2].fork);
+        assert!(fast[2].prompt.contains("Focus on maintenance"), "a fork must not mark the brief as seen");
+    }
+
+    #[tokio::test]
+    async fn cleared_brief_is_announced() {
+        let (runner, calls) = skip_runner();
+        let mut lanes = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        lanes.set_brief(String::new());
+        lanes.answer("q1".to_string(), CardKind::Answer, &TranscriptLog::default(), Arc::new(|_| {}));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(calls.lock().unwrap()[0].prompt.contains("The meeting brief was cleared"));
+    }
+
 }
