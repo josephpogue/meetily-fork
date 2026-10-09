@@ -504,6 +504,13 @@ pub fn run() {
                         tauri::async_runtime::spawn(async move {
                             assistant::core::cycle_mode(&handle).await;
                         });
+                    } else if shortcut.matches(
+                        tauri_plugin_global_shortcut::Modifiers::ALT,
+                        tauri_plugin_global_shortcut::Code::KeyQ,
+                    ) {
+                        tauri::async_runtime::spawn(async move {
+                            assistant::core::refresh_asks(&handle).await;
+                        });
                     }
                 })
                 .build(),
@@ -644,7 +651,8 @@ pub fn run() {
 
             // Global hotkeys for the assistant, unfocused-app included:
             // Option-A voice ask toggle, Option-E explain, Option-C catch-up,
-            // Option-M cycle mode. A failed registration (for example the
+            // Option-M cycle mode, Option-Q refresh Ask next. A failed registration
+            // (for example the
             // combo is already owned by another app) just logs and moves on;
             // every one of these actions also has a button in the panel.
             use tauri_plugin_global_shortcut::GlobalShortcutExt;
@@ -664,6 +672,10 @@ pub fn run() {
                 ("cycle mode (Option-M)", tauri_plugin_global_shortcut::Shortcut::new(
                     Some(tauri_plugin_global_shortcut::Modifiers::ALT),
                     tauri_plugin_global_shortcut::Code::KeyM,
+                )),
+                ("refresh Ask next (Option-Q)", tauri_plugin_global_shortcut::Shortcut::new(
+                    Some(tauri_plugin_global_shortcut::Modifiers::ALT),
+                    tauri_plugin_global_shortcut::Code::KeyQ,
                 )),
             ];
             for (label, shortcut) in hotkeys {
@@ -925,6 +937,8 @@ pub fn run() {
             assistant::commands::assistant_save_note,
             assistant::commands::assistant_discard_note,
             assistant::commands::assistant_set_brief,
+            assistant::commands::assistant_refresh_asks,
+            assistant::commands::assistant_dismiss_ask,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")
