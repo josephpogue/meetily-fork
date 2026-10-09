@@ -6,6 +6,7 @@
 // assistant failure never touches the recording path.
 
 pub mod card;
+pub mod ask_lane;
 pub mod ask_list;
 pub mod claude_cli;
 pub mod commands;
