@@ -1,7 +1,7 @@
 'use client';
 
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
-import { AssistantCard, AssistantStatus, AssistantVoice, AssistantNote } from '@/types';
+import { AssistantCard, AssistantStatus, AssistantVoice, AssistantNote, AssistantAsks } from '@/types';
 import { assistantService } from '@/services/assistantService';
 
 /**
@@ -24,12 +24,16 @@ const DEFAULT_STATUS: AssistantStatus = {
 
 const DEFAULT_VOICE: AssistantVoice = { state: 'off', heard: '' };
 const DEFAULT_NOTE: AssistantNote = { state: 'idle', markdown: '', error: null };
+const DEFAULT_ASKS: AssistantAsks = { state: 'idle', asks: [], forYou: [], updatedAt: null, brief: '' };
 
 interface AssistantContextType {
   status: AssistantStatus;
   cards: AssistantCard[];
   voice: AssistantVoice;
   note: AssistantNote;
+  asks: AssistantAsks;
+  refreshAsks: () => Promise<void>;
+  dismissAsk: (id: string) => Promise<void>;
   ask: (text: string) => Promise<void>;
   explain: () => Promise<void>;
   catchup: () => Promise<void>;
@@ -60,6 +64,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [cards, setCards] = useState<AssistantCard[]>([]);
   const [voice, setVoice] = useState<AssistantVoice>(DEFAULT_VOICE);
   const [note, setNote] = useState<AssistantNote>(DEFAULT_NOTE);
+  const [asks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
 
   // Initial state fetch. A missing backend command (Rust module not built yet,
   // or the assistant disabled) leaves status at its off-by-default value.
@@ -110,6 +115,11 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           setNote(next);
         });
         unsubscribers.push(unlistenNote);
+
+        const unlistenAsks = await assistantService.onAsks((next) => {
+          setAsks(next);
+        });
+        unsubscribers.push(unlistenAsks);
 
         console.log('[AssistantContext] Event listeners set up successfully');
       } catch (error) {
@@ -232,11 +242,30 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const refreshAsks = useCallback(async () => {
+    try {
+      await assistantService.refreshAsks();
+    } catch (error) {
+      console.error('[AssistantContext] assistant_refresh_asks failed:', error);
+    }
+  }, []);
+
+  const dismissAsk = useCallback(async (id: string) => {
+    try {
+      await assistantService.dismissAsk(id);
+    } catch (error) {
+      console.error('[AssistantContext] assistant_dismiss_ask failed:', error);
+    }
+  }, []);
+
   const value: AssistantContextType = {
     status,
     cards,
     voice,
     note,
+    asks,
+    refreshAsks,
+    dismissAsk,
     ask,
     explain,
     catchup,
