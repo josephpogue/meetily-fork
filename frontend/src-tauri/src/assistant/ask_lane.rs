@@ -131,6 +131,12 @@ impl AskLane {
         {
             let mut s = self.state.lock().unwrap();
             s.brief = brief;
+            // Send the opening brief explicitly on the first ask turn too.
+            // The forked trunk is seeded with it, but resumed CLI sessions do
+            // not reliably surface that seed strongly enough for topic-level
+            // coverage decisions.
+            s.brief_version = 1;
+            s.brief_sent = 0;
             s.cfg = Some(cfg.clone());
         }
         let lane_id = match trunk_id {
@@ -741,13 +747,21 @@ mod tests {
         lane.open(
             Some("trunk-1".to_string()),
             AskConfig { cwd: std::env::temp_dir(), model: "ask-model".to_string() },
-            String::new(),
+            "Learn their screening process".to_string(),
         )
         .await;
-        let calls = calls.lock().unwrap();
-        assert_eq!(calls[0].resume.as_deref(), Some("trunk-1"));
-        assert!(calls[0].fork);
-        assert_eq!(calls[0].append_system_prompt.as_deref(), Some(ASK_PROMPT));
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls[0].resume.as_deref(), Some("trunk-1"));
+            assert!(calls[0].fork);
+            assert_eq!(calls[0].append_system_prompt.as_deref(), Some(ASK_PROMPT));
+        }
         assert_eq!(lane.snapshot().state, "idle");
+
+        lane.request(&sample_log(), false);
+        settle().await;
+        let calls = calls.lock().unwrap();
+        assert!(calls[1].prompt.contains("MEETING BRIEF (updated"));
+        assert!(calls[1].prompt.contains("Learn their screening process"));
     }
 }
