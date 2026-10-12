@@ -58,7 +58,10 @@ pub fn parse(raw: &str) -> Option<RawList> {
                 out.asks.push((question, why));
             }
         } else if let Some(body) = line.strip_prefix("YOU:") {
-            let question = body.trim().to_string();
+            // A YOU line carries no reason, but the model sometimes adds one.
+            // Only the question is kept: it is shown in the panel and
+            // appended to the brief when Joseph answers it.
+            let (question, _why) = split_why(body);
             if !question.is_empty() && out.for_you.len() < MAX_FOR_YOU {
                 out.for_you.push(question);
             }
@@ -178,6 +181,19 @@ mod tests {
         let parsed = parse("- ASK: How do you screen tenants?\n- YOU: Do you need a decision today?").unwrap();
         assert_eq!(parsed.asks, vec![("How do you screen tenants?".to_string(), String::new())]);
         assert_eq!(parsed.for_you.len(), 1);
+    }
+
+    #[test]
+    fn parse_drops_a_why_from_a_you_line() {
+        let raw = "YOU: Do you want to find out if managing or selling makes more sense, or have you already leaned one way? | WHY: decides which questions to prioritize\nYOU: Is pricing in scope for this call?";
+        let parsed = parse(raw).expect("valid list");
+        assert_eq!(
+            parsed.for_you,
+            vec![
+                "Do you want to find out if managing or selling makes more sense, or have you already leaned one way?".to_string(),
+                "Is pricing in scope for this call?".to_string(),
+            ]
+        );
     }
 
     #[test]
