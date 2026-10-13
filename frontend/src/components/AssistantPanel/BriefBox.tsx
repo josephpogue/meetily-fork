@@ -11,33 +11,17 @@ import { useAssistant } from '@/contexts/AssistantContext';
  * committed only by an explicit Save (the button or Cmd+Enter), never by
  * leaving the box. An "Unsaved" marker in the header row shows whenever the
  * text differs from the saved brief, even when the box is folded.
- * The backend's copy (sent with every assistant-asks event) wins whenever it
- * changes, unless Joseph has unsaved edits: then his text stays and the
- * marker stays on.
+ * The draft and the saved baseline live in AssistantContext, so collapsing
+ * the panel or leaving the page does not lose an unsaved edit. The backend's
+ * copy (sent with every assistant-asks event) wins whenever it changes, unless
+ * Joseph has unsaved edits: then his text stays, a For-you answer appended to
+ * the brief is added to its end, and the marker stays on.
  */
 export function BriefBox() {
-  const { asks, setBrief } = useAssistant();
-  const [value, setValue] = useState(asks.brief);
-  const [saved, setSaved] = useState(asks.brief);
-  const [backendBrief, setBackendBrief] = useState(asks.brief);
+  const { briefDraft: value, setBriefDraft: setValue, briefSaved, saveBrief: save } = useAssistant();
   const [expanded, setExpanded] = useState(true);
 
-  // Take the backend's latest copy as the saved baseline; adopt it into the
-  // box only when there is nothing unsaved to lose.
-  if (asks.brief !== backendBrief) {
-    setBackendBrief(asks.brief);
-    setSaved(asks.brief);
-    if (value === saved) setValue(asks.brief);
-  }
-
-  const dirty = value !== saved;
-
-  const save = () => {
-    if (!dirty) return;
-    setBrief(value);
-    // Optimistic: set_brief outside a session may emit no event to echo it.
-    setSaved(value);
-  };
+  const dirty = value !== briefSaved;
 
   return (
     <div className="border-b border-gray-200 p-3">

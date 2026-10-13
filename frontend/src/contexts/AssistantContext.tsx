@@ -3,6 +3,7 @@
 import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
 import { AssistantCard, AssistantStatus, AssistantVoice, AssistantNote, AssistantAsks } from '@/types';
 import { assistantService } from '@/services/assistantService';
+import { reconcileBrief, type BriefState } from '@/lib/ask-next';
 
 /**
  * Live assistant state synchronized with backend.
@@ -47,6 +48,13 @@ interface AssistantContextType {
   saveNote: () => Promise<void>;
   discardNote: () => Promise<void>;
   setBrief: (text: string) => Promise<void>;
+  /** The brief box's text, kept here so it survives the box unmounting. */
+  briefDraft: string;
+  setBriefDraft: (text: string) => void;
+  /** The last brief known to be saved; the draft is unsaved while it differs. */
+  briefSaved: string;
+  /** Send the draft to the backend as the brief. No-op when nothing is unsaved. */
+  saveBrief: () => void;
 }
 
 const AssistantContext = createContext<AssistantContextType | null>(null);
@@ -65,6 +73,15 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [voice, setVoice] = useState<AssistantVoice>(DEFAULT_VOICE);
   const [note, setNote] = useState<AssistantNote>(DEFAULT_NOTE);
   const [asks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
+  const [brief, setBriefState] = useState<BriefState>({ draft: DEFAULT_ASKS.brief, saved: DEFAULT_ASKS.brief });
+  const [backendBrief, setBackendBrief] = useState(DEFAULT_ASKS.brief);
+
+  // Take the backend's latest copy of the brief as the saved baseline; the
+  // draft adopts it, or absorbs an appended For-you answer, per reconcileBrief.
+  if (asks.brief !== backendBrief) {
+    setBackendBrief(asks.brief);
+    setBriefState(reconcileBrief(brief, asks.brief));
+  }
 
   // Initial state fetch. A missing backend command (Rust module not built yet,
   // or the assistant disabled) leaves status at its off-by-default value.
@@ -242,6 +259,17 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const setBriefDraft = useCallback((text: string) => {
+    setBriefState(prev => ({ ...prev, draft: text }));
+  }, []);
+
+  const saveBrief = useCallback(() => {
+    if (brief.draft === brief.saved) return;
+    void setBrief(brief.draft);
+    // Optimistic: set_brief outside a session may emit no event to echo it.
+    setBriefState(prev => ({ ...prev, saved: brief.draft }));
+  }, [brief, setBrief]);
+
   const refreshAsks = useCallback(async () => {
     try {
       await assistantService.refreshAsks();
@@ -279,6 +307,10 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     saveNote,
     discardNote,
     setBrief,
+    briefDraft: brief.draft,
+    setBriefDraft,
+    briefSaved: brief.saved,
+    saveBrief,
   };
 
   return (
