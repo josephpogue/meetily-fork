@@ -4,12 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Goal
 
-Joseph's own build of Meetily, a private meeting assistant that records, transcribes and summarises meetings on his Mac and helps him live during the call. The fork tracks upstream Meetily closely so every upstream release can be merged in with little friction, and adds only what his own use needs on top, kept in its own modules where possible so upstream files change as little as they can. Every fork change is listed in `docs/FORK_CHANGES.md`.
+Joseph's own build of Meetily that helps him run a call while it happens, mainly as a consultant on discovery and knowledge-transfer calls. It follows the live transcript and the point of the call, taken from an optional meeting brief he can edit during the call and worked out from the conversation itself, so that when someone asks him a question a suggested answer is ready, and so that it keeps a live list of the gaps it sees and the questions he should ask to fill them, dropping each one once the call answers it. The fork stays close to upstream Meetily so every upstream release merges in cheaply, and adds only what his use needs, in its own modules where possible. Features, requirements and every change from upstream are in `docs/FORK_CHANGES.md`.
 
 ## Fork changes and upstream merges
 
 - Upstream is the `upstream` remote (Zackriya-Solutions/meetily). Merge a new release with `git fetch upstream` and a merge branch, as in PR #3.
-- Any PR that adds or changes fork behaviour also updates `docs/FORK_CHANGES.md`: what it does, the PR number, and the upstream files it touches.
+- Any PR that adds or changes fork behaviour also updates `docs/FORK_CHANGES.md`: what it does, the PR number, and the upstream files it touches. A new decision Joseph makes about this version goes under Requirements there.
 - After an upstream merge, update the upstream base version there and check that each listed change still works.
 
 ## Project Overview
