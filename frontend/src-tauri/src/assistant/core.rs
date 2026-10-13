@@ -789,6 +789,12 @@ async fn open_lanes_with(
 /// away, not defer to a possibly-stale settings row that would otherwise
 /// leave the session closed until the next stop/start cycle.
 async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
+    open_session_in(handle, force_enabled, &std::env::temp_dir()).await;
+}
+
+/// `open_session` with the folder that holds session dirs passed in, so a
+/// test can make the dir step fail without touching the process environment.
+async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, session_root: &std::path::Path) {
     log::info!("assistant: open_session entered");
     let app = { handle.0.lock().await.app.clone() };
 
@@ -810,7 +816,7 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         .ok()
         .flatten();
 
-    let (brief, cfg_ready) = {
+    let cfg_ready = {
         let mut core = handle.0.lock().await;
         core.settings = settings.clone();
         core.transcript = TranscriptLog::default();
@@ -833,10 +839,10 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         if !force_enabled.unwrap_or(settings.enabled) {
             core.enabled = false;
             core.emit_status();
-            (None, false)
+            false
         } else {
             core.enabled = true;
-            (core.pending_brief.take(), true)
+            true
         }
     };
     if !cfg_ready {
@@ -862,7 +868,7 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
     }
     let bin = bin.expect("checked above");
 
-    let session_dir = std::env::temp_dir()
+    let session_dir = session_root
         .join("meetily-assistant")
         .join(uuid::Uuid::new_v4().to_string());
     if let Err(e) = std::fs::create_dir_all(&session_dir) {
@@ -871,6 +877,10 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         core.emit_status();
         return;
     }
+
+    // Take the brief only now that the session is sure to open: an early
+    // return above leaves it pending, so the next attempt still has it.
+    let brief = handle.0.lock().await.pending_brief.take();
 
     let cfg = LaneConfig {
         cwd: session_dir,
@@ -1336,6 +1346,24 @@ mod tests {
         let handle = AssistantHandle::new();
         set_brief(&handle, "intro call".to_string()).await;
         assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("intro call"));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_fails_to_open_keeps_the_saved_brief() {
+        let handle = AssistantHandle::new();
+        set_brief(&handle, "intro call".to_string()).await;
+
+        // A file where the session root should be: whether claude is missing
+        // (probe fails) or present (dir creation fails), the open stops early.
+        let not_a_dir = std::env::temp_dir().join(format!("meetily-brief-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        open_session_in(&handle, Some(true), &not_a_dir).await;
+        std::fs::remove_file(&not_a_dir).unwrap();
+
+        let core = handle.0.lock().await;
+        assert!(!core.session_open);
+        assert_eq!(core.pending_brief.as_deref(), Some("intro call"));
+        assert_eq!(core.ask_lane.snapshot().brief, "intro call");
     }
 
     #[tokio::test]
