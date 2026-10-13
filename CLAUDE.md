@@ -2,6 +2,16 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Goal
+
+Joseph's own build of Meetily, a private meeting assistant that records, transcribes and summarises meetings on his Mac and helps him live during the call. The fork tracks upstream Meetily closely so every upstream release can be merged in with little friction, and adds only what his own use needs on top, kept in its own modules where possible so upstream files change as little as they can. Every fork change is listed in `docs/FORK_CHANGES.md`.
+
+## Fork changes and upstream merges
+
+- Upstream is the `upstream` remote (Zackriya-Solutions/meetily). Merge a new release with `git fetch upstream` and a merge branch, as in PR #3.
+- Any PR that adds or changes fork behaviour also updates `docs/FORK_CHANGES.md`: what it does, the PR number, and the upstream files it touches.
+- After an upstream merge, update the upstream base version there and check that each listed change still works.
+
 ## Project Overview
 
 **Meetily** is a privacy-first AI meeting assistant that captures, transcribes, and summarizes meetings entirely on local infrastructure. The supported application is the Tauri desktop app with a Rust core.
