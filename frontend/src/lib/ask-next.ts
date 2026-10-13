@@ -36,6 +36,7 @@ export function reconcileBrief({ draft, saved }: BriefState, next: string): Brie
   const base = saved.trimEnd();
   if (!next.startsWith(base)) return { draft, saved: next };
   const suffix = next.slice(base.length);
-  if (!suffix) return { draft, saved: next };
+  // Only a whole new line counts as an append; any other edit keeps the draft.
+  if (!suffix || (base && !suffix.startsWith('\n'))) return { draft, saved: next };
   return { draft: draft.trimEnd() + (base ? '' : '\n') + suffix, saved: next };
 }

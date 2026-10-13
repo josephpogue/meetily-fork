@@ -48,6 +48,10 @@ describe('reconcileBrief', () => {
     expect(reconcileBrief({ draft: 'A plus', saved: 'A' }, 'B')).toEqual({ draft: 'A plus', saved: 'B' });
   });
 
+  test('keeps the draft when the backend copy extends the baseline mid-line', () => {
+    expect(reconcileBrief({ draft: 'A plus', saved: 'A' }, 'AB')).toEqual({ draft: 'A plus', saved: 'AB' });
+  });
+
   test('changes nothing when the backend copy equals the baseline', () => {
     expect(reconcileBrief({ draft: 'A plus', saved: 'A' }, 'A')).toEqual({ draft: 'A plus', saved: 'A' });
   });
