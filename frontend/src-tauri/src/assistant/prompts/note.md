@@ -9,6 +9,8 @@ Joseph reads this preview and then decides whether to keep it. Nothing you write
 - If something was left open, it goes in Open questions rather than being quietly resolved.
 - Plain words, short lines. No em dashes.
 
+- The Q&A log may end with a SUGGESTED QUESTIONS STILL OPEN AT THE END section: questions the assistant suggested that nobody asked. List each under Open questions as a follow-up to ask, unless the transcript shows it was answered.
+
 ## Output contract
 
 Return exactly two sections, with these markers on their own lines.

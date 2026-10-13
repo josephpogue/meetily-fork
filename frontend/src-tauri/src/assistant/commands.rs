@@ -99,3 +99,15 @@ pub async fn assistant_set_brief(handle: State<'_, AssistantHandle>, text: Strin
     core::set_brief(handle.inner(), text).await;
     Ok(())
 }
+
+#[tauri::command]
+pub async fn assistant_refresh_asks(handle: State<'_, AssistantHandle>) -> Result<(), String> {
+    core::refresh_asks(handle.inner()).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn assistant_dismiss_ask(handle: State<'_, AssistantHandle>, id: String) -> Result<(), String> {
+    core::dismiss_ask(handle.inner(), id).await;
+    Ok(())
+}

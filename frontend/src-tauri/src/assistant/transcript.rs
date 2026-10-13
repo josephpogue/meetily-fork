@@ -114,6 +114,19 @@ impl TranscriptLog {
         }
     }
 
+    /// The still-open utterance's finalized text, labeled, or empty. Not
+    /// part of `delta_since`, which covers closed finals only: an utterance
+    /// closes when someone else speaks or after a 1.2 s gap is followed by
+    /// more speech, so the last thing said before a silence stays open.
+    pub fn open_preview(&self) -> String {
+        match &self.open {
+            Some(open) if !open.committed_text.is_empty() => {
+                format!("{}: {}", open.speaker.label(), open.committed_text)
+            }
+            _ => String::new(),
+        }
+    }
+
     fn preview_text(&self) -> String {
         let Some(open) = &self.open else {
             return String::new();
@@ -386,4 +399,16 @@ mod tests {
         let log = TranscriptLog::default();
         assert_eq!(log.open_you_preview(), "");
     }
+    #[test]
+    fn open_preview_shows_the_open_utterance_that_delta_since_does_not() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("system", "our fee is ten percent", 0.0, 1.0, false, 1));
+        assert_eq!(log.delta_since(0).0, "");
+        assert_eq!(log.open_preview(), "Them: our fee is ten percent");
+
+        log.ingest(&tu("mic", "ok", 2.0, 3.0, false, 2));
+        assert_eq!(log.delta_since(0).0, "Them: our fee is ten percent");
+        assert_eq!(log.open_preview(), "You: ok");
+    }
+
 }

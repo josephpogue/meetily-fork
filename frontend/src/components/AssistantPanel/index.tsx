@@ -12,13 +12,14 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
-import { Textarea } from '@/components/ui/textarea';
 import { ScrollArea } from '@/components/ui/scroll-area';
 import { useAssistant } from '@/contexts/AssistantContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { AssistantCard } from './AssistantCard';
 import { AskBox } from './AskBox';
 import { NoteBar } from './NoteBar';
+import { BriefBox } from './BriefBox';
+import { AskNext } from './AskNext';
 
 const MODE_ORDER = ['manual', 'gated', 'continuous'] as const;
 const MODE_LABELS: Record<(typeof MODE_ORDER)[number], string> = {
@@ -48,13 +49,11 @@ export function AssistantPanel() {
     setMode,
     explain,
     catchup,
-    setBrief,
     voiceCancel,
   } = useAssistant();
   const { isRecording } = useRecordingState();
 
   const [collapsed, setCollapsed] = useState(false);
-  const [briefValue, setBriefValue] = useState('');
 
   // Tracks whether a recording has actually run this panel's lifetime, so the
   // end-of-meeting note bar can appear after that recording stops even when
@@ -134,7 +133,6 @@ export function AssistantPanel() {
     );
   }
 
-  const showBrief = !status.sessionOpen && cards.length === 0 && note.state === 'idle';
   const actionsDisabled = !status.enabled || !status.claudeOk || !status.sessionOpen;
 
   const cycleMode = () => {
@@ -175,21 +173,11 @@ export function AssistantPanel() {
         </div>
       </div>
 
-      {/* Optional meeting brief, before a session opens */}
-      {showBrief && (
-        <div className="border-b border-gray-200 p-3">
-          <label className="mb-1 block text-xs font-medium text-gray-500">
-            Meeting brief (optional)
-          </label>
-          <Textarea
-            value={briefValue}
-            onChange={(e) => setBriefValue(e.target.value)}
-            onBlur={() => setBrief(briefValue)}
-            placeholder="What is this meeting about?"
-            className="min-h-[60px] text-sm"
-          />
-        </div>
-      )}
+      {/* Meeting brief, editable before and during the call */}
+      <BriefBox />
+
+      {/* Questions for Joseph to ask, while a session is open */}
+      <AskNext disabled={actionsDisabled} />
 
       {/* Body: empty states or card stack */}
       <div className="flex flex-1 flex-col overflow-hidden">
@@ -219,7 +207,7 @@ export function AssistantPanel() {
           <EmptyState
             icon={<Sparkles className="h-5 w-5 text-gray-400" />}
             message="No cards yet."
-            hint="Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode"
+            hint="Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode, Option-Q refresh Ask next"
           />
         ) : (
           <ScrollArea className="flex-1">

@@ -188,6 +188,21 @@ export interface AssistantNote {
   error: string | null;
 }
 
+export interface AssistantAskItem {
+  id: string;
+  question: string;
+  // Empty for a For-you item.
+  why: string;
+}
+
+export interface AssistantAsks {
+  state: 'idle' | 'thinking' | 'failed' | 'unavailable';
+  asks: AssistantAskItem[];
+  forYou: AssistantAskItem[];
+  updatedAt: number | null;
+  brief: string;
+}
+
 export interface AssistantSettings {
   enabled: boolean;
   claudePath: string;

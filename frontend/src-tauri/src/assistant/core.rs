@@ -19,6 +19,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::audio::TranscriptUpdate;
 
+use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut};
 use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, LaneConfig, Runner};
 use super::note::{self, NoteDraft, NOTE_PROMPT};
 use super::settings::{self, AssistantSettings};
@@ -85,6 +86,13 @@ pub struct AssistantCore {
     transcript: TranscriptLog,
     trigger: TriggerEngine,
     lanes: AnswerLanes,
+    /// Ask Next. Replaced with a lane on the real runner when a session opens.
+    ask_lane: AskLane,
+    /// Built once in `wire`, handed to every session's ask lane.
+    ask_hooks: AskHooks,
+    /// The brief as it stands in an open session. Edits land here and in
+    /// both lane sets; `pending_brief` is only for before a session opens.
+    brief: String,
     voice: VoiceAsk,
     /// The open You-utterance's text at the moment voice-ask's hotkey was
     /// pressed, if any. Stripped as a prefix from transcript text fed to
@@ -107,8 +115,9 @@ pub struct AssistantCore {
     mode: TriggerMode,
     listening: bool,
 
-    /// Typed in the panel before a recording starts; folded into the next
-    /// session's seed and cleared once used.
+    /// Typed in the panel while no session is open; seeds the next session
+    /// and is cleared once used. A closing session puts its brief back here,
+    /// because the panel's box still shows it.
     pending_brief: Option<String>,
 
     note_state: NoteState,
@@ -131,6 +140,9 @@ impl Default for AssistantCore {
             // Replaced with a real binary-backed runner once a session opens;
             // an empty path just fails fast if ever invoked before that.
             lanes: AnswerLanes::new(claude_runner(PathBuf::new())),
+            ask_lane: AskLane::new(claude_runner(PathBuf::new()), AskHooks::default()),
+            ask_hooks: AskHooks::default(),
+            brief: String::new(),
             voice: VoiceAsk::new(|_| {}, |_| {}),
             voice_baseline: String::new(),
             app: None,
@@ -290,6 +302,35 @@ fn make_voice_publish(app: AppHandle<Wry>) -> Arc<dyn Fn(VoiceState) + Send + Sy
 // VoiceAsk themselves.
 // ---------------------------------------------------------------------
 
+/// Ask lane hooks: every list change goes out as `assistant-asks`; a
+/// coalesced follow-up and a failure both need core, so they hop back in
+/// through a spawned task.
+fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle) -> AskHooks {
+    let rerun_handle = handle.clone();
+    let error_handle = handle;
+    AskHooks {
+        emit: Arc::new(move |out: AsksOut| {
+            if let Err(e) = app.emit("assistant-asks", &out) {
+                log::warn!("assistant: failed to emit assistant-asks: {}", e);
+            }
+        }),
+        rerun: Arc::new(move || {
+            let handle = rerun_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                rerun_asks(&handle).await;
+            });
+        }),
+        on_error: Arc::new(move |msg: String| {
+            let handle = error_handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let mut core = handle.0.lock().await;
+                core.set_last_error(Some(msg));
+                core.emit_status();
+            });
+        }),
+    }
+}
+
 pub async fn get_state(handle: &AssistantHandle) -> StatusOut {
     handle.0.lock().await.status_snapshot()
 }
@@ -300,6 +341,10 @@ pub async fn set_enabled(handle: &AssistantHandle, enabled: bool) {
         core.enabled = enabled;
         if !enabled {
             core.lanes.close();
+            core.ask_lane.close();
+            if core.session_open {
+                core.pending_brief = Some(core.brief.clone()).filter(|b| !b.trim().is_empty());
+            }
             core.voice.cancel();
             // Otherwise every other path (`ask`/`explain`/`catchup`,
             // the panel's own `actionsDisabled`) disagrees with reality:
@@ -376,9 +421,60 @@ pub async fn set_listening(handle: &AssistantHandle, listening: bool) {
     core.emit_status();
 }
 
+/// Before a session: held for the next one. During a session: replaces the
+/// brief everywhere at once and asks for a fresh list.
 pub async fn set_brief(handle: &AssistantHandle, text: String) {
     let mut core = handle.0.lock().await;
-    core.pending_brief = if text.trim().is_empty() { None } else { Some(text) };
+    if !core.session_open {
+        // Keep the panel's copy current before and after a recording too.
+        core.ask_lane.set_brief(text.clone());
+        core.pending_brief = if text.trim().is_empty() { None } else { Some(text) };
+        return;
+    }
+    if core.brief == text {
+        return;
+    }
+    core.brief = text.clone();
+    core.lanes.set_brief(text.clone());
+    core.ask_lane.set_brief(text);
+    if core.enabled {
+        core.ask_lane.request(&core.transcript, false);
+    }
+}
+
+/// The Refresh button and Option-Q. Runs even when nothing changed and
+/// even while triggers are paused, because Joseph asked for it.
+pub async fn refresh_asks(handle: &AssistantHandle) {
+    let mut core = handle.0.lock().await;
+    if !core.session_open {
+        drop_closed_session(&mut core, "refresh asks");
+        return;
+    }
+    if !core.enabled {
+        drop_disabled(&mut core, "refresh asks");
+        return;
+    }
+    core.ask_lane.request(&core.transcript, true);
+}
+
+/// The follow-up an ask turn fires when requests landed while it ran.
+async fn rerun_asks(handle: &AssistantHandle) {
+    let core = handle.0.lock().await;
+    if !core.session_open || !core.enabled {
+        return;
+    }
+    // The dirty flag includes manual refreshes even with no new transcript.
+    core.ask_lane.request(&core.transcript, true);
+}
+
+pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
+    let core = handle.0.lock().await;
+    if !core.ask_lane.dismiss(&id) {
+        return;
+    }
+    if core.session_open && core.enabled {
+        core.ask_lane.request(&core.transcript, false);
+    }
 }
 
 /// Surfaces "the session is not open" as a visible error rather than a
@@ -491,8 +587,19 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
         core.emit_note();
         let transcript_text = core.transcript.all();
         let qa_log_text = core.qa_log.lock().unwrap().join("\n\n");
+        let open_asks = core.ask_lane.open_asks();
+        let draft_input = if open_asks.is_empty() {
+            qa_log_text
+        } else {
+            let list = open_asks
+                .iter()
+                .map(|q| format!("- {}", q))
+                .collect::<Vec<_>>()
+                .join("\n");
+            format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", qa_log_text, list)
+        };
         core.session_transcript = transcript_text.clone();
-        (transcript_text, qa_log_text)
+        (transcript_text, draft_input)
     };
 
     let result = {
@@ -619,6 +726,11 @@ async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate
                     core.voice_baseline.clear();
                 }
                 core.trigger.consume_utterance(speaker, &text);
+                // Someone finished speaking: refresh Ask Next, unless
+                // Joseph paused the assistant from the header dot.
+                if core.listening {
+                    core.ask_lane.request(&core.transcript, false);
+                }
             }
         }
     }
@@ -627,12 +739,31 @@ async fn on_transcript_update(handle: &AssistantHandle, update: TranscriptUpdate
 /// The claude-turn part of opening a session, isolated so a test can inject
 /// a fake `Runner` and check the failure path without a real binary, a real
 /// DB, or a running Tauri app.
-async fn open_lanes_with(handle: &AssistantHandle, cfg: LaneConfig, seed: String, runner: Runner) {
+async fn open_lanes_with(
+    handle: &AssistantHandle,
+    cfg: LaneConfig,
+    seed: String,
+    brief: String,
+    runner: Runner,
+) {
     let mut core = handle.0.lock().await;
-    core.lanes = AnswerLanes::new(runner);
+    core.lanes = AnswerLanes::new(runner.clone());
     let emit = core.card_emit.clone();
     core.lanes.open(seed, &cfg, emit).await;
     core.lanes_ready = core.lanes.is_ready();
+
+    // The ask lane forks the same trunk once the answer lanes are up. Its
+    // failure leaves the answer lanes alone; it reports "unavailable".
+    let hooks = core.ask_hooks.clone();
+    core.ask_lane = AskLane::new(runner, hooks);
+    core.brief = brief.clone();
+    let trunk = core.lanes.trunk_id();
+    let ask_cfg = AskConfig {
+        cwd: cfg.cwd.clone(),
+        model: cfg.fast_model.clone(),
+    };
+    core.ask_lane.open(trunk, ask_cfg, brief).await;
+
     core.session_open = true;
     let lanes_ready = core.lanes_ready;
     core.set_last_error(if lanes_ready {
@@ -658,6 +789,12 @@ async fn open_lanes_with(handle: &AssistantHandle, cfg: LaneConfig, seed: String
 /// away, not defer to a possibly-stale settings row that would otherwise
 /// leave the session closed until the next stop/start cycle.
 async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
+    open_session_in(handle, force_enabled, &std::env::temp_dir()).await;
+}
+
+/// `open_session` with the folder that holds session dirs passed in, so a
+/// test can make the dir step fail without touching the process environment.
+async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, session_root: &std::path::Path) {
     log::info!("assistant: open_session entered");
     let app = { handle.0.lock().await.app.clone() };
 
@@ -679,7 +816,7 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         .ok()
         .flatten();
 
-    let (brief, cfg_ready) = {
+    let cfg_ready = {
         let mut core = handle.0.lock().await;
         core.settings = settings.clone();
         core.transcript = TranscriptLog::default();
@@ -702,10 +839,10 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         if !force_enabled.unwrap_or(settings.enabled) {
             core.enabled = false;
             core.emit_status();
-            (None, false)
+            false
         } else {
             core.enabled = true;
-            (core.pending_brief.take(), true)
+            true
         }
     };
     if !cfg_ready {
@@ -731,7 +868,7 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
     }
     let bin = bin.expect("checked above");
 
-    let session_dir = std::env::temp_dir()
+    let session_dir = session_root
         .join("meetily-assistant")
         .join(uuid::Uuid::new_v4().to_string());
     if let Err(e) = std::fs::create_dir_all(&session_dir) {
@@ -740,6 +877,10 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         core.emit_status();
         return;
     }
+
+    // Take the brief only now that the session is sure to open: an early
+    // return above leaves it pending, so the next attempt still has it.
+    let brief = handle.0.lock().await.pending_brief.take();
 
     let cfg = LaneConfig {
         cwd: session_dir,
@@ -762,7 +903,7 @@ async fn open_session(handle: &AssistantHandle, force_enabled: Option<bool>) {
         seed.push_str(brief);
     }
 
-    open_lanes_with(handle, cfg, seed, claude_runner(bin)).await;
+    open_lanes_with(handle, cfg, seed, brief.unwrap_or_default(), claude_runner(bin)).await;
 }
 
 /// Bound to `recording-stopped`. Leaves the transcript and Q&A log in place
@@ -774,6 +915,8 @@ async fn close_session(handle: &AssistantHandle) {
     }
     core.session_open = false;
     core.lanes.close();
+    core.ask_lane.close();
+    core.pending_brief = Some(core.brief.clone()).filter(|b| !b.trim().is_empty());
     core.emit_status();
 }
 
@@ -797,6 +940,8 @@ async fn wire(app: AppHandle<Wry>) {
         let mut core = handle.0.lock().await;
         core.app = Some(app.clone());
         core.card_emit = card_emit;
+        core.ask_hooks = make_ask_hooks(app.clone(), handle.clone());
+        core.ask_lane = AskLane::new(claude_runner(PathBuf::new()), core.ask_hooks.clone());
 
         let fire_handle = handle.clone();
         core.trigger.on_fire = Arc::new(move |question, _reason| {
@@ -1071,11 +1216,12 @@ mod tests {
             note_prompt: "note".to_string(),
         };
 
-        open_lanes_with(&handle, cfg, "seed".to_string(), failing_runner).await;
+        open_lanes_with(&handle, cfg, "seed".to_string(), String::new(), failing_runner).await;
 
         let core = handle.0.lock().await;
         assert!(!core.lanes_ready);
         assert_eq!(core.last_error.as_deref(), Some("assistant lanes failed to open"));
+        assert_eq!(core.ask_lane.snapshot().state, "unavailable");
     }
 
     /// The panel keys its transient error display on `last_error_seq`
@@ -1105,4 +1251,250 @@ mod tests {
         let after_unrelated = get_state(&handle).await.last_error_seq;
         assert_eq!(after_unrelated, after_second.last_error_seq);
     }
+    use crate::assistant::ask_lane::ASK_PROMPT;
+
+    fn test_lane_cfg() -> LaneConfig {
+        LaneConfig {
+            cwd: std::env::temp_dir(),
+            fast_model: "fast".to_string(),
+            fast_effort: "low".to_string(),
+            deep_model: "deep".to_string(),
+            deep_effort: "medium".to_string(),
+            deep_read_dirs: Vec::new(),
+            note_prompt: "note".to_string(),
+        }
+    }
+
+    /// Every turn gets a session id. Ask-lane turns (the ask system prompt,
+    /// past the fork) get a one-item list; everything else gets READY.
+    fn ask_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
+        Arc::new(move |turn, _on_delta, _register| {
+            let is_ask_turn = turn.append_system_prompt.as_deref() == Some(ASK_PROMPT)
+                && !turn.prompt.starts_with("Standing by");
+            calls.lock().unwrap().push(turn);
+            let text = if is_ask_turn {
+                "ASK: What are your fees? | WHY: budget"
+            } else {
+                "READY"
+            };
+            Box::pin(async move {
+                ClaudeOutcome {
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    text: text.to_string(),
+                    error: None,
+                }
+            })
+        })
+    }
+
+    fn ask_turns(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Vec<String> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.prompt.contains("CURRENT LIST:"))
+            .map(|t| t.prompt.clone())
+            .collect()
+    }
+
+    async fn settle() {
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test]
+    async fn utterance_close_requests_asks_only_while_listening_and_refresh_always_runs() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+
+        on_transcript_update(&handle, tu("system", "what do you need from us", 0.0, 1.0)).await;
+        on_transcript_update(&handle, tu("mic", "good question", 2.0, 3.0)).await;
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 1);
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().asks.len(), 1);
+
+        set_listening(&handle, false).await;
+        on_transcript_update(&handle, tu("system", "well it depends", 4.0, 5.0)).await;
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 1, "paused: no automatic refresh");
+
+        refresh_asks(&handle).await;
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 2, "manual refresh runs while paused");
+    }
+
+    #[tokio::test]
+    async fn set_brief_mid_call_reaches_the_ask_lane_and_requests_a_refresh() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "old goal".to_string(), ask_runner(calls.clone())).await;
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().brief, "old goal");
+
+        set_brief(&handle, "Learn their fees".to_string()).await;
+        settle().await;
+
+        let turns = ask_turns(&calls);
+        assert_eq!(turns.len(), 1);
+        assert!(turns[0].contains("Learn their fees"));
+        let core = handle.0.lock().await;
+        assert_eq!(core.brief, "Learn their fees");
+        assert_eq!(core.ask_lane.snapshot().brief, "Learn their fees");
+    }
+
+    #[tokio::test]
+    async fn set_brief_before_a_session_stays_pending() {
+        let handle = AssistantHandle::new();
+        set_brief(&handle, "intro call".to_string()).await;
+        assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("intro call"));
+    }
+
+    #[tokio::test]
+    async fn a_session_that_fails_to_open_keeps_the_saved_brief() {
+        let handle = AssistantHandle::new();
+        set_brief(&handle, "intro call".to_string()).await;
+
+        // A file where the session root should be: whether claude is missing
+        // (probe fails) or present (dir creation fails), the open stops early.
+        let not_a_dir = std::env::temp_dir().join(format!("meetily-brief-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&not_a_dir, b"x").unwrap();
+        open_session_in(&handle, Some(true), &not_a_dir).await;
+        std::fs::remove_file(&not_a_dir).unwrap();
+
+        let core = handle.0.lock().await;
+        assert!(!core.session_open);
+        assert_eq!(core.pending_brief.as_deref(), Some("intro call"));
+        assert_eq!(core.ask_lane.snapshot().brief, "intro call");
+    }
+
+    #[tokio::test]
+    async fn brief_edits_outside_a_session_update_the_visible_snapshot() {
+        let handle = AssistantHandle::new();
+        let emitted = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = emitted.clone();
+        let hooks = AskHooks {
+            emit: Arc::new(move |out| recorded.lock().unwrap().push(out)),
+            ..Default::default()
+        };
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.ask_hooks = hooks.clone();
+            core.ask_lane = AskLane::new(ask_runner(calls.clone()), hooks);
+        }
+
+        set_brief(&handle, "intro call".into()).await;
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().brief, "intro call");
+        assert_eq!(emitted.lock().unwrap().last().unwrap().brief, "intro call");
+
+        open_lanes_with(&handle, test_lane_cfg(), "seed".into(), "intro call".into(), ask_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        close_session(&handle).await;
+        set_brief(&handle, "next call".into()).await;
+        dismiss_ask(&handle, id).await;
+
+        let core = handle.0.lock().await;
+        assert_eq!(core.pending_brief.as_deref(), Some("next call"));
+        assert_eq!(core.ask_lane.snapshot().brief, "next call");
+        assert_eq!(emitted.lock().unwrap().last().unwrap().brief, "next call");
+        assert_eq!(ask_turns(&calls).len(), 1, "closed sessions must not refresh");
+    }
+
+    #[tokio::test]
+    async fn closing_the_session_carries_the_brief_into_the_next_one() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls)).await;
+        close_session(&handle).await;
+        assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"));
+    }
+
+    #[tokio::test]
+    async fn dismiss_ask_removes_the_item_and_tells_the_model() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+
+        dismiss_ask(&handle, id).await;
+        settle().await;
+
+        let turns = ask_turns(&calls);
+        assert_eq!(turns.len(), 2);
+        assert!(turns[1].contains("Joseph dismissed these"));
+        assert!(handle.0.lock().await.ask_lane.snapshot().asks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn turning_the_assistant_off_closes_the_ask_lane() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        set_enabled(&handle, false).await;
+        {
+            let core = handle.0.lock().await;
+            core.ask_lane.request(&core.transcript, true);
+        }
+        settle().await;
+        assert!(ask_turns(&calls).is_empty());
+    }
+
+    #[tokio::test]
+    async fn refresh_asks_sets_last_error_when_session_closed() {
+        let handle = AssistantHandle::new();
+        refresh_asks(&handle).await;
+        assert_eq!(
+            get_state(&handle).await.last_error.as_deref(),
+            Some("Assistant session is not open yet.")
+        );
+    }
+
+    #[tokio::test]
+    async fn manual_refresh_during_a_turn_runs_one_follow_up_without_new_transcript() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let base = ask_runner(calls.clone());
+        let runner_gate = gate.clone();
+        let runner: Runner = Arc::new(move |turn, delta, register| {
+            let is_ask = turn.prompt.contains("CURRENT LIST:");
+            let reply = base(turn, delta, register);
+            let gate = runner_gate.clone();
+            Box::pin(async move {
+                if is_ask {
+                    gate.acquire().await.unwrap().forget();
+                }
+                reply.await
+            })
+        });
+        let weak_handle = Arc::downgrade(&handle.0);
+        handle.0.lock().await.ask_hooks.rerun = Arc::new(move || {
+            if let Some(core) = weak_handle.upgrade() {
+                tokio::spawn(async move {
+                    rerun_asks(&AssistantHandle(core)).await;
+                });
+            }
+        });
+        open_lanes_with(&handle, test_lane_cfg(), "seed".into(), String::new(), runner).await;
+        set_listening(&handle, false).await;
+
+        refresh_asks(&handle).await;
+        settle().await;
+        for _ in 0..3 {
+            refresh_asks(&handle).await;
+        }
+        assert_eq!(ask_turns(&calls).len(), 1);
+
+        gate.add_permits(1);
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 2, "manual requests must not be lost");
+        gate.add_permits(1);
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 2, "requests coalesce into one follow-up");
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().state, "idle");
+    }
+
 }

@@ -54,6 +54,13 @@ impl ClaudeTurn {
             "stream-json".to_string(),
             "--verbose".to_string(),
         ];
+        // Every lane forks one trunk and passes its own --append-system-prompt.
+        // With the CLI default (on), a resumed or forked session keeps the
+        // trunk's recorded prompt and ignores the new one, so each turn turns
+        // the record off. Source: `claude --help`, --system-prompt-snapshot,
+        // CLI 2.1.296.
+        a.push("--system-prompt-snapshot".to_string());
+        a.push("off".to_string());
         if self.safe_mode {
             a.push("--safe-mode".to_string());
         }
@@ -343,6 +350,8 @@ mod tests {
             "--output-format",
             "stream-json",
             "--verbose",
+            "--system-prompt-snapshot",
+            "off",
             "--safe-mode",
             "--add-dir",
             "/tmp/a",
@@ -364,6 +373,14 @@ mod tests {
             "Bash",
         ];
         assert_eq!(a, expected);
+    }
+
+    #[test]
+    fn argv_always_turns_the_system_prompt_snapshot_off() {
+        let a = ClaudeTurn::default().argv();
+        assert!(a
+            .windows(2)
+            .any(|w| w == ["--system-prompt-snapshot", "off"]));
     }
 
     #[test]

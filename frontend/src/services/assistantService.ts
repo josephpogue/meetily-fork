@@ -14,6 +14,7 @@ import {
   AssistantStatus,
   AssistantVoice,
   AssistantNote,
+  AssistantAsks,
   AssistantSettings,
   AssistantClaudeProbe,
 } from '@/types';
@@ -81,6 +82,14 @@ export class AssistantService {
     return invoke('assistant_set_brief', { text });
   }
 
+  async refreshAsks(): Promise<void> {
+    return invoke('assistant_refresh_asks');
+  }
+
+  async dismissAsk(id: string): Promise<void> {
+    return invoke('assistant_dismiss_ask', { id });
+  }
+
   async getSettings(): Promise<AssistantSettings> {
     return invoke<AssistantSettings>('assistant_get_settings');
   }
@@ -127,6 +136,14 @@ export class AssistantService {
    */
   async onNote(callback: (note: AssistantNote) => void): Promise<UnlistenFn> {
     return listen<AssistantNote>('assistant-note', (event) => {
+      callback(event.payload);
+    });
+  }
+  /**
+   * Listen for Ask next list changes (thinking, new list, failure, brief sync)
+   */
+  async onAsks(callback: (asks: AssistantAsks) => void): Promise<UnlistenFn> {
+    return listen<AssistantAsks>('assistant-asks', (event) => {
       callback(event.payload);
     });
   }
