@@ -2,6 +2,49 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Goal
+
+Joseph's own build of Meetily that helps him run a call while it happens, mainly as a consultant on discovery and knowledge-transfer calls.
+- Follow the live transcript and the point of the call, so a suggested answer is ready when someone asks him a question.
+- Keep a live list of the gaps it sees, given the point of the call, with a question he can ask to fill each one.
+- Take the point of the call from an optional meeting brief he can edit during the call, and from the conversation itself.
+- Stay close to upstream Meetily, so every upstream release merges in cheaply, and add only what his use needs.
+
+Every difference from upstream Meetily, built or planned, is listed in `docs/FORK_CHANGES.md`.
+
+### Stories
+
+Each story is one person and one result. Check a change against them: Joseph must still get each result.
+- **Answer on the spot:** Someone on the call asks Joseph a question, and a suggested answer is on screen before he has to reply.
+- **Fill the gaps:** On a discovery or knowledge-transfer call, Joseph sees what is still unknown and a question to ask for each gap.
+- **Gaps clear themselves:** Once the call answers a gap question, it leaves the list without Joseph touching it.
+- **Point of the call:** Joseph types a brief before or during the call, or none at all, and the assistant still knows what the call is for.
+- **Ask privately:** Joseph types or speaks a question mid-call and gets an answer that uses the call so far.
+- **Catch up:** After losing the thread, Joseph presses one key and gets what was just said and what it means.
+- **Keep a record:** After the call, a note with decisions, action items and open questions goes into the vault only when Joseph saves it.
+- **Stay current:** A new Meetily release merges into the fork, and every feature in `docs/FORK_CHANGES.md` still works.
+
+### Requirements
+
+Decisions Joseph has made for this version. Every feature follows them.
+- Every model call is the local `claude` CLI on his subscription. No API keys, no paid APIs, and Meetily's own summary providers stay untouched.
+- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI.
+- The assistant informs and converses, and never acts. Nothing is written anywhere without a Save press.
+- Output is text only, with no spoken replies.
+- The app runs on macOS on Apple Silicon.
+- The app is a normal window. It is not hidden from screen share, and is never described as hidden.
+- The meeting brief is optional and editable during the call. The assistant also works out the point of the call from the conversation.
+- Gaps are the assistant's own judgment from the context it has. There is no preset question list or checklist.
+- The assistant removes a gap question once the call answers it. Joseph does not tick questions off.
+- New code lives in its own modules, and edits to upstream files stay small and are listed in `docs/FORK_CHANGES.md`.
+- Upstream releases arrive only by merging into the fork. Meetily's in-app updater stays off, because it would install plain Meetily over the fork.
+
+## Fork changes and upstream merges
+
+- Upstream is the `upstream` remote (Zackriya-Solutions/meetily). Merge a new release with `git fetch upstream` and a merge branch, as in PR #3.
+- Any PR that adds or changes fork behaviour also updates `docs/FORK_CHANGES.md`: what it does, the PR number, and the upstream files it touches. A new decision Joseph makes about this version goes under Requirements above.
+- After an upstream merge, update the upstream base version there and check that each listed change still works.
+
 ## Project Overview
 
 **Meetily** is a privacy-first AI meeting assistant that captures, transcribes, and summarizes meetings entirely on local infrastructure. The supported application is the Tauri desktop app with a Rust core.
@@ -198,6 +241,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 - **GPU**: Metal + CoreML automatically enabled
 - **Permissions**: Requires microphone + screen recording permissions
 - **System Audio**: Requires virtual audio device (BlackHole) for system capture
+- **Worktree builds without Xcode**: Full Xcode is not installed (only Command Line Tools), and the `cidre` build script needs `xcodebuild`, so a fresh worktree cannot build. Seed it from the main checkout: (1) `cp -cR <main>/target <worktree>/target` (APFS clone); (2) run cargo once, which fails on cidre and prints the new `cidre-<hash>/out/Debug` dir; (3) copy `<main>/target/debug/build/cidre-7f94277628a88da5/out/Debug` into it, put a shim `xcodebuild` (prints, exits 0) first on PATH, and build once; (4) copy `<main>/frontend/src-tauri/binaries/llama-helper-aarch64-apple-darwin` into the worktree (gitignored sidecar the tauri build requires); (5) cargo lives in `~/.cargo/bin`. Never `cargo clean` a worktree prepared this way. The real fix is reinstalling Xcode; until then even the main checkout cannot rebuild cidre after a rustc upgrade.
 
 ### Windows
 - **Audio Capture**: Uses WASAPI (Windows Audio Session API)
