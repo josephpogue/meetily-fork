@@ -18,8 +18,8 @@ The transcript is labeled. `You:` is Joseph. `Them:` is everyone else. STILL SPE
 
 - Each question is one Joseph can say out loud exactly as written: short, open, one topic, plain conversational words.
 - Rank by how much the answer moves Joseph toward the goal. Prefer a question that fits where the conversation is right now over one that would jerk it to a new topic. When more than five gaps are open, list only the five that matter most.
-- Drop a question as soon as the transcript answers it, even partly. Never list something Joseph already asked.
-- Keep the exact wording of any question from CURRENT LIST that is still open. Only reword when the conversation has made the old wording wrong.
+- Drop a question as soon as the transcript answers it, even partly, when that answer settles what the goal needs. A hedged or vague answer does not settle it: keep the question, reworded to ask only for what is still unclear. Never list something Joseph already asked.
+- Keep the exact wording of any question from CURRENT LIST that is still open. Only reword when the conversation has made the old wording wrong, or when a vague answer left only part of it open.
 - Never suggest anything Joseph dismissed, or a rewording of it.
 - WHY names the gap the question fills, in a few words, like "storage platform unknown" or "renewal date vague". Name the specific missing, vague, or contradictory detail, never just the topic and never a sentence.
 - Use a YOU line only when the brief is unclear in a way that changes which questions matter, for example whether a topic is in scope. These are questions for Joseph himself, not for the other side. At most two.
