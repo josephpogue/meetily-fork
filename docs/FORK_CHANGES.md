@@ -34,7 +34,7 @@ Bugs in upstream code fixed here. Each is a candidate to send upstream.
 - **Recording auto-started after relaunch (PR #1):** the `autoStartRecording` flag is now a short-lived timestamp in `SidebarProvider.tsx`.
 - **RUST_LOG ignored (PR #1):** `main.rs` now sets a default only when the variable is unset.
 - **Built-in mic test failed on some hardware (PR #5):** `device_detection.rs` no longer depends on the host machine.
-- **Release app needed Homebrew onnxruntime (PR #TBD):** on a build Mac with Homebrew's onnxruntime, `ort-sys` linked that dylib by absolute path, so the app died at launch on a Mac without Homebrew. `LIBONNXRUNTIME_NO_PKG_CONFIG` in `.cargo/config.toml` makes it link its bundled static build. Upstream has the same latent bug.
+- **Release app needed Homebrew onnxruntime (PR #10):** on a build Mac with Homebrew's onnxruntime, `ort-sys` linked that dylib by absolute path, so the app died at launch on a Mac without Homebrew. `LIBONNXRUNTIME_NO_PKG_CONFIG` in `.cargo/config.toml` makes it link pyke's prebuilt static build instead, so nothing extra ships in the bundle. Upstream has the same latent bug.
 
 ## Upstream files touched
 
@@ -45,7 +45,7 @@ The files most likely to conflict when merging a new upstream release.
 - **Name (PR #4):** `tauri.conf.json`, `tray.rs`, `notifications/commands.rs`, `notifications/types.rs`, `app/metadata.ts(x)`, `Logo.tsx`.
 - **Updater off (PR #4):** `services/updateService.ts`.
 - **Mic test (PR #5):** `audio/device_detection.rs`.
-- **Static onnxruntime (PR #TBD):** `frontend/src-tauri/.cargo/config.toml`.
 - **Ask next (PR #6):** `lib.rs` (Opt-Q hotkey and two commands), `types/index.ts`. Its own code is under `src-tauri/src/assistant/` and `components/AssistantPanel/`, plus `AssistantContext.tsx`, `assistantService.ts` and `lib/ask-next.ts`.
 - **See the Zoom window (PR #9):** `lib.rs` (two commands), `types/index.ts`, `database/manager.rs` (migrations tolerate a newer database, so an older fork build still opens it), `Cargo.toml` and `Cargo.lock` (`base64`). Its own code is `src-tauri/src/assistant/vision/`, the assistant lanes and prompts, `AssistantSettings.tsx`, `assistantService.ts`, and the `see_zoom_window` migration. `scripts/xcodebuild-shim/` builds cidre without full Xcode.
+- **Static onnxruntime (PR #10):** `frontend/src-tauri/.cargo/config.toml`, and a macOS note in `CLAUDE.md`.
 - **Docs (PR #2, #7):** `CLAUDE.md` trimmed, with reference sections moved into `docs/architecture.md` and `docs/common-tasks.md`.
