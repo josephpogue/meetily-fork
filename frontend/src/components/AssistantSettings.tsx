@@ -50,6 +50,7 @@ export function AssistantSettings() {
   const [saving, setSaving] = useState(false);
   const [testing, setTesting] = useState(false);
   const [probe, setProbe] = useState<AssistantClaudeProbe | null>(null);
+  const [screenAllowed, setScreenAllowed] = useState(true);
 
   const loadSettings = useCallback(async () => {
     try {
@@ -62,9 +63,32 @@ export function AssistantSettings() {
     }
   }, []);
 
+  const checkScreenPermission = useCallback(async () => {
+    try {
+      setScreenAllowed(await assistantService.screenRecordingAllowed());
+    } catch (error) {
+      console.error('[AssistantSettings] Failed to check Screen Recording permission:', error);
+    }
+  }, []);
+
   useEffect(() => {
     loadSettings();
-  }, [loadSettings]);
+    checkScreenPermission();
+    // Joseph grants the permission in System Settings, then comes back here.
+    window.addEventListener('focus', checkScreenPermission);
+    return () => window.removeEventListener('focus', checkScreenPermission);
+  }, [loadSettings, checkScreenPermission]);
+
+  const handleOpenScreenSettings = async () => {
+    try {
+      await assistantService.openScreenRecordingSettings();
+    } catch (error) {
+      console.error('[AssistantSettings] Failed to open System Settings:', error);
+      toast.error('Could not open System Settings', {
+        description: error instanceof Error ? error.message : String(error),
+      });
+    }
+  };
 
   const handleSave = async () => {
     setSaving(true);
@@ -123,6 +147,30 @@ export function AssistantSettings() {
           </div>
           <Switch checked={settings.enabled} onCheckedChange={(v) => update('enabled', v)} />
         </div>
+      </div>
+
+      <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
+        <div className="flex items-center justify-between">
+          <div>
+            <Label htmlFor="see-zoom-window" className="text-base font-semibold text-gray-900">See the Zoom window</Label>
+            <p className="text-sm text-gray-600 mt-1">
+              Sends changed pictures of the Zoom meeting window to Claude with each answer.
+            </p>
+          </div>
+          <Switch
+            id="see-zoom-window"
+            checked={settings.seeZoomWindow}
+            onCheckedChange={(v) => update('seeZoomWindow', v)}
+          />
+        </div>
+        {settings.seeZoomWindow && !screenAllowed && (
+          <div className="mt-3 flex items-center justify-between gap-3 text-sm text-amber-700">
+            <span>Allow Screen Recording in System Settings</span>
+            <Button variant="outline" size="sm" onClick={handleOpenScreenSettings}>
+              Open System Settings
+            </Button>
+          </div>
+        )}
       </div>
 
       <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm space-y-6">

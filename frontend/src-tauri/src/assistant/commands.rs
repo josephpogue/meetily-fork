@@ -111,3 +111,13 @@ pub async fn assistant_dismiss_ask(handle: State<'_, AssistantHandle>, id: Strin
     core::dismiss_ask(handle.inner(), id).await;
     Ok(())
 }
+
+#[tauri::command]
+pub async fn assistant_screen_recording_allowed() -> Result<bool, String> {
+    Ok(super::vision::permission::screen_recording_allowed())
+}
+
+#[tauri::command]
+pub async fn assistant_open_screen_recording_settings() -> Result<(), String> {
+    super::vision::permission::open_screen_recording_settings()
+}
