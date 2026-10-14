@@ -16,13 +16,14 @@
 
 use std::collections::HashMap;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 
 use super::card::{self, ParsedCard};
 use super::claude_cli::{ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS, READ_ONLY_TOOLS, WRITE_TOOLS};
 use super::transcript::{Speaker, TranscriptLog};
+use super::vision::{encode, FrameStore, ImageBlock, KeptFrame};
 
 const FAST_PROMPT: &str = include_str!("prompts/fast.md");
 const DEEP_PROMPT: &str = include_str!("prompts/deep.md");
@@ -61,6 +62,148 @@ pub fn claude_runner(binary: PathBuf) -> Runner {
             .await
         })
     })
+}
+
+/// Turns a kept frame on disk into an image block. Production is
+/// `encode::for_send`; tests inject a fake so they never touch disk.
+pub type Encoder = Arc<dyn Fn(&Path) -> Result<ImageBlock, String> + Send + Sync>;
+
+/// Which kept frames a turn wants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FrameMode {
+    /// Only the newest frame since the lane's cursor (zero or one).
+    Newest,
+    /// Every frame since the lane's cursor.
+    All,
+}
+
+/// The frame store plus the encoder the lanes use for it.
+#[derive(Clone)]
+pub struct FrameFeed {
+    store: FrameStore,
+    encode: Encoder,
+}
+
+impl FrameFeed {
+    pub fn new(store: FrameStore) -> Self {
+        Self {
+            store,
+            encode: Arc::new(|p: &Path| encode::for_send(p)),
+        }
+    }
+
+    pub fn with_encoder(store: FrameStore, encode: Encoder) -> Self {
+        Self { store, encode }
+    }
+
+    /// The frames a lane at `cursor` should send, and the new cursor value
+    /// (the newest seq at this moment). The caller moves the cursor only
+    /// for a primary turn, like the transcript cursor.
+    pub(super) fn select(&self, cursor: u64, mode: FrameMode) -> (FrameBatch, u64) {
+        let latest = self.store.latest_seq();
+        let mut frames: Vec<KeptFrame> = self
+            .store
+            .since(cursor)
+            .into_iter()
+            .filter(|f| f.seq <= latest)
+            .collect();
+        if mode == FrameMode::Newest && frames.len() > 1 {
+            frames.drain(..frames.len() - 1);
+        }
+        (self.batch(frames), latest)
+    }
+
+    fn batch(&self, frames: Vec<KeptFrame>) -> FrameBatch {
+        FrameBatch {
+            frames,
+            encode: Some(self.encode.clone()),
+        }
+    }
+}
+
+/// Frames chosen for one turn, not yet encoded. Encoding happens on a
+/// blocking thread when the turn runs, so building a turn stays instant.
+#[derive(Clone, Default)]
+pub(super) struct FrameBatch {
+    frames: Vec<KeptFrame>,
+    encode: Option<Encoder>,
+}
+
+impl FrameBatch {
+    fn none() -> Self {
+        Self::default()
+    }
+
+    /// Encodes the frames into `turn.images`. A frame that fails to encode
+    /// is skipped.
+    async fn attach(self, turn: &mut ClaudeTurn) {
+        let Some(encode) = self.encode else { return };
+        if self.frames.is_empty() {
+            return;
+        }
+        let frames = self.frames;
+        let done = tokio::task::spawn_blocking(move || {
+            let mut out = Vec::new();
+            for f in frames {
+                match encode(&f.path) {
+                    Ok(img) => out.push((frame_label(f.captured_at_ms), img)),
+                    Err(e) => log::debug!("zoom frame {} skipped: {}", f.seq, e),
+                }
+            }
+            out
+        })
+        .await
+        .unwrap_or_default();
+        for (label, img) in done {
+            turn.image_labels.push(label);
+            turn.images.push(img);
+        }
+    }
+}
+
+fn frame_label(captured_at_ms: i64) -> String {
+    use chrono::TimeZone;
+    match chrono::Local.timestamp_millis_opt(captured_at_ms).single() {
+        Some(t) => format!("Zoom window at {}:", t.format("%H:%M:%S")),
+        None => "Zoom window:".to_string(),
+    }
+}
+
+pub(super) type DeltaCb = Box<dyn FnMut(String) + Send>;
+pub(super) type RegisterCb = Box<dyn FnOnce(TurnHandle) + Send>;
+
+/// Runs a turn with its frames. When it fails and carried images, runs once
+/// more with the same prompt and no images; `on_retry` lets the caller drop
+/// whatever the failed attempt streamed. `make_cbs` supplies fresh callbacks
+/// for each attempt.
+pub(super) async fn run_with_retry(
+    runner: &Runner,
+    mut turn: ClaudeTurn,
+    batch: FrameBatch,
+    mut make_cbs: impl FnMut() -> (DeltaCb, RegisterCb),
+    mut on_retry: impl FnMut(),
+    should_retry: impl Fn() -> bool,
+) -> ClaudeOutcome {
+    batch.attach(&mut turn).await;
+    let had_images = !turn.images.is_empty();
+    let (delta, register) = make_cbs();
+    let outcome = (runner)(turn.clone(), delta, register).await;
+    if had_images {
+        if let Some(err) = &outcome.error {
+            // A turn killed by close() reports an error too; nothing may
+            // start once the session is closed.
+            if !should_retry() {
+                return outcome;
+            }
+            log::warn!("assistant turn with images failed ({}), retrying without them", err);
+            on_retry();
+            turn.images.clear();
+            turn.image_labels.clear();
+            let (delta, register) = make_cbs();
+            return (runner)(turn, delta, register).await;
+        }
+    }
+    outcome
 }
 
 #[derive(Debug, Clone)]
@@ -127,6 +270,13 @@ struct LaneState {
     deep_brief_seen: u64,
     live_runs: Vec<TurnHandle>,
     cfg: Option<LaneConfig>,
+    /// Zoom window frames, when the assistant can see the window.
+    frames: Option<FrameFeed>,
+    /// Last frame seq each lane sent (0 = none yet).
+    fast_frame_cursor: u64,
+    deep_frame_cursor: u64,
+    /// Set by `close`: no retry may start after it.
+    closed: bool,
 }
 
 pub struct AnswerLanes {
@@ -223,6 +373,30 @@ fn take_brief_update(s: &mut LaneState, lane: Lane, fork: bool) -> Option<String
     Some(s.brief.clone())
 }
 
+/// The frames this lane's next turn carries. Only a primary turn (not a
+/// fork) moves the lane's frame cursor.
+fn take_frames(s: &mut LaneState, lane: Lane, mode: FrameMode, fork: bool) -> FrameBatch {
+    let Some(feed) = s.frames.clone() else {
+        return FrameBatch::none();
+    };
+    let cursor = match lane {
+        Lane::Fast => &mut s.fast_frame_cursor,
+        Lane::Deep => &mut s.deep_frame_cursor,
+    };
+    let (batch, latest) = feed.select(*cursor, mode);
+    if !fork {
+        *cursor = latest;
+    }
+    batch
+}
+
+fn fast_frame_mode(kind: CardKind) -> FrameMode {
+    match kind {
+        CardKind::Answer | CardKind::Explain => FrameMode::Newest,
+        CardKind::Ask | CardKind::Catchup => FrameMode::All,
+    }
+}
+
 fn with_brief_update(update: Option<String>, prompt: String) -> String {
     match update {
         None => prompt,
@@ -247,32 +421,46 @@ fn spawn_turn(
     runner: Runner,
     state: Arc<Mutex<LaneState>>,
     turn: ClaudeTurn,
-    stream_cb: impl Fn(ParsedCard) + Send + 'static,
+    batch: FrameBatch,
+    stream_cb: impl Fn(ParsedCard) + Send + Sync + 'static,
     done_cb: impl FnOnce(ParsedCard) + Send + 'static,
 ) {
     tokio::spawn(async move {
         let accumulated = Arc::new(Mutex::new(String::new()));
-        let on_delta: Box<dyn FnMut(String) + Send> = {
+        let stream_cb = Arc::new(stream_cb);
+        let make_cbs = {
             let accumulated = accumulated.clone();
-            Box::new(move |chunk: String| {
-                let whole = {
-                    let mut acc = accumulated.lock().unwrap();
-                    acc.push_str(&chunk);
-                    acc.clone()
-                };
-                if card::can_decide(&whole) {
-                    stream_cb(card::parse(&whole));
-                }
-            })
-        };
-        let register: Box<dyn FnOnce(TurnHandle) + Send> = {
             let state = state.clone();
-            Box::new(move |handle: TurnHandle| {
-                state.lock().unwrap().live_runs.push(handle);
-            })
+            move || -> (DeltaCb, RegisterCb) {
+                let accumulated = accumulated.clone();
+                let stream_cb = stream_cb.clone();
+                let on_delta: DeltaCb = Box::new(move |chunk: String| {
+                    let whole = {
+                        let mut acc = accumulated.lock().unwrap();
+                        acc.push_str(&chunk);
+                        acc.clone()
+                    };
+                    if card::can_decide(&whole) {
+                        stream_cb(card::parse(&whole));
+                    }
+                });
+                let state = state.clone();
+                let register: RegisterCb = Box::new(move |handle: TurnHandle| {
+                    state.lock().unwrap().live_runs.push(handle);
+                });
+                (on_delta, register)
+            }
+        };
+        let drop_streamed = {
+            let accumulated = accumulated.clone();
+            move || accumulated.lock().unwrap().clear()
         };
 
-        let outcome = (runner)(turn, on_delta, register).await;
+        let open_state = state.clone();
+        let outcome = run_with_retry(&runner, turn, batch, make_cbs, drop_streamed, move || {
+            !open_state.lock().unwrap().closed
+        })
+        .await;
         if let Some(err) = &outcome.error {
             log::warn!("assistant lane turn failed: {}", err);
         }
@@ -464,6 +652,7 @@ impl AnswerLanes {
     pub fn close(&mut self) {
         let handles: Vec<TurnHandle> = {
             let mut s = self.state.lock().unwrap();
+            s.closed = true;
             std::mem::take(&mut s.live_runs)
         };
         for handle in handles {
@@ -477,6 +666,20 @@ impl AnswerLanes {
         let mut s = self.state.lock().unwrap();
         s.brief = text;
         s.brief_version += 1;
+    }
+
+    /// Hands the lanes the frames of the Zoom window, or None when the
+    /// assistant cannot see it. Cursors restart at 0.
+    pub fn set_frames(&mut self, feed: Option<FrameFeed>) {
+        let mut s = self.state.lock().unwrap();
+        s.frames = feed;
+        s.fast_frame_cursor = 0;
+        s.deep_frame_cursor = 0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_frames(&self) -> bool {
+        self.state.lock().unwrap().frames.is_some()
     }
 
     /// The seeded trunk the lanes forked from, for the ask lane to fork too.
@@ -526,14 +729,15 @@ impl AnswerLanes {
         };
 
         // Fast lane. It self-gates: SKIP renders nothing at all.
-        let (fast_fork, fast_brief) = {
+        let (fast_fork, fast_brief, fast_frames) = {
             let mut s = self.state.lock().unwrap();
             let fork = s.fast_in_flight;
             if !fork {
                 s.fast_cursor = fast_delta_cursor;
             }
             s.fast_in_flight = true;
-            (fork, take_brief_update(&mut *s, Lane::Fast, fork))
+            let frames = take_frames(&mut *s, Lane::Fast, fast_frame_mode(kind), fork);
+            (fork, take_brief_update(&mut *s, Lane::Fast, fork), frames)
         };
         let fast_turn = build_turn(LaneCall {
             lane_id: fast_id,
@@ -556,6 +760,7 @@ impl AnswerLanes {
             self.runner.clone(),
             self.state.clone(),
             fast_turn,
+            fast_frames,
             move |parsed: ParsedCard| {
                 present_or_update_draft(&stream_emit, &stream_card_id, kind, &stream_question, parsed);
             },
@@ -571,14 +776,15 @@ impl AnswerLanes {
         );
 
         // Deep lane, started at the same instant. It never waits on fast.
-        let (deep_fork, deep_brief) = {
+        let (deep_fork, deep_brief, deep_frames) = {
             let mut s = self.state.lock().unwrap();
             let fork = s.deep_in_flight;
             if !fork {
                 s.deep_cursor = deep_delta_cursor;
             }
             s.deep_in_flight = true;
-            (fork, take_brief_update(&mut *s, Lane::Deep, fork))
+            let frames = take_frames(&mut *s, Lane::Deep, FrameMode::All, fork);
+            (fork, take_brief_update(&mut *s, Lane::Deep, fork), frames)
         };
         let deep_turn = build_turn(LaneCall {
             lane_id: deep_id,
@@ -601,6 +807,7 @@ impl AnswerLanes {
             self.runner.clone(),
             self.state.clone(),
             deep_turn,
+            deep_frames,
             |_parsed: ParsedCard| {},
             move |parsed: ParsedCard| {
                 done_state.lock().unwrap().deep_in_flight = false;
@@ -674,11 +881,12 @@ impl AnswerLanes {
         log::info!("assistant fast-only request past guards, spawning a turn: kind={:?}", kind);
 
         let card_id = uuid::Uuid::new_v4().to_string();
-        let (fast_fork, fast_brief) = {
+        let (fast_fork, fast_brief, fast_frames) = {
             let mut s = self.state.lock().unwrap();
             let fork = s.fast_in_flight;
             s.fast_in_flight = true;
-            (fork, take_brief_update(&mut *s, Lane::Fast, fork))
+            let frames = take_frames(&mut *s, Lane::Fast, fast_frame_mode(kind), fork);
+            (fork, take_brief_update(&mut *s, Lane::Fast, fork), frames)
         };
         let turn = build_turn(LaneCall {
             lane_id: fast_id,
@@ -704,6 +912,7 @@ impl AnswerLanes {
             self.runner.clone(),
             self.state.clone(),
             turn,
+            fast_frames,
             move |parsed: ParsedCard| {
                 present_or_update_draft(&stream_emit, &stream_card_id, kind, &stream_question, parsed);
             },
@@ -745,7 +954,22 @@ impl AnswerLanes {
         let Some(cfg) = cfg else {
             return Err("assistant lanes are not configured".to_string());
         };
-        let prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
+        // The note forks the deep session, whose history already holds every
+        // frame the deep lane sent, so it gets only the frames newer than that.
+        let (batch, has_frames) = {
+            let s = self.state.lock().unwrap();
+            let cursor = s.deep_frame_cursor;
+            match s.frames.clone() {
+                Some(feed) => (feed.select(cursor, FrameMode::All).0, true),
+                None => (FrameBatch::none(), false),
+            }
+        };
+        let mut prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
+        if has_frames {
+            prompt.push_str(
+                "\n\nPictures of the Zoom window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
+            );
+        }
         let turn = build_turn(LaneCall {
             lane_id: deep_id,
             model: cfg.deep_model.clone(),
@@ -758,7 +982,25 @@ impl AnswerLanes {
             prompt,
             partial: false,
         });
-        let outcome = self.run_bare_turn(turn).await;
+        let state = self.state.clone();
+        let open_state = self.state.clone();
+        let outcome = run_with_retry(
+            &self.runner,
+            turn,
+            batch,
+            move || -> (DeltaCb, RegisterCb) {
+                let state = state.clone();
+                (
+                    Box::new(|_| {}),
+                    Box::new(move |handle| {
+                        state.lock().unwrap().live_runs.push(handle);
+                    }),
+                )
+            },
+            || {},
+            move || !open_state.lock().unwrap().closed,
+        )
+        .await;
         match outcome.error {
             Some(err) => Err(err),
             None => Ok(outcome.text),
@@ -1004,4 +1246,409 @@ mod tests {
         assert!(calls.lock().unwrap()[0].prompt.contains("The meeting brief was cleared"));
     }
 
+
+    // ---- Zoom frames ----
+
+    fn fake_encoder() -> Encoder {
+        Arc::new(|p: &Path| {
+            Ok(ImageBlock {
+                media_type: "image/jpeg".to_string(),
+                base64: p.file_name().unwrap().to_string_lossy().to_string(),
+            })
+        })
+    }
+
+    fn store_with(n: u64) -> FrameStore {
+        let store = FrameStore::new();
+        for i in 1..=n {
+            store.push(format!("/f/{}", i).into(), i as i64);
+        }
+        store
+    }
+
+    fn names(t: &ClaudeTurn) -> Vec<String> {
+        t.images.iter().map(|i| i.base64.clone()).collect()
+    }
+
+    fn batch_names(feed: &FrameFeed, cursor: u64, mode: FrameMode) -> (Vec<u64>, u64) {
+        let (b, latest) = feed.select(cursor, mode);
+        (b.frames.iter().map(|f| f.seq).collect(), latest)
+    }
+
+    fn lanes_with_frames(runner: Runner, store: &FrameStore) -> AnswerLanes {
+        let mut lanes = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        lanes.set_frames(Some(FrameFeed::with_encoder(store.clone(), fake_encoder())));
+        lanes
+    }
+
+    impl AnswerLanes {
+        fn test_frame_cursors(&self) -> (u64, u64) {
+            let s = self.state.lock().unwrap();
+            (s.fast_frame_cursor, s.deep_frame_cursor)
+        }
+    }
+
+    #[test]
+    fn frame_selection_follows_each_lanes_own_cursor() {
+        let store = store_with(3);
+        let mut lanes = AnswerLanes::for_test(skip_runner().0, "f", "d", test_cfg());
+        lanes.set_frames(Some(FrameFeed::with_encoder(store.clone(), fake_encoder())));
+        let mut s = lanes.state.lock().unwrap();
+
+        // Fast Answer at cursor 0 sends only the newest, cursor becomes 3.
+        let b = take_frames(&mut s, Lane::Fast, FrameMode::Newest, false);
+        assert_eq!(b.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![3]);
+        assert_eq!(s.fast_frame_cursor, 3);
+
+        store.push("/f/4".into(), 4);
+        store.push("/f/5".into(), 5);
+
+        // Deep (cursor 0) sends everything.
+        let b = take_frames(&mut s, Lane::Deep, FrameMode::All, false);
+        assert_eq!(b.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![1, 2, 3, 4, 5]);
+        assert_eq!(s.deep_frame_cursor, 5);
+
+        // Fast Answer again: only the newest, 5.
+        let b = take_frames(&mut s, Lane::Fast, FrameMode::Newest, false);
+        assert_eq!(b.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![5]);
+
+        // A fork sends the newest and leaves the cursor.
+        store.push("/f/6".into(), 6);
+        store.push("/f/7".into(), 7);
+        let b = take_frames(&mut s, Lane::Fast, FrameMode::Newest, true);
+        assert_eq!(b.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![7]);
+        assert_eq!(s.fast_frame_cursor, 5);
+
+        // Ask / catch-up send all since the cursor.
+        let b = take_frames(&mut s, Lane::Fast, FrameMode::All, false);
+        assert_eq!(b.frames.iter().map(|f| f.seq).collect::<Vec<_>>(), vec![6, 7]);
+        assert_eq!(s.fast_frame_cursor, 7);
+
+        // Nothing new, nothing sent.
+        let b = take_frames(&mut s, Lane::Fast, FrameMode::All, false);
+        assert!(b.frames.is_empty());
+    }
+
+    #[test]
+    fn select_modes_and_note_batch() {
+        let feed = FrameFeed::with_encoder(store_with(3), fake_encoder());
+        assert_eq!(batch_names(&feed, 0, FrameMode::Newest), (vec![3], 3));
+        assert_eq!(batch_names(&feed, 0, FrameMode::All), (vec![1, 2, 3], 3));
+        assert_eq!(batch_names(&feed, 3, FrameMode::Newest), (vec![], 3));
+    }
+
+    #[tokio::test]
+    async fn answer_sends_frames_to_each_lane_and_switch_off_sends_none() {
+        let store = store_with(3);
+        let (runner, calls) = skip_runner();
+        let mut lanes = lanes_with_frames(runner, &store);
+        let log = TranscriptLog::default();
+        let emit: EmitFn = Arc::new(|_| {});
+
+        lanes.answer("q1".to_string(), CardKind::Answer, &log, emit.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(lanes.test_frame_cursors(), (3, 3));
+        store.push("/f/4".into(), 4);
+        store.push("/f/5".into(), 5);
+        lanes.answer("q2".to_string(), CardKind::Ask, &log, emit.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        {
+            let calls = calls.lock().unwrap();
+            let fast: Vec<&ClaudeTurn> = calls.iter().filter(|t| t.resume.as_deref() == Some("fast-1")).collect();
+            let deep: Vec<&ClaudeTurn> = calls.iter().filter(|t| t.resume.as_deref() == Some("deep-1")).collect();
+            assert_eq!(names(fast[0]), vec!["3"], "suggested answer: newest only");
+            assert_eq!(names(deep[0]), vec!["1", "2", "3"]);
+            assert_eq!(names(fast[1]), vec!["4", "5"], "a direct ask: all since the cursor");
+            assert_eq!(names(deep[1]), vec!["4", "5"]);
+            assert!(fast[0].image_labels[0].starts_with("Zoom window at "));
+            assert!(fast[0].stdin_line().is_some());
+        }
+
+        // Switch off: no feed, no images, argv equals a plain turn's.
+        let (runner, calls) = skip_runner();
+        let mut off = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        off.answer("q".to_string(), CardKind::Answer, &log, emit);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let calls = calls.lock().unwrap();
+        assert!(calls.iter().all(|t| t.images.is_empty() && t.stdin_line().is_none()));
+        assert_eq!(calls[0].argv()[0..2], ["-p".to_string(), calls[0].prompt.clone()]);
+    }
+
+    #[tokio::test]
+    async fn explain_sends_newest_frame_and_catchup_sends_all() {
+        let store = store_with(3);
+        let (runner, calls) = skip_runner();
+        let mut lanes = lanes_with_frames(runner, &store);
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("system", "hello there", 0.0, 1.0, false, 1));
+        let emit: EmitFn = Arc::new(|_| {});
+        lanes.catchup(&log, emit.clone());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        store.push("/f/4".into(), 4);
+        store.push("/f/5".into(), 5);
+        lanes.catchup(&log, emit);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let calls = calls.lock().unwrap();
+        assert_eq!(names(&calls[0]), vec!["1", "2", "3"]);
+        assert_eq!(names(&calls[1]), vec!["4", "5"]);
+    }
+
+    /// Fails whenever the turn carries images, after streaming junk and with
+    /// no final text; succeeds when it carries none.
+    fn fail_with_images_runner() -> (Runner, Arc<Mutex<Vec<ClaudeTurn>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: Runner = Arc::new(move |turn, mut on_delta, _register| {
+            let failing = !turn.images.is_empty();
+            recorded.lock().unwrap().push(turn);
+            if failing {
+                on_delta("LEAD: junk from the failed try".to_string());
+            } else {
+                on_delta("LEAD: ok".to_string());
+            }
+            let outcome = ClaudeOutcome {
+                session_id: None,
+                text: String::new(),
+                error: failing.then(|| "image rejected".to_string()),
+            };
+            Box::pin(async move { outcome })
+        });
+        (runner, calls)
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_with_images_runs_once_more_without_them() {
+        let store = store_with(2);
+        let (runner, calls) = fail_with_images_runner();
+        let mut lanes = lanes_with_frames(runner, &store);
+        let emitted = Arc::new(Mutex::new(Vec::new()));
+        let e = emitted.clone();
+        let emit: EmitFn = Arc::new(move |c| e.lock().unwrap().push(c));
+        lanes.answer("q".to_string(), CardKind::Answer, &TranscriptLog::default(), emit);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+
+        let calls = calls.lock().unwrap();
+        for lane in ["fast-1", "deep-1"] {
+            let t: Vec<&ClaudeTurn> = calls.iter().filter(|t| t.resume.as_deref() == Some(lane)).collect();
+            assert_eq!(t.len(), 2, "{}: one try with images, one retry", lane);
+            assert!(!t[0].images.is_empty());
+            assert!(t[1].images.is_empty() && t[1].image_labels.is_empty());
+            assert_eq!(t[0].prompt, t[1].prompt, "same prompt");
+        }
+        assert_eq!(lanes.test_frame_cursors(), (2, 2), "the cursor stays advanced");
+        // The failed attempt's streamed text was dropped, not glued on.
+        let cards = emitted.lock().unwrap();
+        let last_checked = cards.iter().rev().find(|c| c.phase != "drafting").expect("deep settles");
+        assert_eq!(last_checked.lead, "ok");
+    }
+
+    #[tokio::test]
+    async fn a_failed_turn_without_images_is_not_retried() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async {
+                ClaudeOutcome { session_id: None, text: String::new(), error: Some("boom".into()) }
+            })
+        });
+        let mut lanes = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        lanes.answer("q".to_string(), CardKind::Answer, &TranscriptLog::default(), Arc::new(|_| {}));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(calls.lock().unwrap().len(), 2, "one per lane, no retries");
+    }
+
+    #[tokio::test]
+    async fn the_note_sends_frames_the_deep_lane_has_not_sent_and_retries_without_them() {
+        let store = store_with(3);
+        let (runner, calls) = fail_with_images_runner();
+        let mut lanes = lanes_with_frames(runner, &store);
+        // Deep never ran: the note sends every frame.
+        let out = lanes.draft_note("t".to_string(), "qa".to_string()).await;
+        assert!(out.is_ok(), "{:?}", out);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(names(&calls[0]), vec!["1", "2", "3"]);
+            assert!(calls[0].prompt.contains("sent earlier in this conversation"));
+            assert!(calls[1].images.is_empty());
+        }
+
+        // Deep has sent up to 2: the note sends only 3 and 4.
+        lanes.state.lock().unwrap().deep_frame_cursor = 2;
+        store.push("/f/4".into(), 4);
+        calls.lock().unwrap().clear();
+        let _ = lanes.draft_note("t".to_string(), "qa".to_string()).await;
+        assert_eq!(names(&calls.lock().unwrap()[0]), vec!["3", "4"]);
+
+        // Switch off: no pictures, and the prompt says nothing about them.
+        let (runner, calls) = skip_runner();
+        let mut off = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        let _ = off.draft_note("t".to_string(), "qa".to_string()).await;
+        let calls = calls.lock().unwrap();
+        assert!(calls[0].images.is_empty() && !calls[0].prompt.contains("Pictures of the Zoom"));
+    }
+
+    #[tokio::test]
+    async fn close_during_an_image_turn_starts_no_retry() {
+        let store = store_with(2);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let g = gate.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            recorded.lock().unwrap().push(turn);
+            if let Some(tx) = started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let g = g.clone();
+            Box::pin(async move {
+                g.acquire().await.unwrap().forget();
+                ClaudeOutcome { session_id: None, text: String::new(), error: Some("killed".into()) }
+            })
+        });
+        let mut lanes = lanes_with_frames(runner, &store);
+        lanes.answer("q".to_string(), CardKind::Answer, &TranscriptLog::default(), Arc::new(|_| {}));
+        started_rx.await.unwrap();
+        lanes.close();
+        gate.add_permits(10);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            calls.lock().unwrap().iter().all(|t| !t.images.is_empty()),
+            "no no-image retry after close"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_frame_that_fails_to_encode_is_skipped() {
+        let store = store_with(3);
+        let enc: Encoder = Arc::new(|p: &Path| {
+            if p.ends_with("2") {
+                Err("bad".to_string())
+            } else {
+                Ok(ImageBlock { media_type: "image/png".into(), base64: "x".into() })
+            }
+        });
+        let feed = FrameFeed::with_encoder(store, enc);
+        let mut turn = ClaudeTurn::default();
+        feed.batch(feed.store.all()).attach(&mut turn).await;
+        assert_eq!(turn.images.len(), 2);
+        assert_eq!(turn.image_labels.len(), 2);
+    }
+
+    // ---- Live speed check ----
+
+    const SPEED_CALL: &[(&str, &str)] = &[
+        ("system", "Thanks for making time today, Joseph. We wanted to walk through how the migration would roll out."),
+        ("mic", "Happy to. Before we start, can you tell me how many sites are in scope?"),
+        ("system", "Right now it is four data centers and about sixty clusters."),
+        ("mic", "Okay, and are all of them on the same version?"),
+        ("system", "Mostly. Three of the data centers are on the current release and one is two versions behind."),
+        ("mic", "That one will need an upgrade first, I would think."),
+        ("system", "Yes, that was our thinking too. The team is nervous about downtime."),
+        ("mic", "We can keep it rolling so workloads move without a stop."),
+        ("system", "That helps. Our change window is Saturday night only."),
+        ("mic", "Understood. Who signs off on the change window?"),
+        ("system", "The infrastructure director, and she wants a written plan two weeks ahead."),
+        ("mic", "I can have a draft to you by Friday."),
+        ("system", "Great. Now, on the licensing side, finance is asking about the timing."),
+        ("mic", "We can line the renewal up with the last wave."),
+        ("system", "That works for them. Another thing, the storage team wants to go first."),
+        ("mic", "Storage first is fine as long as networking is ready."),
+        ("system", "Networking says they need three weeks of lead time."),
+        ("mic", "Then we start storage in week four."),
+        ("system", "Okay. One more thing before we wrap this section."),
+        ("system", "Joseph, can you walk us through the wave plan, which sites go in which wave and how long each wave takes?"),
+    ];
+
+    /// Milliseconds from firing `answer` to the first drafting card, with the
+    /// default settings' models, a fresh session each run.
+    async fn speed_run(with_frame: bool, image: &Path) -> Result<u128, String> {
+        let settings = crate::assistant::AssistantSettings::default();
+        let bin = crate::assistant::settings::resolve_claude_binary(&settings).ok_or("claude binary not found")?;
+        let cwd = std::env::temp_dir().join(format!("meetily-speed-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).map_err(|e| e.to_string())?;
+        let cfg = LaneConfig {
+            cwd: cwd.clone(),
+            fast_model: settings.fast_model.clone(),
+            fast_effort: settings.fast_effort.clone(),
+            deep_model: settings.deep_model.clone(),
+            deep_effort: settings.deep_effort.clone(),
+            deep_read_dirs: Vec::new(),
+            note_prompt: "note prompt".to_string(),
+        };
+        let mut lanes = AnswerLanes::new(claude_runner(bin));
+        let store = FrameStore::new();
+        if with_frame {
+            store.push(image.to_path_buf(), now_ms());
+        }
+        // The production encoder: downscaled to 1280 wide, JPEG, as in a call.
+        lanes.set_frames(Some(FrameFeed::new(store)));
+        let noop: EmitFn = Arc::new(|_| {});
+        lanes
+            .open(
+                "Meeting: Migration planning call\nDate: 2026-10-14\n\nBrief:\nLearn the wave plan constraints and agree who signs off.".to_string(),
+                &cfg,
+                noop,
+            )
+            .await;
+        if !lanes.is_ready() {
+            return Err("lanes did not open".to_string());
+        }
+
+        let mut log = TranscriptLog::default();
+        for (n, (src, text)) in SPEED_CALL.iter().enumerate() {
+            log.ingest(&tu(src, text, n as f64 * 3.0, n as f64 * 3.0 + 2.0, false, n as u64 + 1));
+        }
+        let first: Arc<Mutex<Option<std::time::Instant>>> = Arc::new(Mutex::new(None));
+        let f = first.clone();
+        let emit: EmitFn = Arc::new(move |c| {
+            if c.phase == "drafting" {
+                f.lock().unwrap().get_or_insert_with(std::time::Instant::now);
+            }
+        });
+        let question = SPEED_CALL.last().unwrap().1.to_string();
+        let fired = std::time::Instant::now();
+        lanes.answer(question, CardKind::Answer, &log, emit);
+        let result = loop {
+            if let Some(t) = *first.lock().unwrap() {
+                break Ok(t.duration_since(fired).as_millis());
+            }
+            if fired.elapsed() > Duration::from_secs(120) {
+                break Err("no drafting card within 120 s".to_string());
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        };
+        lanes.close();
+        let _ = std::fs::remove_dir_all(&cwd);
+        result
+    }
+
+    /// Time to the first words on screen, frame off vs on. Spends real turns:
+    /// ASSISTANT_SPEED_TEST=1 and VISION_SPEED_IMAGE=<png> required.
+    #[tokio::test]
+    #[ignore]
+    async fn live_speed_with_and_without_a_frame() {
+        if std::env::var("ASSISTANT_SPEED_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skipping live_speed_with_and_without_a_frame: set ASSISTANT_SPEED_TEST=1 to run");
+            return;
+        }
+        let image = PathBuf::from(std::env::var("VISION_SPEED_IMAGE").expect("set VISION_SPEED_IMAGE to an image file"));
+        let (mut off, mut on) = (Vec::new(), Vec::new());
+        for run in 0..10 {
+            let with_frame = run % 2 == 1;
+            let ms = speed_run(with_frame, &image).await.expect("speed run");
+            println!("run {:2} {:>9}: {} ms to first drafting card", run / 2 + 1, if with_frame { "frame ON" } else { "frame OFF" }, ms);
+            if with_frame { on.push(ms) } else { off.push(ms) }
+        }
+        let median = |v: &mut Vec<u128>| {
+            v.sort();
+            v[v.len() / 2]
+        };
+        println!("RESULT frame OFF median {} ms, runs {:?}", median(&mut off), off);
+        println!("RESULT frame ON  median {} ms, runs {:?}", median(&mut on), on);
+    }
 }

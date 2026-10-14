@@ -28,7 +28,8 @@ Each story is one person and one result. Check a change against them: Joseph mus
 
 Decisions Joseph has made for this version. Every feature follows them.
 - Every model call is the local `claude` CLI on his subscription. No API keys, no paid APIs, and Meetily's own summary providers stay untouched.
-- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI.
+- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI, and that path also carries pictures of the Zoom meeting window when "See the Zoom window" is on.
+- The assistant sees only the Zoom meeting window, and only while recording. It keeps a picture only when the window changes, by the /watch rule in `~/.claude/skills/watch/scripts/frames.py` (scene score above 0.20, then a 16x16 thumbnail more than 2.0 from the last kept picture). Kept pictures are saved full-size in the meeting folder.
 - The assistant informs and converses, and never acts. Nothing is written anywhere without a Save press.
 - Output is text only, with no spoken replies.
 - The app runs on macOS on Apple Silicon.
@@ -241,7 +242,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 - **GPU**: Metal + CoreML automatically enabled
 - **Permissions**: Requires microphone + screen recording permissions
 - **System Audio**: Requires virtual audio device (BlackHole) for system capture
-- **Worktree builds without Xcode**: Full Xcode is not installed (only Command Line Tools), and the `cidre` build script needs `xcodebuild`, so a fresh worktree cannot build. Seed it from the main checkout: (1) `cp -cR <main>/target <worktree>/target` (APFS clone); (2) run cargo once, which fails on cidre and prints the new `cidre-<hash>/out/Debug` dir; (3) copy `<main>/target/debug/build/cidre-7f94277628a88da5/out/Debug` into it, put a shim `xcodebuild` (prints, exits 0) first on PATH, and build once; (4) copy `<main>/frontend/src-tauri/binaries/llama-helper-aarch64-apple-darwin` into the worktree (gitignored sidecar the tauri build requires); (5) cargo lives in `~/.cargo/bin`. Never `cargo clean` a worktree prepared this way. The real fix is reinstalling Xcode; until then even the main checkout cannot rebuild cidre after a rustc upgrade.
+- **Worktree builds without Xcode**: Full Xcode is not installed (only Command Line Tools), and the `cidre` build script calls `xcodebuild` to build its pomace Objective-C libraries. `scripts/xcodebuild-shim/xcodebuild` stands in for it: it compiles each requested pomace target with clang into the folder cidre links from. Put it first on PATH for every cargo or tauri command: `PATH=$PWD/scripts/xcodebuild-shim:$HOME/.cargo/bin:$PATH`. A fresh worktree builds from cold this way (about 10 minutes). Also copy `<main>/frontend/src-tauri/binaries/*` into the worktree (gitignored sidecars the tauri build requires).
 
 ### Windows
 - **Audio Capture**: Uses WASAPI (Windows Audio Session API)

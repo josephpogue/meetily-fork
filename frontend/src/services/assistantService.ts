@@ -102,6 +102,14 @@ export class AssistantService {
     return invoke<AssistantClaudeProbe>('assistant_test_claude');
   }
 
+  async screenRecordingAllowed(): Promise<boolean> {
+    return invoke<boolean>('assistant_screen_recording_allowed');
+  }
+
+  async openScreenRecordingSettings(): Promise<void> {
+    return invoke('assistant_open_screen_recording_settings');
+  }
+
   // Event Listeners
 
   /**

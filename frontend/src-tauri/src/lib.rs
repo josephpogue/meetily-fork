@@ -939,6 +939,8 @@ pub fn run() {
             assistant::commands::assistant_set_brief,
             assistant::commands::assistant_refresh_asks,
             assistant::commands::assistant_dismiss_ask,
+            assistant::commands::assistant_screen_recording_allowed,
+            assistant::commands::assistant_open_screen_recording_settings,
         ])
         .build(tauri::generate_context!())
         .expect("error while building tauri application")

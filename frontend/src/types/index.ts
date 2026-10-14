@@ -215,6 +215,7 @@ export interface AssistantSettings {
   names: string;
   vaultRoot: string;
   deepReadDirs: string;
+  seeZoomWindow: boolean;
 }
 
 export interface AssistantClaudeProbe {

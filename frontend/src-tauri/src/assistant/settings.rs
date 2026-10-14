@@ -22,6 +22,9 @@ pub struct AssistantSettings {
     pub names: String,
     pub vault_root: String,
     pub deep_read_dirs: String,
+    /// "See the Zoom window": capture the Zoom meeting window and send
+    /// changed frames to the lanes. On by default.
+    pub see_zoom_window: bool,
 }
 
 impl Default for AssistantSettings {
@@ -38,6 +41,7 @@ impl Default for AssistantSettings {
             names: "joseph,joe".to_string(),
             vault_root: String::new(),
             deep_read_dirs: String::new(),
+            see_zoom_window: true,
         }
     }
 }
@@ -47,7 +51,7 @@ impl AssistantSettings {
         sqlx::query_as::<_, Self>(
             r#"
             SELECT enabled, claude_path, fast_model, fast_effort, deep_model, deep_effort,
-                   trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs
+                   trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs, see_zoom_window
             FROM assistant_settings WHERE id = '1'
             "#,
         )
@@ -60,8 +64,8 @@ impl AssistantSettings {
             r#"
             INSERT INTO assistant_settings (
                 id, enabled, claude_path, fast_model, fast_effort, deep_model, deep_effort,
-                trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs
-            ) VALUES ('1', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs, see_zoom_window
+            ) VALUES ('1', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             ON CONFLICT(id) DO UPDATE SET
                 enabled = excluded.enabled,
                 claude_path = excluded.claude_path,
@@ -73,7 +77,8 @@ impl AssistantSettings {
                 quiet_gap_secs = excluded.quiet_gap_secs,
                 names = excluded.names,
                 vault_root = excluded.vault_root,
-                deep_read_dirs = excluded.deep_read_dirs
+                deep_read_dirs = excluded.deep_read_dirs,
+                see_zoom_window = excluded.see_zoom_window
             "#,
         )
         .bind(self.enabled)
@@ -87,6 +92,7 @@ impl AssistantSettings {
         .bind(&self.names)
         .bind(&self.vault_root)
         .bind(&self.deep_read_dirs)
+        .bind(self.see_zoom_window)
         .execute(pool)
         .await?;
 
@@ -212,6 +218,16 @@ mod tests {
         assert!(s.enabled);
         assert_eq!(s.fast_model, "claude-sonnet-5");
         assert_eq!(s.trigger_mode, "gated");
+        assert!(s.see_zoom_window);
+    }
+
+    #[tokio::test]
+    async fn see_zoom_window_round_trips() {
+        let pool = test_pool().await;
+        let mut s = AssistantSettings::load(&pool).await.unwrap();
+        s.see_zoom_window = false;
+        s.save(&pool).await.unwrap();
+        assert!(!AssistantSettings::load(&pool).await.unwrap().see_zoom_window);
     }
 
     #[tokio::test]

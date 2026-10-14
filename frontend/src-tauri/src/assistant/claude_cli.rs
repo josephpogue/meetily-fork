@@ -6,9 +6,11 @@
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::Arc;
-use tokio::io::AsyncBufReadExt;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 use tokio::process::{Child, Command};
 use tokio::sync::Mutex as AsyncMutex;
+
+use super::vision::ImageBlock;
 
 /// Tool policy shared with the answer lanes (Task 7). The fast lane never
 /// fetches or reads anything; the deep lane reads local files and never
@@ -43,17 +45,61 @@ pub struct ClaudeTurn {
     pub safe_mode: bool,
     /// Extra directories the turn may read.
     pub add_dirs: Vec<PathBuf>,
+    /// Pictures of the Zoom window that ride inside this turn's message.
+    /// Empty means the turn is exactly what it was before: the prompt is a
+    /// positional argument and stdin is null. With images the prompt and the
+    /// pictures go in one stream-json user message on stdin.
+    pub images: Vec<ImageBlock>,
+    /// A short caption written before each image (same order as `images`),
+    /// for example "Zoom window at 10:15:02:". A missing entry means no caption.
+    pub image_labels: Vec<String>,
 }
 
 impl ClaudeTurn {
+    /// The one stdin line for a turn with images, `None` for a text-only turn.
+    pub fn stdin_line(&self) -> Option<String> {
+        if self.images.is_empty() {
+            return None;
+        }
+        let mut content = Vec::with_capacity(self.images.len() * 2 + 1);
+        for (i, img) in self.images.iter().enumerate() {
+            if let Some(label) = self.image_labels.get(i).filter(|l| !l.is_empty()) {
+                content.push(serde_json::json!({"type": "text", "text": label}));
+            }
+            content.push(serde_json::json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": img.media_type, "data": img.base64},
+            }));
+        }
+        content.push(serde_json::json!({"type": "text", "text": self.prompt}));
+        Some(
+            serde_json::json!({
+                "type": "user",
+                "message": {"role": "user", "content": content},
+            })
+            .to_string(),
+        )
+    }
+
     pub fn argv(&self) -> Vec<String> {
-        let mut a = vec![
-            "-p".to_string(),
-            self.prompt.clone(),
-            "--output-format".to_string(),
-            "stream-json".to_string(),
-            "--verbose".to_string(),
-        ];
+        let mut a = if self.images.is_empty() {
+            vec![
+                "-p".to_string(),
+                self.prompt.clone(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+            ]
+        } else {
+            vec![
+                "-p".to_string(),
+                "--input-format".to_string(),
+                "stream-json".to_string(),
+                "--output-format".to_string(),
+                "stream-json".to_string(),
+                "--verbose".to_string(),
+            ]
+        };
         // Every lane forks one trunk and passes its own --append-system-prompt.
         // With the CLI default (on), a resumed or forked session keeps the
         // trunk's recorded prompt and ignores the new one, so each turn turns
@@ -214,10 +260,15 @@ pub async fn run_turn(
     mut on_delta: impl FnMut(&str) + Send,
     register: impl FnOnce(TurnHandle),
 ) -> ClaudeOutcome {
+    let stdin_line = turn.stdin_line();
     let mut cmd = Command::new(binary);
     cmd.args(turn.argv())
         .current_dir(&turn.cwd)
-        .stdin(Stdio::null())
+        .stdin(if stdin_line.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
@@ -232,6 +283,16 @@ pub async fn run_turn(
             };
         }
     };
+
+    if let (Some(line), Some(mut stdin)) = (stdin_line, child.stdin.take()) {
+        // Written off to the side so a big picture never blocks reading the
+        // reply; dropping stdin at the end closes it, which ends the input.
+        tokio::spawn(async move {
+            let _ = stdin.write_all(line.as_bytes()).await;
+            let _ = stdin.write_all(b"\n").await;
+            let _ = stdin.shutdown().await;
+        });
+    }
 
     let stdout = child.stdout.take().expect("stdout was piped");
     let stderr = child.stderr.take().expect("stderr was piped");
@@ -381,6 +442,50 @@ mod tests {
         assert!(a
             .windows(2)
             .any(|w| w == ["--system-prompt-snapshot", "off"]));
+    }
+
+    #[test]
+    fn a_turn_with_images_sends_one_stream_json_line_on_stdin() {
+        let t = ClaudeTurn {
+            prompt: "what is the fee?".into(),
+            safe_mode: true,
+            resume: Some("r1".into()),
+            fork: true,
+            images: vec![
+                ImageBlock { media_type: "image/jpeg".into(), base64: "AAAA".into() },
+                ImageBlock { media_type: "image/png".into(), base64: "BBBB".into() },
+            ],
+            image_labels: vec!["Zoom window at 10:15:02:".into()],
+            ..Default::default()
+        };
+        let a = t.argv();
+        assert_eq!(
+            &a[..6],
+            &["-p", "--input-format", "stream-json", "--output-format", "stream-json", "--verbose"]
+        );
+        assert!(!a.contains(&"what is the fee?".to_string()), "no positional prompt");
+        assert!(a.windows(2).any(|w| w == ["--resume", "r1"]));
+        let line = t.stdin_line().expect("images produce a stdin line");
+        assert!(!line.contains('\n'), "exactly one line");
+        let v: serde_json::Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(v["type"], "user");
+        assert_eq!(v["message"]["role"], "user");
+        let c = v["message"]["content"].as_array().unwrap();
+        assert_eq!(c.len(), 4, "label, image, image (no label), prompt");
+        assert_eq!(c[0], serde_json::json!({"type":"text","text":"Zoom window at 10:15:02:"}));
+        assert_eq!(
+            c[1],
+            serde_json::json!({"type":"image","source":{"type":"base64","media_type":"image/jpeg","data":"AAAA"}})
+        );
+        assert_eq!(c[2]["source"]["media_type"], "image/png");
+        assert_eq!(c[3], serde_json::json!({"type":"text","text":"what is the fee?"}));
+    }
+
+    #[test]
+    fn a_text_only_turn_has_no_stdin_line() {
+        let t = ClaudeTurn { prompt: "hi".into(), ..Default::default() };
+        assert_eq!(t.stdin_line(), None);
+        assert_eq!(&t.argv()[..2], &["-p", "hi"]);
     }
 
     #[test]

@@ -1,0 +1,27 @@
+#!/bin/bash
+# Stand-in for xcodebuild on a Mac with only the Command Line Tools: compiles
+# each requested cidre pomace target (pomace/<t>/<t>.m) into SYMROOT/<cfg>/lib<t>.a.
+set -e
+cfg=Debug; arch=arm64; sym=""; minos=14.2; targets=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -configuration) cfg="$2"; shift;;
+    -arch) arch="$2"; shift;;
+    -target) targets+=("$2"); shift;;
+    -project|-sdk|-destination) shift;;
+    SYMROOT=*) sym="${1#SYMROOT=}";;
+    MACOSX_DEPLOYMENT_TARGET=*) minos="${1#MACOSX_DEPLOYMENT_TARGET=}";;
+  esac
+  shift
+done
+[ -z "$sym" ] && { echo "xcodebuild shim: no SYMROOT, nothing to do"; exit 0; }
+sdk="$(xcrun --show-sdk-path)"
+out="$sym/$cfg"; mkdir -p "$out"
+for t in "${targets[@]}"; do
+  src="./pomace/$t/$t.m"
+  [ -f "$src" ] || { echo "xcodebuild shim: missing $src" >&2; exit 1; }
+  /usr/bin/clang -c "$src" -o "$out/$t.o" -fobjc-arc -fmodules -fobjc-weak -arch "$arch" \
+    -isysroot "$sdk" -mmacosx-version-min="$minos" -O1 -I./pomace
+  rm -f "$out/lib$t.a"; /usr/bin/ar rcs "$out/lib$t.a" "$out/$t.o"
+  echo "xcodebuild shim: built lib$t.a"
+done
