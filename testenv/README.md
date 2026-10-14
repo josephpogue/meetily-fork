@@ -47,7 +47,7 @@ Every Meetily run makes these first three checks:
 2. **You and Them:** during a recording, `you.wav` played into the fake microphone shows up as a You line, and `them.wav` played as call audio shows up as a Them line, each with its words.
 3. **Zoom window seen:** with the stand-in open during a recording, pictures appear in the meeting folder's `zoom-frames/`.
 
-The test Mac has a Claude stand-in at `/Users/admin/.local/bin/claude`, the way it has a Zoom stand-in. It lets the assistant session open during a recording, but every answer it gives is canned: no cards, no gap questions, and a fixed placeholder note. Assistant answers are not tested in the test Mac, because real ones need Joseph's Claude login inside it and the app under test could read it. Skip the user stories that judge what Claude says.
+The test Mac has a Claude stand-in at `/Users/admin/.local/bin/claude`, the way it has a Zoom stand-in. It lets the assistant session open during a recording, but every answer it gives is canned: a question you type in the Ask box (`type "Ask a question" "<question>"`, then `click "Send question"`) gets one fixed reply card, nothing else makes a card, there are no gap questions, and the note is a fixed placeholder. Assistant answers are not tested in the test Mac, because real ones need Joseph's Claude login inside it and the app under test could read it. Skip the user stories that judge what Claude says.
 
 ## 7. Finish
 

@@ -7,7 +7,7 @@
 set -u
 [ "${1:-}" = "--version" ] && { echo "0.0.0 (Claude stand-in, test Mac)"; exit 0; }
 
-session="" resume="" fork=0 system="" stdin_json=0
+all="$*" input="" session="" resume="" fork=0 system="" stdin_json=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) session="${2:-}"; shift ;;
@@ -18,8 +18,9 @@ while [ $# -gt 0 ]; do
   esac
   shift
 done
-# A turn with pictures sends them as one stream-json line on stdin: read it so the app's write never hits a closed pipe.
-[ "$stdin_json" = 1 ] && cat >/dev/null
+# A turn with pictures sends them and the prompt as one stream-json line on stdin: read it (the app's write must never
+# hit a closed pipe), and keep it, because the prompt is in it. A text-only turn carries the prompt as an argument.
+[ "$stdin_json" = 1 ] && input=$(cat)
 
 if [ -z "$session" ]; then
   if [ -n "$resume" ] && [ "$fork" = 0 ]; then session="$resume"; else session=$(uuidgen | tr '[:upper:]' '[:lower:]'); fi
@@ -28,7 +29,12 @@ fi
 case "$system" in
   *"=== SLUG ==="*) text=$'=== SLUG ===\ntest-mac-canned-note\n=== NOTE ===\n## Summary\n\nCanned note from the test Mac Claude stand-in.' ;; # note.rs parse_note
   *"ASK:"*) text="NONE" ;;  # ask_list.rs parse: an empty gap list
-  *) text="SKIP" ;;         # card.rs parse: answer lanes render nothing; trunk and forks only need a session id
+  *) case "$all$input" in
+       # A question Joseph asks directly (typed or spoken) says so in its prompt (commands.rs `assistant_ask`):
+       # answer with a one-line card (card.rs parse: LEAD and a bullet), so the Ask box shows a reply.
+       *"Do not reply SKIP."*) text=$'LEAD: Canned answer from the test Mac Claude stand-in.\n- Assistant answers are not tested in the test Mac.' ;;
+       *) text="SKIP" ;;    # card.rs parse: other answer turns render nothing; trunk and forks only need a session id
+     esac ;;
 esac
 
 json() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; printf '"%s"' "$s"; }
