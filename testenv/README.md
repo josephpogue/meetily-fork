@@ -9,6 +9,7 @@ The build is not yours. You are handed the path of the built app. It comes from 
 ## 2. Start
 
 - Start a fresh test Mac: `testenv up meetily-fork --app <app path> --recipe <repo>/testenv`. It prints the test Mac's id. Write that id down and type it literally in place of `<id>` in every later command, because shell variables do not carry over between your Bash calls.
+- Give the `testenv up` Bash call a 900000 ms timeout. It can wait up to ten minutes for a free slot and two more for the test Mac to start, so the default two-minute timeout would cut it off and look like a failure.
 - Open the app in it: `testenv exec <id> -- bash /Users/admin/launch-app.sh`
 - Commands run inside the test Mac use absolute paths under `/Users/admin/`, never `~`, because your own shell expands `~` to the wrong home.
 - The app takes a moment to start. Poll `testenv exec <id> -- node /Users/admin/testenv-ui/ui.mjs read` for up to a minute until it prints the first screen. Only after that does "the app does not answer" count as a failed step.
@@ -43,7 +44,7 @@ The build is not yours. You are handed the path of the built app. It comes from 
 ## 6. The three standing checks
 
 Every Meetily run makes these first three checks:
-1. **Opens on a clean Mac:** the app launches and reaches the first screen, with no crash report and no permission prompt.
+1. **Opens on a clean Mac:** the app launches and reaches the first screen, with no crash report and no permission prompt. For the crash report, run `testenv exec <id> -- ls /Users/admin/Library/Logs/DiagnosticReports`: it must list no file whose name starts with `meetily`.
 2. **You and Them:** during a recording, `you.wav` played into the fake microphone shows up as a You line, and `them.wav` played as call audio shows up as a Them line, each with its words.
 3. **Zoom window seen:** with the stand-in open during a recording, pictures appear in the meeting folder's `zoom-frames/`.
 

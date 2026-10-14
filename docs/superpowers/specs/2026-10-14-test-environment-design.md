@@ -39,6 +39,8 @@ Images are built with Packer (free under HashiCorp's license for this use) and `
 | `testenv ls` | Lists test Macs and their age |
 | `testenv reap` | Deletes `run-*` test Macs older than two hours |
 
+As built, `bake` also takes `--recipe <dir>` (`testenv bake <app> --recipe <repo>/testenv`), and the hash leaves out `*.md` files and the `test/` folder.
+
 Rules the tool enforces:
 - **Two at most:** Apple's license allows two macOS virtual machines at once. `up` waits up to ten minutes for a free slot, then fails.
 - **Stale image:** `up` refuses to start when the app repo's `testenv/` folder no longer matches the hash on `<app>-golden`, and says to run `bake`.
@@ -53,6 +55,7 @@ A `testenv/` folder in the Meetily repo:
 
 - **`golden.pkr.hcl`:** the Packer template for the prepared image, using Cirrus's Tart plugin for Packer, in the same layered style as Cirrus's own `macos-image-templates`: their tools image is the base and this template adds one Meetily layer.
   - Installs BlackHole 2ch as the fake microphone (default input) and BlackHole 16ch as the fake speakers (default output), plus sox and switchaudio-osx. Two devices keep call audio out of the microphone.
+  - As built, the two are swapped: BlackHole 16ch is the fake microphone and BlackHole 2ch the fake speakers, so `play mic` can put an inverted copy of the clip on channels 3-4 and the app's system-audio tap hears silence (see `testenv/provision/audio.sh`).
   - Copies the Parakeet transcription model (640 MB) from Joseph's Mac into the guest's app data, so a run never downloads it.
   - Builds and installs the Zoom stand-in (below).
   - Writes the permission rows before the app has ever launched: microphone and system-audio capture for `com.meetily.ai` in the user permission database, screen recording in the system one. The base image already has SIP off, which this needs.

@@ -172,6 +172,15 @@ test('exit 64: unknown verb', async () => {
   assert.deepEqual(calls, []);
 });
 
+test('exit 64: a missing or empty argument is a usage mistake, and nothing is sent to the app', async () => {
+  for (const args of [['click'], ['click', '  '], ['type', 'Ask a question'], ['type'], ['wait'], ['wait', 'Welcome', 'soon']]) {
+    const r = await ui(args);
+    assert.equal(r.code, 64, `${args.join(' ')}: ${r.stderr}`);
+    assert.match(r.stderr, new RegExp(`usage: ui.mjs ${args[0]} `));
+  }
+  assert.deepEqual(calls, []);
+});
+
 test('read prints more than 64 KB, so the exit does not cut piped output', async () => {
   mode.bigRead = 300000;
   const r = await ui(['read']);

@@ -123,6 +123,11 @@ async function readScreen(browser) {
 
 async function run() {
   if (!['wait', 'click', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|type|read'); return 64; }
+  // A missing argument is the caller's mistake (64), not a screen that lacks the text (1).
+  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', type: 'type <field> <text>', read: 'read' };
+  const badArgs = (verb !== 'read' && !a?.trim()) || (verb === 'type' && b === undefined)
+    || (verb === 'wait' && b !== undefined && !(Number(b) > 0));
+  if (badArgs) { console.error(`usage: ui.mjs ${USAGE[verb]}`); return 64; }
   const deadline = Date.now() + secs * 1000;
   let browser;
   try {
