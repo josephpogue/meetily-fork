@@ -25,10 +25,11 @@ The tool that creates the test Macs is shared, so other Mac apps and later the R
 
 A new private repo, `josephpogue/testenv`, at `~/brain/departments/personal/projects/testenv`, with a row in the routing registry.
 It is one shell command over Tart 2.41.0 (already installed at `~/.local/opt/tart-2.41.0/`), linked into `~/.local/bin/testenv`.
+Images are built with Packer (free under HashiCorp's license for this use) and `packer-plugin-tart` (MPL-2.0), the way GitHub and Cirrus build their macOS runner images.
 
 | Command | What it does |
 |---|---|
-| `testenv bake <app>` | Clones the Cirrus `macos-sequoia-base` image, runs the app repo's `testenv/golden.sh` inside it, and saves the result as `<app>-golden`, tagged with a hash of the recipe |
+| `testenv bake <app>` | Runs `packer build` on the app repo's `testenv/golden.pkr.hcl`, which starts from the Cirrus `macos-sequoia-base` image and saves the result as `<app>-golden`, tagged with a hash of the `testenv/` folder |
 | `testenv up <app> --app <path>` | Clones `<app>-golden` into `run-<app>-<id>`, starts it headless with `--no-audio`, waits until it answers, copies the app into `/Applications`, prints the id |
 | `testenv exec <id> -- <cmd>` | Runs a command in the test Mac |
 | `testenv shot <id> <file>` | Saves a screenshot of the test Mac's screen |
@@ -40,7 +41,7 @@ It is one shell command over Tart 2.41.0 (already installed at `~/.local/opt/tar
 
 Rules the tool enforces:
 - **Two at most:** Apple's license allows two macOS virtual machines at once. `up` waits up to ten minutes for a free slot, then fails.
-- **Stale image:** `up` refuses to start when the app repo's `golden.sh` no longer matches the hash on `<app>-golden`, and says to run `bake`.
+- **Stale image:** `up` refuses to start when the app repo's `testenv/` folder no longer matches the hash on `<app>-golden`, and says to run `bake`.
 - **Two kinds of failure:** exit code 2 means the test Mac itself failed (no slot, did not start, copy failed). Any other non-zero code is passed through from the command it ran. User-mock reports exit code 2 as an environment failure, never as an app bug.
 - **Cleanup job:** a launchd job runs `testenv reap` every 15 minutes and reports through `runlog`.
 
@@ -50,7 +51,7 @@ Run output (screenshots, logs, the report) goes to `~/.cache/testenv/runs/<id>/`
 
 A `testenv/` folder in the Meetily repo:
 
-- **`golden.sh`:** the recipe for the prepared image.
+- **`golden.pkr.hcl`:** the Packer template for the prepared image, using Cirrus's Tart plugin for Packer, in the same layered style as Cirrus's own `macos-image-templates`: their tools image is the base and this template adds one Meetily layer.
   - Installs BlackHole 2ch, sox and switchaudio-osx, and makes BlackHole the default input, so the app hears a fake microphone.
   - Copies the Parakeet transcription model (640 MB) from Joseph's Mac into the guest's app data, so a run never downloads it.
   - Builds and installs the Zoom stand-in (below).
