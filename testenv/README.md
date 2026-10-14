@@ -28,8 +28,8 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 ## 4. Audio
 
-- Your voice: `testenv play <id> mic /Users/admin/clips/you.wav`. The expected words are "blue giraffe" and "seven pancakes", and they must be labelled You.
-- The other side of the call: `testenv play <id> call /Users/admin/clips/them.wav`. The expected words are "orange submarine" and "Tuesday harbor", and they must be labelled Them.
+- Your voice: `testenv play <id> mic /Users/admin/clips/you.wav`. The line must contain "giraffe" and "pancakes" and be labelled You. Wait on `giraffe`.
+- The other side of the call: `testenv play <id> call /Users/admin/clips/them.wav`. The line must contain "Submarine" and "harbor" and be labelled Them. Wait on `Submarine`.
 - Play a clip only while a recording is running, and play each clip once. You can play them back to back in either order. Then give the line about 10 seconds to show up before you call it missing.
 - How the audio gets in: the fake microphone is a 16-channel virtual device. `play mic` writes the clip on its first two channels and an inverted copy on the next two, so the app's microphone hears it, while the app's system-audio capture, which hears every program's output, gets silence. `play call` plays the clip on the 2-channel fake speakers at full level, which the app hears as Them. You do not need to do anything about this; it is why one play of each clip is enough.
 
