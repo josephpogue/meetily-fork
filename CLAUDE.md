@@ -209,6 +209,8 @@ Do not add new endpoints to `backend/app/main.py`; that FastAPI code is legacy a
 
 ## Testing and Debugging
 
+Before a PR, user-mock walks the app in a throwaway test Mac: `testenv/README.md`.
+
 ### Frontend Debugging
 
 **Enable Rust Logging**:
@@ -242,7 +244,8 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 - **GPU**: Metal + CoreML automatically enabled
 - **Permissions**: Requires microphone + screen recording permissions
 - **System Audio**: Requires virtual audio device (BlackHole) for system capture
-- **Worktree builds without Xcode**: Full Xcode is not installed (only Command Line Tools), and the `cidre` build script calls `xcodebuild` to build its pomace Objective-C libraries. `scripts/xcodebuild-shim/xcodebuild` stands in for it: it compiles each requested pomace target with clang into the folder cidre links from. Put it first on PATH for every cargo or tauri command: `PATH=$PWD/scripts/xcodebuild-shim:$HOME/.cargo/bin:$PATH`. A fresh worktree builds from cold this way (about 10 minutes). Also copy `<main>/frontend/src-tauri/binaries/*` into the worktree (gitignored sidecars the tauri build requires).
+- **Worktree builds**: Full Xcode 26.3 is installed and selected (since 2026-10-14), so the `cidre` build script's `xcodebuild` call works and a fresh worktree builds normally with `PATH=$HOME/.cargo/bin:$PATH`. Copy `<main>/frontend/src-tauri/binaries/*` into the worktree first (gitignored sidecars the tauri build requires). `scripts/xcodebuild-shim/xcodebuild` is a fallback for a Mac with only Command Line Tools: put it first on PATH and it compiles cidre's pomace targets with clang.
+- **Test Mac screen capture**: an app that captures the screen needs its bundle id pre-approved in replayd's `ScreenCaptureApprovals.plist` by `testenv/provision/tcc.sh`, or Sequoia covers the screen with "<app> is requesting to bypass the system private window picker". Meetily's entry is `com.meetily.ai`.
 - **No Homebrew libraries in the app**: `frontend/src-tauri/.cargo/config.toml` sets `LIBONNXRUNTIME_NO_PKG_CONFIG`, so onnxruntime links statically even on a Mac with Homebrew's onnxruntime. It applies only to cargo run from `frontend/src-tauri` (tauri does that), not to `cargo test` from the repo root. Check a built app with `otool -L <app>/Contents/MacOS/meetily | grep /opt/homebrew`, which must print nothing.
 
 ### Windows

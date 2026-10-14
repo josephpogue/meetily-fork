@@ -450,6 +450,12 @@ pub fn run() {
 
     let mut builder = tauri::Builder::default();
 
+    // Test Macs only (cargo feature `testenv`): embedded WebDriver for the user-mock agent.
+    #[cfg(all(feature = "testenv", target_os = "macos"))]
+    {
+        builder = builder.plugin(tauri_plugin_wdio_webdriver::init());
+    }
+
     #[cfg(any(target_os = "macos", windows, target_os = "linux"))]
     {
         builder = builder.plugin(tauri_plugin_single_instance::init(|app, args, cwd| {

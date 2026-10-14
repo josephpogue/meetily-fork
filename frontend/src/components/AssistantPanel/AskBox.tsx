@@ -67,6 +67,7 @@ export function AskBox({ disabled }: AskBoxProps) {
           onClick={handleMicClick}
           disabled={disabled || isSubmitting}
           title={isListening ? 'Stop and submit' : 'Voice ask'}
+          aria-label={isListening ? 'Stop and submit' : 'Speak a question'}
         >
           {isListening ? <Square className="h-4 w-4" /> : <Mic className="h-4 w-4" />}
         </Button>
@@ -77,6 +78,7 @@ export function AskBox({ disabled }: AskBoxProps) {
           onClick={submit}
           disabled={disabled || !value.trim()}
           title="Send"
+          aria-label="Send question"
         >
           <Send className="h-4 w-4" />
         </Button>

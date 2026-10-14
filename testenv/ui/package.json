@@ -1,0 +1,1 @@
+{ "name": "testenv-ui", "private": true, "type": "module", "dependencies": { "webdriverio": "^9" } }
