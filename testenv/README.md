@@ -17,8 +17,9 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 - Use the app with `testenv exec <id> -- node /Users/admin/testenv-ui/ui.mjs wait|click|type|read ...`
   - `wait "<text>"` waits until that text is on screen (30 seconds by default). `wait "<text>" 60` waits up to 60 seconds, for slow screens.
-  - `click "<text>"` presses the button or link with that text, or the button whose `aria-label` is that text. Exact matches come first, then ones that contain it. `wait` and `type` match the same way.
-  - `type "<field>" "<text>"` types into the field with that name or placeholder.
+  - `click "<text>"` presses the element whose whole text, `aria-label` or placeholder is that text. Case and extra spaces do not matter, but part of a label does not count: `click "Start"` does not press "Get Started". Copy the label from `read`.
+  - `type "<field>" "<text>"` types into the field whose whole label or placeholder is that text, matched the same way as `click`.
+  - `wait` tries the same whole-label match first, then any text that contains yours.
   - `read` prints all the text on screen, then the labels of round icon buttons that have no text, one per line as `button: <label>`. Those lines are the buttons that look unlabeled on a screenshot but that `click` can press.
   - Start a recording with `click "Start recording"` and stop it with `click "Stop recording"`.
 - If a `ui.mjs` verb fails (the text never appears, or the app does not answer), that is a failed step, not an environment failure. Screenshot it and report what is on screen. Exit 1 means the text was not found or the app answered too slowly ("app did not answer within 15s"), exit 3 means nothing answered the WebDriver port at all (refused, reset or closed), and exit 64 means you called `ui.mjs` wrongly: fix the command, it is not an app failure.
@@ -28,11 +29,14 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 - Your voice: `testenv play <id> mic /Users/admin/clips/you.wav`. The expected words are "blue giraffe" and "seven pancakes", and they must be labelled You.
 - The other side of the call: `testenv play <id> call /Users/admin/clips/them.wav`. The expected words are "orange submarine" and "Tuesday harbor", and they must be labelled Them.
-- Play a clip only while a recording is running.
+- Play a clip only while a recording is running, and play each clip once. You can play them back to back in either order. Then give the line about 10 seconds to show up before you call it missing.
+- How the audio gets in: the fake microphone is a 16-channel virtual device. `play mic` writes the clip on its first two channels and an inverted copy on the next two, so the app's microphone hears it, while the app's system-audio capture, which hears every program's output, gets silence. `play call` plays the clip on the 2-channel fake speakers at full level, which the app hears as Them. You do not need to do anything about this; it is why one play of each clip is enough.
 
 ## 5. Zoom
 
 - Open the stand-in Zoom window: `testenv exec <id> -- open -a "Zoom Stand-in"`
+- Opening it puts Zoom in front. Bring Meetily back before you click anything: `testenv exec <id> -- open -a meetily-fork`
+- "See the Zoom window" is on by default, so you do not need to turn it on in the app's settings.
 - During a recording, run `testenv exec <id> -- bash -c 'ls /Users/admin/Movies/meetily-recordings/*/zoom-frames/ 2>/dev/null | head'`. It must list picture files.
 - The app saves the frames in `zoom-frames` inside the meeting folder (default `~/Movies/meetily-recordings/<meeting>/`). See `zoom_frames_dir` in `frontend/src-tauri/src/assistant/core.rs`. You do not read that file; this is only where the pictures land.
 
@@ -43,7 +47,7 @@ Every Meetily run makes these first three checks:
 2. **You and Them:** during a recording, `you.wav` played into the fake microphone shows up as a You line, and `them.wav` played as call audio shows up as a Them line, each with its words.
 3. **Zoom window seen:** with the stand-in open during a recording, pictures appear in the meeting folder's `zoom-frames/`.
 
-Features that call Claude (answers, gap questions, the note) are not tested in the test Mac, because that needs Joseph's Claude login inside it and the app under test could read it. Skip the user stories that need Claude.
+The test Mac has a Claude stand-in at `/Users/admin/.local/bin/claude`, the way it has a Zoom stand-in. It lets the assistant session open during a recording, but every answer it gives is canned: no cards, no gap questions, and a fixed placeholder note. Assistant answers are not tested in the test Mac, because real ones need Joseph's Claude login inside it and the app under test could read it. Skip the user stories that judge what Claude says.
 
 ## 7. Finish
 

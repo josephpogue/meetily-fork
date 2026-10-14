@@ -57,6 +57,17 @@ build {
     source      = "ui/"
     destination = "/Users/admin/testenv-ui/"
   }
+  # The Claude stand-in (see claude-standin/claude): canned answers, no login, no network.
+  provisioner "shell" {
+    inline = ["mkdir -p /Users/admin/.local/bin"]
+  }
+  provisioner "file" {
+    source      = "claude-standin/claude"
+    destination = "/Users/admin/.local/bin/claude"
+  }
+  provisioner "shell" {
+    inline = ["chmod +x /Users/admin/.local/bin/claude && /Users/admin/.local/bin/claude --version"]
+  }
   provisioner "file" {
     source      = "launch-app.sh"
     destination = "/Users/admin/launch-app.sh"
