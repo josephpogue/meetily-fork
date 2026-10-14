@@ -346,6 +346,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                 <>
                   <button
                     onClick={handleStartRecording}
+                    aria-label="Start recording"
                     className="w-10 h-10 flex items-center justify-center bg-red-500 rounded-full text-white hover:bg-red-600 transition-colors"
                   >
                     <Mic size={16} />
@@ -373,6 +374,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                   <button
                     className="w-10 h-10 flex items-center justify-center bg-gray-300 rounded-full text-white cursor-not-allowed"
                     disabled
+                    aria-label="Play recording"
                   >
                     <Play size={16} />
                   </button>
@@ -389,6 +391,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                             handleStartRecording();
                           }}
                           disabled={isStarting || isProcessing || isRecordingDisabled || isValidatingModel || isStartingRecording}
+                          aria-label="Start recording"
                           className={`w-12 h-12 flex items-center justify-center ${isStarting || isProcessing || isValidatingModel || isStartingRecording ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
                             } rounded-full text-white transition-colors relative`}
                         >
@@ -419,6 +422,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               }
                             }}
                             disabled={isPausing || isResuming || isStopping}
+                            aria-label={isPaused ? 'Resume recording' : 'Pause recording'}
                             className={`w-10 h-10 flex items-center justify-center ${isPausing || isResuming || isStopping
                               ? 'bg-gray-200 border-2 border-gray-300 text-gray-400'
                               : 'bg-white border-2 border-gray-300 text-gray-600 hover:border-gray-400 hover:bg-gray-50'
@@ -445,6 +449,7 @@ export const RecordingControls: React.FC<RecordingControlsProps> = ({
                               handleStopRecording();
                             }}
                             disabled={isStopping || isPausing || isResuming || isStartingRecording}
+                            aria-label="Stop recording"
                             className={`w-10 h-10 flex items-center justify-center ${isStopping || isPausing || isResuming || isStartingRecording ? 'bg-gray-400' : 'bg-red-500 hover:bg-red-600'
                               } rounded-full text-white transition-colors relative`}
                           >

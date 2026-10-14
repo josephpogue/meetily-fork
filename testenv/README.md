@@ -17,10 +17,11 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 - Use the app with `testenv exec <id> -- node /Users/admin/testenv-ui/ui.mjs wait|click|type|read ...`
   - `wait "<text>"` waits until that text is on screen (30 seconds by default). `wait "<text>" 60` waits up to 60 seconds, for slow screens.
-  - `click "<text>"` presses the button or link with that text.
+  - `click "<text>"` presses the button or link with that text, or the button whose `aria-label` is that text. Exact matches come first, then ones that contain it. `wait` and `type` match the same way.
   - `type "<field>" "<text>"` types into the field with that name or placeholder.
-  - `read` prints all the text on screen.
-- If a `ui.mjs` verb fails (the text never appears, or the app does not answer), that is a failed step, not an environment failure. Screenshot it and report what is on screen. Exit 1 means the text was not found or the app answered too slowly ("app did not answer within 5s"), exit 3 means nothing answered the WebDriver port at all (refused, reset or closed), and exit 64 means you called `ui.mjs` wrongly: fix the command, it is not an app failure.
+  - `read` prints all the text on screen, then the labels of round icon buttons that have no text, one per line as `button: <label>`. Those lines are the buttons that look unlabeled on a screenshot but that `click` can press.
+  - Start a recording with `click "Start recording"` and stop it with `click "Stop recording"`.
+- If a `ui.mjs` verb fails (the text never appears, or the app does not answer), that is a failed step, not an environment failure. Screenshot it and report what is on screen. Exit 1 means the text was not found or the app answered too slowly ("app did not answer within 15s"), exit 3 means nothing answered the WebDriver port at all (refused, reset or closed), and exit 64 means you called `ui.mjs` wrongly: fix the command, it is not an app failure.
 - After every step, take a screenshot: `testenv shot <id> <step-name>`
 
 ## 4. Audio

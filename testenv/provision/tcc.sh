@@ -15,6 +15,7 @@ sudo sqlite3 "$sys_db" "$(row kTCCServiceScreenCapture com.meetily.ai 0)"
 # the app capturing the screen and covers the screen with "tart-guest-agent is requesting to bypass the system private
 # window picker". Grant it by path in TCC (the symlink and the Cellar file it points at) and pre-approve it in replayd's
 # approvals file with a far-future privacy-hint date, so the one-month prompt never shows. An image for any app needs this for `shot`.
+# The approvals file is overwritten (any existing content is replaced) and replayd is restarted so it reads the new one.
 agent_link=/opt/homebrew/bin/tart-guest-agent
 agent_real=$(readlink -f "$agent_link")
 [ -x "$agent_real" ] || { echo "tcc.sh: $agent_link does not resolve to a program (got '$agent_real')" >&2; exit 1; }

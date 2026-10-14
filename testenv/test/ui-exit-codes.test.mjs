@@ -15,7 +15,7 @@ const uiSrc = path.join(here, '..', 'ui');
 const work = path.join(here, '..', 'build', 'ui-test');
 const ELEMENT = 'element-6066-11e4-a52e-4f735466cecf';
 
-let server, port, calls, bodies, mode, sessionAttempts;
+let server, port, calls, bodies, xpaths, mode, sessionAttempts;
 const SCRIPT_NOISE = 'self.__next_f.push([1,"1:HL[]"])';
 
 before(async () => {
@@ -41,22 +41,32 @@ before(async () => {
         if (mode.session === 'hang-first' && sessionAttempts === 1) return;
         if (mode.session === 'reset') return void req.socket.destroy();
         if (mode.session === 'broken') return err(500, 'session not created', 'stub says the app is unhappy');
-        return send(200, { sessionId: 's1', capabilities: {} });
+        const created = () => send(200, { sessionId: 's1', capabilities: {} });
+        return mode.sessionDelay ? void setTimeout(() => { if (!res.destroyed) created(); }, mode.sessionDelay) : created();
       }
       if (req.method === 'DELETE' && req.url === '/session/s1') return send(200, null);
       if (req.method === 'GET' && req.url === '/session/s1/window') return send(200, 'w1');
-      if (req.method === 'POST' && req.url === '/session/s1/element' && mode.elementDelay) return void setTimeout(() => { if (!res.destroyed) err(404, 'no such element', 'Unable to locate element'); }, mode.elementDelay);
+      // ui.mjs looks elements up with POST /elements (an empty list when nothing matches) and takes the first displayed one.
+      // mode.find(xpath) returns the element ids that xpath would match; without it every xpath matches e1 (or nothing).
+      if (req.method === 'POST' && req.url === '/session/s1/elements') {
+        const xpath = JSON.parse(body).value;
+        xpaths.push(xpath);
+        const reply = () => send(200, (mode.find ? mode.find(xpath) : mode.elements ? ['e1'] : []).map((id) => ({ [ELEMENT]: id })));
+        if (mode.elementHangFirst && xpaths.length === 1) return; // the first poll is never answered
+        return mode.elementDelay ? void setTimeout(() => { if (!res.destroyed) reply(); }, mode.elementDelay) : reply();
+      }
       if (req.method === 'POST' && req.url === '/session/s1/element') return mode.elements ? send(200, { [ELEMENT]: 'e1' }) : err(404, 'no such element', 'Unable to locate element');
       // webdriverio's isDisplayed runs a script instead of calling GET .../displayed.
       if (req.method === 'POST' && req.url === '/session/s1/execute/sync') {
-        if (!body.includes('innerText')) return send(200, true);
+        // webdriverio's isDisplayed passes the element reference as the script argument.
+        if (!body.includes('innerText')) return send(200, !(mode.hiddenIds ?? []).some((id) => JSON.stringify(JSON.parse(body).args).includes(`"${id}"`)));
         if (mode.execute === 'rejected') return err(404, 'unknown command', 'execute is not allowed');
-        return send(200, mode.bigRead ? `${'x'.repeat(mode.bigRead)}\nend` : 'Welcome to Meetily\nGet Started');
+        return send(200, { text: mode.bigRead ? `${'x'.repeat(mode.bigRead)}\nend` : 'Welcome to Meetily\nGet Started', buttons: mode.buttons ?? [] });
       }
       if (req.method === 'GET' && req.url === '/session/s1/element/e1/text') return send(200, 'Welcome to Meetily' + SCRIPT_NOISE);
-      if (req.method === 'POST' && req.url === '/session/s1/element/e1/click') return send(200, null);
-      if (req.method === 'POST' && req.url === '/session/s1/element/e1/clear') return send(200, null);
-      if (req.method === 'POST' && req.url === '/session/s1/element/e1/value') return send(200, null);
+      if (req.method === 'POST' && /^\/session\/s1\/element\/e\d\/click$/.test(req.url)) return send(200, null);
+      if (req.method === 'POST' && /^\/session\/s1\/element\/e\d\/clear$/.test(req.url)) return send(200, null);
+      if (req.method === 'POST' && /^\/session\/s1\/element\/e\d\/value$/.test(req.url)) return send(200, null);
       send(404, { error: 'unknown command', message: req.url, stacktrace: '' });
     });
   });
@@ -65,7 +75,7 @@ before(async () => {
 });
 
 after(() => { server?.closeAllConnections(); server?.close(); });
-beforeEach(() => { calls = []; bodies = []; sessionAttempts = 0; mode = { session: 'ok', elements: true, execute: 'ok' }; });
+beforeEach(() => { calls = []; bodies = []; xpaths = []; sessionAttempts = 0; mode = { session: 'ok', elements: true, execute: 'ok' }; });
 
 function ui(args, p = port, env = {}) {
   return new Promise((resolve) => {
@@ -170,6 +180,73 @@ test('read prints more than 64 KB, so the exit does not cut piped output', async
   assert.ok(r.stdout.endsWith('\nend\n'));
 });
 
+// Matching: visible text OR aria-label OR placeholder, exact first, then contains.
+test('click matches an icon-only button by its aria-label: the exact xpath names @aria-label', async () => {
+  const r = await ui(['click', 'Start recording']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(xpaths[0].includes('@aria-label="Start recording"'), xpaths[0]);
+  assert.ok(calls.includes('POST /session/s1/element/e1/click'));
+});
+
+test('exact match wins over contains: both would match, the click goes to the exact one', async () => {
+  mode.find = (xp) => (xp.includes('contains(') ? ['e2', 'e1'] : ['e1']);
+  const r = await ui(['click', 'Start recording']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(calls.includes('POST /session/s1/element/e1/click'));
+  assert.ok(!calls.some((c) => c.includes('/element/e2/')), 'clicked the contains match');
+  assert.equal(xpaths.length, 1, 'looked up contains although the exact match was there');
+});
+
+test('contains is the fallback: nothing matches exactly, a longer label does', async () => {
+  mode.find = (xp) => (xp.includes('contains(') ? ['e2'] : []);
+  const r = await ui(['click', 'Start rec']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(calls.includes('POST /session/s1/element/e2/click'));
+  assert.equal(xpaths.length, 2);
+  assert.ok(xpaths[1].includes('contains(@aria-label, "Start rec")'), xpaths[1]);
+});
+
+test('wait and type use the same matching (aria-label)', async () => {
+  const w = await ui(['wait', 'Stop recording', '5']);
+  assert.equal(w.code, 0, w.stderr);
+  const t = await ui(['type', 'Meeting title', 'x']);
+  assert.equal(t.code, 0, t.stderr);
+  assert.ok(xpaths.every((x) => x.includes('@aria-label=') && x.includes('@placeholder=')));
+});
+
+test('the first displayed match is used: a hidden twin is skipped', async () => {
+  mode.find = () => ['e2', 'e1'];
+  mode.hiddenIds = ['e2'];
+  const r = await ui(['click', 'Start recording']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(calls.includes('POST /session/s1/element/e1/click'));
+});
+
+test('exit 1: click on a label nothing carries says "nothing to click"', async () => {
+  mode.elements = false;
+  const r = await ui(['click', 'Start recording']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /nothing to click: Start recording/);
+  assert.equal(xpaths.length > 2, true, 'did not poll');
+});
+
+// read: visible text, then the aria-labels of icon-only buttons.
+test('read lists icon-only buttons after the text, one per line, prefixed "button: "', async () => {
+  mode.buttons = ['Start recording', 'Home'];
+  const r = await ui(['read']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, 'Welcome to Meetily\nGet Started\nbutton: Start recording\nbutton: Home\n');
+});
+
+test('the read script asks only for visible buttons with an aria-label and no text of their own', async () => {
+  await ui(['read']);
+  const i = calls.indexOf('POST /session/s1/execute/sync');
+  const script = JSON.parse(bodies[i]).script;
+  assert.match(script, /button\[aria-label\]/);
+  assert.match(script, /getClientRects/);
+  assert.match(script, /innerText\.trim\(\)/);
+});
+
 test('exit 0: type clears the field and sends the text', async () => {
   const r = await ui(['type', 'Meeting title', 'Quarterly review']);
   assert.equal(r.code, 0, r.stderr);
@@ -221,6 +298,7 @@ test('exit 3 at once: the app stops listening after the session opens', async ()
 // A slow or hung app that does answer late is a timeout (exit 1), never "nothing is answering" (exit 3).
 test('exit 1, not 3: a slow but alive app answers "no such element" after 3 s and wait Missing 2 ends as not found', async () => {
   mode.elementDelay = 3000;
+  mode.elements = false;
   const r = await ui(['wait', 'Missing', '2'], port, { TESTENV_UI_TIMEOUT_SECS: '5' });
   assert.equal(r.code, 1, r.stderr);
   assert.match(r.stderr, /not found after 2s: Missing/);
@@ -228,7 +306,7 @@ test('exit 1, not 3: a slow but alive app answers "no such element" after 3 s an
   assert.ok(r.ms < 8000, `took ${r.ms} ms`);
 });
 
-for (const [verb, args] of [['wait', ['wait', 'Missing', '30']], ['click', ['click', 'Start']], ['type', ['type', 'Field', 'x']], ['read', ['read']]]) {
+for (const [verb, args] of [['wait', ['wait', 'Missing', '3']], ['click', ['click', 'Start']], ['type', ['type', 'Field', 'x']], ['read', ['read']]]) {
   test(`exit 1: a hung app makes ${verb} say "app did not answer within 2s" and not exit 3`, async () => {
     mode.hang = true;
     const r = await ui(args);
@@ -238,6 +316,31 @@ for (const [verb, args] of [['wait', ['wait', 'Missing', '30']], ['click', ['cli
     assert.ok(r.ms < 9000, `took ${r.ms} ms`);
   });
 }
+
+test('exit 0: wait keeps polling after one poll that never answers, and finds the text', async () => {
+  mode.elementHangFirst = true;
+  const r = await ui(['wait', 'Welcome', '30']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(xpaths.length >= 2, `only ${xpaths.length} poll(s)`);
+  assert.ok(r.ms < 10000, `took ${r.ms} ms`);
+});
+
+test('exit 1: wait with every poll unanswered ends at the deadline, not at the first slow poll', async () => {
+  mode.hang = true;
+  const r = await ui(['wait', 'Missing', '5']);
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /app did not answer within 2s/);
+  assert.ok(r.ms >= 5000, `ended at ${r.ms} ms, before the 5 s deadline`);
+  assert.ok(r.ms < 12000, `took ${r.ms} ms`);
+});
+
+test('exit 0: read waits out an 11 s POST /session hold with the default session timeout', async () => {
+  mode.sessionDelay = 11000;
+  const r = await ui(['read'], port, { TESTENV_UI_TIMEOUT_SECS: undefined });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /Welcome to Meetily/);
+  assert.ok(r.ms >= 10500, `answered in ${r.ms} ms`);
+});
 
 test('exit 1: POST /session that never answers ends wait after one request timeout, not the whole wait', async () => {
   mode.session = 'hang';

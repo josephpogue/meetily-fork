@@ -7,7 +7,11 @@ import { remote } from 'webdriverio';
 const [verb, a, b] = process.argv.slice(2);
 const port = Number(process.env.TESTENV_WEBDRIVER_PORT ?? 4445);
 const secs = Number(b ?? 30);
-const xpathText = (t) => `//*[normalize-space(text())=${JSON.stringify(t)} or @aria-label=${JSON.stringify(t)} or @placeholder=${JSON.stringify(t)}]`;
+// An element matches by its visible text, its aria-label (what an icon-only button is named by) or its placeholder.
+// Exact match is tried first, then contains. Scripts and styles carry page text but are never on screen.
+const SKIP = 'not(self::script or self::style or self::title)';
+const xpathExact = (t) => `//*[${SKIP} and (normalize-space(text())=${JSON.stringify(t)} or @aria-label=${JSON.stringify(t)} or @placeholder=${JSON.stringify(t)})]`;
+const xpathContains = (t) => `//*[${SKIP} and (text()[contains(normalize-space(.), ${JSON.stringify(t)})] or contains(@aria-label, ${JSON.stringify(t)}) or contains(@placeholder, ${JSON.stringify(t)}))]`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // Exit 3 means only "nothing is answering": the connection was refused, reset or closed before any reply.
@@ -15,15 +19,17 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const CONNECTION_CODES = ['ECONNREFUSED', 'ECONNRESET', 'UND_ERR_SOCKET', 'UND_ERR_CLOSED'];
 const errorCode = (e) => e?.code ?? e?.cause?.code;
 const isConnectionError = (e) => CONNECTION_CODES.includes(errorCode(e));
-const isTimeout = (e) => errorCode(e) === 'ETIMEDOUT';
+const TIMEOUT_CODES = ['ETIMEDOUT', 'UND_ERR_HEADERS_TIMEOUT', 'UND_ERR_BODY_TIMEOUT'];
+const isTimeout = (e) => TIMEOUT_CODES.includes(errorCode(e));
 // The app answers but has no window yet. The plugin waits 10 s for one, then replies "no such window"
 // / "No window could be found" (a reply from the app, not a Node error, so the text is all there is).
 const isNoWindow = (e) => /no such window|no window could be found/i.test(e?.message ?? '');
 
 // One fixed request timeout for the whole session. webdriverio also uses it as the headers and body timeout of the
 // session's connection and fixes that at the first command, so it cannot follow the time left in a `wait`.
-// TESTENV_UI_TIMEOUT_SECS exists for the tests.
-const TIMEOUT_MS = Number(process.env.TESTENV_UI_TIMEOUT_SECS ?? 5) * 1000;
+// The default is above the 10 s the plugin holds POST /session waiting for a window, so a cold-start read, click or
+// type gets the plugin's own answer. TESTENV_UI_TIMEOUT_SECS exists for the tests.
+const TIMEOUT_MS = Number(process.env.TESTENV_UI_TIMEOUT_SECS ?? 15) * 1000;
 
 // Is anything listening on the port? Returns a connection code if not, else null.
 function probe() {
@@ -60,28 +66,49 @@ async function connect(retryUntil) {
   }
 }
 
-// Poll until the text is displayed or `ms` run out. A dead or hung app propagates at once (connection error or
-// timeout); any other error, such as no such element, counts as "not there yet".
-async function find(browser, t, ms) {
+// First displayed element for an xpath, or null.
+async function firstDisplayed(browser, xpath) {
+  for (const el of await browser.$$(xpath)) if (await el.isDisplayed()) return el;
+  return null;
+}
+
+// Poll until the text is displayed or `ms` run out. A dead app (connection error) propagates at once; any other
+// error, such as no such element, counts as "not there yet". A poll that times out propagates too, except for `wait`
+// (`retryTimeouts`): one slow poll must not end it, so it polls on until the deadline. At the deadline it throws the
+// timeout only if no poll was ever answered (the app is hung), else it returns null (the text is not there).
+async function find(browser, t, ms, retryTimeouts = false) {
   const end = Date.now() + ms;
+  let answered = false;
+  let slow = null;
   for (;;) {
     try {
-      const el = await browser.$(xpathText(t));
-      if (await el.isDisplayed()) return el;
+      const el = (await firstDisplayed(browser, xpathExact(t))) ?? (await firstDisplayed(browser, xpathContains(t)));
+      answered = true;
+      if (el) return el;
     } catch (e) {
-      if (isConnectionError(e) || isTimeout(e)) throw e;
+      if (isConnectionError(e) || (isTimeout(e) && !retryTimeouts)) throw e;
+      if (isTimeout(e)) slow = e;
+      else answered = true;
     }
-    if (Date.now() >= end) return null;
+    if (Date.now() >= end) { if (!answered && slow) throw slow; return null; }
     await sleep(250);
   }
 }
 
 // Only what a person sees: innerText skips <script> and <style>, which getText returns here as raw page text.
+// An icon-only button has no text, so the aria-labels of the visible ones follow as "button: <label>" lines.
 // Fall back to getText if the add-on rejects execute.
 async function readScreen(browser) {
   try {
-    const text = await browser.execute(() => document.body.innerText);
-    if (typeof text === 'string') return text;
+    const screen = await browser.execute(() => {
+      const shown = (el) => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden';
+      const labels = [...document.querySelectorAll('button[aria-label], [role="button"][aria-label]')]
+        .filter((el) => shown(el) && !el.innerText.trim())
+        .map((el) => el.getAttribute('aria-label').trim())
+        .filter(Boolean);
+      return { text: document.body.innerText, buttons: [...new Set(labels)] };
+    });
+    if (typeof screen?.text === 'string') return [screen.text, ...screen.buttons.map((l) => `button: ${l}`)].join('\n');
   } catch (e) {
     if (isConnectionError(e) || isTimeout(e)) throw e; // a dead or hung app is not "execute rejected"
   } // else the add-on rejected execute
@@ -96,7 +123,7 @@ async function run() {
     browser = await connect(verb === 'wait' ? deadline : 0);
     switch (verb) {
       case 'wait':
-        if (!(await find(browser, a, deadline - Date.now()))) { console.error(`not found after ${secs}s: ${a}`); return 1; }
+        if (!(await find(browser, a, deadline - Date.now(), true))) { console.error(`not found after ${secs}s: ${a}`); return 1; }
         break;
       case 'click': { const el = await find(browser, a, 10000); if (!el) { console.error(`nothing to click: ${a}`); return 1; } await el.click(); break; }
       case 'type': { const el = await find(browser, a, 10000); if (!el) { console.error(`no field: ${a}`); return 1; } await el.setValue(b); break; }
