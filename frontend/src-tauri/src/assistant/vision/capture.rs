@@ -41,13 +41,23 @@ impl WindowTarget {
     /// `MEETILY_VISION_APP` (a bundle id or an app name) and optional
     /// `MEETILY_VISION_TITLE` (a title substring) point the capture at that
     /// app's largest on-screen window instead of Zoom's. Unset means `zoom()`.
+    /// Debug builds only: a release build always returns `zoom()`, so a stray
+    /// variable can never point capture at another app and send it to Claude.
     pub fn from_env_or_zoom() -> Self {
-        Self::from_overrides(
-            std::env::var("MEETILY_VISION_APP").ok().as_deref(),
-            std::env::var("MEETILY_VISION_TITLE").ok().as_deref(),
-        )
+        #[cfg(debug_assertions)]
+        {
+            Self::from_overrides(
+                std::env::var("MEETILY_VISION_APP").ok().as_deref(),
+                std::env::var("MEETILY_VISION_TITLE").ok().as_deref(),
+            )
+        }
+        #[cfg(not(debug_assertions))]
+        {
+            Self::zoom()
+        }
     }
 
+    #[cfg_attr(not(any(debug_assertions, test)), allow(dead_code))]
     fn from_overrides(app: Option<&str>, title: Option<&str>) -> Self {
         let app = app.map(str::trim).filter(|s| !s.is_empty());
         let Some(app) = app else {
@@ -164,6 +174,28 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     hay.to_lowercase().contains(&needle.to_lowercase())
 }
 
+fn is_zoom_meeting(w: &WindowInfo) -> bool {
+    w.bundle_id == ZOOM_BUNDLE_ID
+        && w.layer == 0
+        && w.width >= ZOOM_MIN_WIDTH
+        && w.height >= ZOOM_MIN_HEIGHT
+        && (contains_ci(&w.title, "meeting") || contains_ci(&w.title, "webinar"))
+        && !contains_ci(&w.title, "chat")
+}
+
+/// Titles of Zoom's titled windows, for the "Zoom is open but no meeting
+/// window" log line.
+fn zoom_titles(windows: &[WindowInfo]) -> Vec<String> {
+    let mut t: Vec<String> = windows
+        .iter()
+        .filter(|w| w.bundle_id == ZOOM_BUNDLE_ID && !w.title.trim().is_empty())
+        .map(|w| w.title.clone())
+        .collect();
+    t.sort();
+    t.dedup();
+    t
+}
+
 /// Index of the window to capture, or None when there is no (meeting) window.
 fn choose_window(target: &WindowTarget, windows: &[WindowInfo]) -> Option<usize> {
     let largest = |idx: Vec<usize>| {
@@ -176,34 +208,19 @@ fn choose_window(target: &WindowTarget, windows: &[WindowInfo]) -> Option<usize>
     };
 
     if target.is_zoom() {
-        let zoom: Vec<usize> = (0..windows.len())
-            .filter(|&i| {
-                let w = &windows[i];
-                w.bundle_id == ZOOM_BUNDLE_ID
-                    && w.on_screen
-                    && w.layer == 0
-                    && w.width >= ZOOM_MIN_WIDTH
-                    && w.height >= ZOOM_MIN_HEIGHT
-            })
+        // Only the meeting window: a Zoom window titled meeting or webinar,
+        // never a chat window. Not required to be on screen, so a full-screen
+        // Zoom on another Space still counts (a grab of a minimized one fails
+        // and lands in the quiet retry). Visible windows win over hidden ones.
+        let meeting: Vec<usize> = (0..windows.len())
+            .filter(|&i| is_zoom_meeting(&windows[i]))
             .collect();
-        let meeting: Vec<usize> = zoom
+        let visible: Vec<usize> = meeting
             .iter()
             .copied()
-            .filter(|&i| {
-                contains_ci(&windows[i].title, "meeting") || contains_ci(&windows[i].title, "webinar")
-            })
+            .filter(|&i| windows[i].on_screen)
             .collect();
-        if let Some(i) = largest(meeting) {
-            return Some(i);
-        }
-        let other: Vec<usize> = zoom
-            .into_iter()
-            .filter(|&i| {
-                let t = windows[i].title.trim().to_lowercase();
-                !t.is_empty() && t != "zoom workplace" && t != "zoom"
-            })
-            .collect();
-        return largest(other);
+        return largest(if visible.is_empty() { meeting } else { visible });
     }
 
     if target.bundle_id.is_none() && target.app_name.is_none() {
@@ -250,7 +267,9 @@ fn frame_file_name(captured_at_ms: i64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     NoPermission,
-    NoWindow,
+    /// No window yet. Holds Zoom's window titles when Zoom is open but none
+    /// of them is a meeting window.
+    NoWindow(Vec<String>),
     Failed(String),
     Capturing(String),
 }
@@ -260,7 +279,13 @@ fn log_state(state: &State) {
         State::NoPermission => log::info!(
             "vision: Screen Recording permission is missing, the assistant cannot see the window"
         ),
-        State::NoWindow => log::info!("vision: no window to capture yet, waiting"),
+        State::NoWindow(titles) if titles.is_empty() => {
+            log::info!("vision: no window to capture yet, waiting")
+        }
+        State::NoWindow(titles) => log::info!(
+            "vision: Zoom is open but none of its windows is a meeting window, waiting. Zoom windows: {:?}",
+            titles
+        ),
         State::Failed(e) => log::info!("vision: capture failed, will retry: {}", e),
         State::Capturing(title) => log::info!("vision: capturing window \"{}\"", title),
     }
@@ -277,13 +302,12 @@ async fn run(cfg: CaptureConfig, store: FrameStore, token: CancellationToken) {
         let started = std::time::Instant::now();
         let p = pipeline.take().unwrap_or_else(|| mac::Pipeline::new(&cfg));
         let rt = tokio::runtime::Handle::current();
-        let t = token.clone();
-        let (state, kept, wait) = match tokio::task::spawn_blocking(move || p.step(&rt, &t)).await {
+        let (state, kept, wait) = match tokio::task::spawn_blocking(move || p.step(&rt)).await {
             Ok((p, outcome)) => {
                 pipeline = Some(p);
                 match outcome {
                     mac::Outcome::NoPermission => (State::NoPermission, None, cfg.retry_interval),
-                    mac::Outcome::NoWindow => (State::NoWindow, None, cfg.retry_interval),
+                    mac::Outcome::NoWindow(t) => (State::NoWindow(t), None, cfg.retry_interval),
                     mac::Outcome::Failed(e) => (State::Failed(e), None, cfg.retry_interval),
                     mac::Outcome::Seen { title, kept } => (
                         State::Capturing(title),
@@ -303,10 +327,10 @@ async fn run(cfg: CaptureConfig, store: FrameStore, token: CancellationToken) {
             log_state(&state);
             last = Some(state);
         }
+        // Pushed even after a stop: the frame is already on disk, and stopping
+        // only means no new grabs.
         if let Some((path, ms)) = kept {
-            if !token.is_cancelled() {
-                store.push(path, ms);
-            }
+            store.push(path, ms);
         }
         tokio::select! {
             _ = token.cancelled() => break,
@@ -324,18 +348,17 @@ async fn run(_cfg: CaptureConfig, _store: FrameStore, _token: CancellationToken)
 mod mac {
     use std::path::PathBuf;
 
-    use cidre::{arc, cg, cv, sc};
+    use cidre::{arc, cg, cv, objc, sc};
     use tokio::runtime::Handle;
-    use tokio_util::sync::CancellationToken;
-
     use super::super::change::{ChangeFilter, Frame, PixelOrder};
     use super::super::encode::mac::{jpeg_bytes, Bitmap};
-    use super::{choose_window, frame_file_name, CaptureConfig, WindowInfo, WindowTarget};
+    use super::{choose_window, frame_file_name, zoom_titles, CaptureConfig, WindowInfo, WindowTarget};
     use super::{GRAB_TIMEOUT, SAVE_QUALITY};
 
+    #[derive(Clone)]
     pub enum Outcome {
         NoPermission,
-        NoWindow,
+        NoWindow(Vec<String>),
         Failed(String),
         /// A grab worked. `kept` is the saved file when the frame was kept.
         Seen {
@@ -366,24 +389,28 @@ mod mac {
         }
 
         /// One find / grab / filter / save pass. Runs on a blocking thread.
-        pub fn step(mut self, rt: &Handle, token: &CancellationToken) -> (Self, Outcome) {
-            let outcome = self.pass(rt, token);
+        pub fn step(mut self, rt: &Handle) -> (Self, Outcome) {
+            // The blocking thread is reused and has no autorelease pool of its
+            // own: drain what ScreenCaptureKit and ImageIO autorelease per pass.
+            let outcome = objc::ar_pool(|| self.pass(rt));
             (self, outcome)
         }
 
-        fn pass(&mut self, rt: &Handle, token: &CancellationToken) -> Outcome {
+        fn pass(&mut self, rt: &Handle) -> Outcome {
             // Preflight never shows the permission prompt; a missing grant just waits.
             if !unsafe { CGPreflightScreenCaptureAccess() } {
                 return Outcome::NoPermission;
             }
+            // Stamped before the grab, so it is when the picture was taken.
+            let captured_at_ms = chrono::Local::now().timestamp_millis();
             let grabbed = rt.block_on(async {
                 tokio::time::timeout(GRAB_TIMEOUT, grab(&self.target))
                     .await
                     .unwrap_or_else(|_| Err("the window grab timed out".to_string()))
             });
             let (title, image) = match grabbed {
-                Ok(Some(g)) => g,
-                Ok(None) => return Outcome::NoWindow,
+                Ok(Grab::Got(title, image)) => (title, image),
+                Ok(Grab::NoWindow(titles)) => return Outcome::NoWindow(titles),
                 Err(e) => return Outcome::Failed(e),
             };
 
@@ -401,20 +428,23 @@ mod mac {
                 order: PixelOrder::Rgba,
             };
             let verdict = self.filter.observe(&frame);
-            if !verdict.kept || token.is_cancelled() {
+            if !verdict.kept {
                 return Outcome::Seen { title, kept: None };
             }
-            match self.save(&image) {
-                Ok(k) => Outcome::Seen {
-                    title,
-                    kept: Some(k),
-                },
+            match self.save(&image, captured_at_ms) {
+                Ok(k) => {
+                    // Only a saved frame counts as kept for later dedup.
+                    self.filter.commit_kept();
+                    Outcome::Seen {
+                        title,
+                        kept: Some(k),
+                    }
+                }
                 Err(e) => Outcome::Failed(e),
             }
         }
 
-        fn save(&self, image: &cg::Image) -> Result<(PathBuf, i64), String> {
-            let ms = chrono::Local::now().timestamp_millis();
+        fn save(&self, image: &cg::Image, ms: i64) -> Result<(PathBuf, i64), String> {
             std::fs::create_dir_all(&self.frames_dir)
                 .map_err(|e| format!("cannot create {}: {}", self.frames_dir.display(), e))?;
             let path = self.frames_dir.join(frame_file_name(ms));
@@ -425,16 +455,22 @@ mod mac {
         }
     }
 
-    /// Finds the target window and grabs it at full pixel size. `Ok(None)`
-    /// when there is no such window.
-    async fn grab(target: &WindowTarget) -> Result<Option<(String, arc::R<cg::Image>)>, String> {
+    enum Grab {
+        Got(String, arc::R<cg::Image>),
+        /// No window to capture; holds Zoom's titles when Zoom is open.
+        NoWindow(Vec<String>),
+    }
+
+    /// Finds the target window and grabs it at full pixel size.
+    async fn grab(target: &WindowTarget) -> Result<Grab, String> {
         let content = sc::ShareableContent::current()
             .await
             .map_err(|e| format!("cannot list windows: {:?}", e))?;
         let windows = content.windows();
         let infos: Vec<WindowInfo> = windows.iter().map(info_of).collect();
         let Some(idx) = choose_window(target, &infos) else {
-            return Ok(None);
+            let titles = if target.is_zoom() { zoom_titles(&infos) } else { Vec::new() };
+            return Ok(Grab::NoWindow(titles));
         };
         let window = &windows[idx];
         let filter = sc::ContentFilter::with_desktop_independent_window(window);
@@ -446,7 +482,7 @@ mod mac {
             (frame.size.height as f64 * scale).round() as usize,
         );
         if w == 0 || h == 0 {
-            return Ok(None);
+            return Ok(Grab::NoWindow(Vec::new()));
         }
         let mut cfg = sc::StreamCfg::new();
         cfg.set_width(w);
@@ -456,7 +492,7 @@ mod mac {
         let image = sc::ScreenshotManager::capture_image(&filter, &cfg)
             .await
             .map_err(|e| format!("cannot grab the window: {:?}", e))?;
-        Ok(Some((infos[idx].title.clone(), image)))
+        Ok(Grab::Got(infos[idx].title.clone(), image))
     }
 
     fn info_of(w: &sc::Window) -> WindowInfo {
@@ -496,7 +532,7 @@ mod tests {
     const Z: &str = "us.zoom.xos";
 
     #[test]
-    fn zoom_prefers_the_meeting_window_over_a_bigger_one() {
+    fn zoom_takes_only_the_meeting_window_never_a_bigger_other_one() {
         let ws = vec![
             win(Z, "Zoom Workplace", 1600.0, 1000.0),
             win(Z, "Zoom Meeting", 900.0, 600.0),
@@ -515,35 +551,46 @@ mod tests {
     }
 
     #[test]
-    fn zoom_home_and_untitled_windows_are_no_meeting() {
+    fn zoom_without_a_meeting_title_is_no_meeting() {
         let ws = vec![
             win(Z, "Zoom Workplace", 1600.0, 1000.0),
             win(Z, "Zoom", 1600.0, 1000.0),
             win(Z, "", 1600.0, 1000.0),
+            win(Z, "Screen share", 1700.0, 1100.0),
         ];
         assert_eq!(choose_window(&WindowTarget::zoom(), &ws), None);
+        assert_eq!(
+            zoom_titles(&ws),
+            vec!["Screen share", "Zoom", "Zoom Workplace"]
+        );
     }
 
     #[test]
-    fn zoom_falls_back_to_the_largest_titled_window() {
+    fn zoom_chat_windows_are_excluded_even_with_meeting_in_the_title() {
         let ws = vec![
-            win(Z, "Zoom Workplace", 1600.0, 1000.0),
-            win(Z, "Screen share", 700.0, 400.0),
-            win(Z, "Chat", 500.0, 450.0),
+            win(Z, "Meeting Chat", 1000.0, 800.0),
+            win(Z, "Zoom Meeting", 900.0, 600.0),
         ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(1));
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws[..1]), None);
+    }
+
+    #[test]
+    fn zoom_meeting_off_screen_still_counts_but_visible_wins() {
+        let mut off = win(Z, "Zoom Meeting", 1600.0, 1000.0);
+        off.on_screen = false;
+        assert_eq!(choose_window(&WindowTarget::zoom(), &[off.clone()]), Some(0));
+        let ws = vec![off, win(Z, "Zoom Meeting", 900.0, 600.0)];
         assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(1));
     }
 
     #[test]
-    fn zoom_ignores_small_offscreen_and_non_zero_layer_windows() {
-        let mut off = win(Z, "Zoom Meeting", 900.0, 600.0);
-        off.on_screen = false;
+    fn zoom_ignores_small_and_non_zero_layer_windows() {
         let mut high = win(Z, "Zoom Meeting", 900.0, 600.0);
         high.layer = 25;
         let ws = vec![
             win(Z, "Zoom Meeting", 399.0, 600.0),
             win(Z, "Zoom Meeting", 900.0, 299.0),
-            off,
             high,
         ];
         assert_eq!(choose_window(&WindowTarget::zoom(), &ws), None);

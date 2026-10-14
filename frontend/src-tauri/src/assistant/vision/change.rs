@@ -86,6 +86,8 @@ pub struct ChangeFilter {
     prev_mafd: f64,
     /// Thumbnail of the last KEPT frame.
     last_kept_thumb: Option<Vec<u8>>,
+    /// Thumbnail of a frame `observe` said to keep, until `commit_kept`.
+    pending_thumb: Option<Vec<u8>>,
 }
 
 impl ChangeFilter {
@@ -93,12 +95,22 @@ impl ChangeFilter {
         Self::default()
     }
 
+    /// Call once a kept frame is safely saved. Until then the filter does not
+    /// count it as kept, so a failed save leaves the next grab of that slide
+    /// free to be kept (and re-checked even when it scores 0).
+    pub fn commit_kept(&mut self) {
+        if let Some(t) = self.pending_thumb.take() {
+            self.last_kept_thumb = Some(t);
+        }
+    }
+
     /// Feeds the next captured frame (kept or not, it becomes the "previous
-    /// captured" frame) and says whether to keep it.
+    /// captured" frame) and says whether to keep it. A `kept` verdict only
+    /// takes effect after `commit_kept`.
     pub fn observe(&mut self, frame: &Frame) -> Verdict {
         let verdict = match &self.prev {
             None => {
-                self.last_kept_thumb = Some(thumbnail(frame));
+                self.pending_thumb = Some(thumbnail(frame));
                 Verdict {
                     score: 1.0,
                     thumb_delta: None,
@@ -116,7 +128,10 @@ impl ChangeFilter {
                     self.prev_mafd = m;
                     (m.min(diff) / 100.0).clamp(0.0, 1.0)
                 };
-                if score > SCENE_THRESHOLD {
+                // Nothing committed yet means the last keep never reached disk:
+                // judge this frame by dedup alone, whatever its scene score.
+                let unsaved = self.pending_thumb.is_some() || self.last_kept_thumb.is_none();
+                if score > SCENE_THRESHOLD || unsaved {
                     let thumb = thumbnail(frame);
                     let delta = self
                         .last_kept_thumb
@@ -124,9 +139,7 @@ impl ChangeFilter {
                         .map(|last| thumb_delta(&thumb, last))
                         .unwrap_or(f64::INFINITY);
                     let kept = delta > DEDUP_THRESHOLD;
-                    if kept {
-                        self.last_kept_thumb = Some(thumb);
-                    }
+                    self.pending_thumb = if kept { Some(thumb) } else { None };
                     Verdict {
                         score,
                         thumb_delta: Some(delta),
@@ -235,6 +248,15 @@ mod tests {
         d
     }
 
+    /// Observe, and commit when kept (the save worked).
+    fn feed(f: &mut ChangeFilter, fr: &Frame) -> Verdict {
+        let v = f.observe(fr);
+        if v.kept {
+            f.commit_kept();
+        }
+        v
+    }
+
     fn frame(d: &[u8], w: usize, h: usize) -> Frame<'_> {
         Frame {
             data: d,
@@ -261,11 +283,29 @@ mod tests {
     }
 
     #[test]
+    fn kept_but_never_committed_leaves_the_next_identical_frame_kept() {
+        let d = solid(64, 64, 90);
+        let mut f = ChangeFilter::new();
+        assert!(f.observe(&frame(&d, 64, 64)).kept);
+        // The save failed: no commit. The same slide again must still be kept.
+        assert!(f.observe(&frame(&d, 64, 64)).kept);
+        f.commit_kept();
+        let v = f.observe(&frame(&d, 64, 64));
+        assert!(!v.kept, "after a committed keep the duplicate is dropped");
+        // A later uncommitted keep behaves the same way.
+        let w = solid(64, 64, 255);
+        assert!(f.observe(&frame(&w, 64, 64)).kept);
+        assert!(f.observe(&frame(&w, 64, 64)).kept);
+        f.commit_kept();
+        assert!(!f.observe(&frame(&w, 64, 64)).kept);
+    }
+
+    #[test]
     fn identical_frames_score_zero_and_are_not_kept() {
         let d = solid(64, 64, 90);
         let mut f = ChangeFilter::new();
-        assert!(f.observe(&frame(&d, 64, 64)).kept, "first frame is kept");
-        let v = f.observe(&frame(&d, 64, 64));
+        assert!(feed(&mut f, &frame(&d, 64, 64)).kept, "first frame is kept");
+        let v = feed(&mut f, &frame(&d, 64, 64));
         assert_eq!(v.score, 0.0);
         assert!(!v.kept);
         assert_eq!(v.thumb_delta, None, "not a candidate, no dedup run");
@@ -276,8 +316,8 @@ mod tests {
         let (b, w) = (solid(64, 64, 0), solid(64, 64, 255));
         assert_eq!(mafd(&frame(&b, 64, 64), &frame(&w, 64, 64)), 255.0);
         let mut f = ChangeFilter::new();
-        f.observe(&frame(&b, 64, 64));
-        let v = f.observe(&frame(&w, 64, 64));
+        feed(&mut f, &frame(&b, 64, 64));
+        let v = feed(&mut f, &frame(&w, 64, 64));
         assert_eq!(v.score, 1.0);
         assert_eq!(v.thumb_delta, Some(255.0));
         assert!(v.kept);
@@ -297,8 +337,8 @@ mod tests {
         }
         assert_eq!(mafd(&frame(&a, 64, 64), &frame(&b, 64, 64)), 1.984375);
         let mut f = ChangeFilter::new();
-        f.observe(&frame(&a, 64, 64));
-        let v = f.observe(&frame(&b, 64, 64));
+        feed(&mut f, &frame(&a, 64, 64));
+        let v = feed(&mut f, &frame(&b, 64, 64));
         assert_eq!(v.score, 0.01984375);
         assert!(!v.kept);
     }
@@ -307,12 +347,12 @@ mod tests {
     fn steady_change_scores_on_the_jump_not_the_drift() {
         let (a, b, c) = (solid(64, 64, 0), solid(64, 64, 50), solid(64, 64, 100));
         let mut f = ChangeFilter::new();
-        f.observe(&frame(&a, 64, 64));
-        let v2 = f.observe(&frame(&b, 64, 64));
+        feed(&mut f, &frame(&a, 64, 64));
+        let v2 = feed(&mut f, &frame(&b, 64, 64));
         assert_eq!(v2.score, 0.5);
         assert!(v2.kept);
         // mafd 50, prev_mafd 50: diff 0, so the score is 0.
-        let v3 = f.observe(&frame(&c, 64, 64));
+        let v3 = feed(&mut f, &frame(&c, 64, 64));
         assert_eq!(v3.score, 0.0);
         assert!(!v3.kept);
     }
@@ -325,8 +365,8 @@ mod tests {
         assert_eq!(ta.len(), 256);
         assert!(ta.iter().chain(tb.iter()).all(|&v| v == 128));
         let mut f = ChangeFilter::new();
-        assert!(f.observe(&frame(&a, 64, 64)).kept);
-        let v = f.observe(&frame(&b, 64, 64));
+        assert!(feed(&mut f, &frame(&a, 64, 64)).kept);
+        let v = feed(&mut f, &frame(&b, 64, 64));
         assert_eq!(v.score, 1.0);
         assert_eq!(v.thumb_delta, Some(0.0));
         assert!(!v.kept);
@@ -349,14 +389,14 @@ mod tests {
         let same = solid(32, 32, 102);
         let more = solid(32, 32, 103);
         let mut f = ChangeFilter::new();
-        f.observe(&frame(&a, 64, 64));
-        let v = f.observe(&frame(&same, 32, 32));
+        feed(&mut f, &frame(&a, 64, 64));
+        let v = feed(&mut f, &frame(&same, 32, 32));
         assert_eq!(v.score, 1.0);
         assert_eq!(v.thumb_delta, Some(2.0));
         assert!(!v.kept);
         let mut g = ChangeFilter::new();
-        g.observe(&frame(&a, 64, 64));
-        let v = g.observe(&frame(&more, 32, 32));
+        feed(&mut g, &frame(&a, 64, 64));
+        let v = feed(&mut g, &frame(&more, 32, 32));
         assert_eq!(v.thumb_delta, Some(3.0));
         assert!(v.kept);
     }
@@ -365,8 +405,8 @@ mod tests {
     fn size_change_scores_one_and_dedup_decides() {
         let (a, b) = (solid(64, 64, 128), solid(32, 32, 128));
         let mut f = ChangeFilter::new();
-        f.observe(&frame(&a, 64, 64));
-        let v = f.observe(&frame(&b, 32, 32));
+        feed(&mut f, &frame(&a, 64, 64));
+        let v = feed(&mut f, &frame(&b, 32, 32));
         assert_eq!(v.score, 1.0);
         assert_eq!(v.thumb_delta, Some(0.0));
         assert!(!v.kept);
