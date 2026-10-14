@@ -23,6 +23,7 @@ const DEFAULT_SETTINGS: AssistantSettingsData = {
   names: 'joseph,joe',
   vaultRoot: '',
   deepReadDirs: '',
+  seeZoomWindow: true,
 };
 
 const MODEL_OPTIONS = [

@@ -16,6 +16,7 @@ pub mod note;
 pub mod settings;
 pub mod transcript;
 pub mod trigger;
+pub mod vision;
 pub mod voice_ask;
 
 use std::sync::Arc;
