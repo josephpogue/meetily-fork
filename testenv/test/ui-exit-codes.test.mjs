@@ -15,6 +15,7 @@ const work = path.join(here, '..', 'build', 'ui-test');
 const ELEMENT = 'element-6066-11e4-a52e-4f735466cecf';
 
 let server, port, calls, mode;
+const SCRIPT_NOISE = 'self.__next_f.push([1,"1:HL[]"])';
 
 before(async () => {
   fs.mkdirSync(work, { recursive: true });
@@ -24,7 +25,8 @@ before(async () => {
     calls.push(`${req.method} ${req.url}`);
     const send = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ value })); };
     const err = (status, error, message) => send(status, { error, message, stacktrace: '' });
-    req.resume();
+    let body = '';
+    req.on('data', (d) => (body += d));
     req.on('end', () => {
       if (req.method === 'POST' && req.url === '/session') {
         if (mode.session === 'no-window') return err(404, 'no such window', 'No window could be found')  // the plugin's own reply;
@@ -35,8 +37,12 @@ before(async () => {
       if (req.method === 'GET' && req.url === '/session/s1/window') return send(200, 'w1');
       if (req.method === 'POST' && req.url === '/session/s1/element') return mode.elements ? send(200, { [ELEMENT]: 'e1' }) : err(404, 'no such element', 'Unable to locate element');
       // webdriverio's isDisplayed runs a script instead of calling GET .../displayed.
-      if (req.method === 'POST' && req.url === '/session/s1/execute/sync') return send(200, true);
-      if (req.method === 'GET' && req.url === '/session/s1/element/e1/text') return send(200, 'Welcome to Meetily');
+      if (req.method === 'POST' && req.url === '/session/s1/execute/sync') {
+        if (!body.includes('innerText')) return send(200, true);
+        if (mode.execute === 'rejected') return err(404, 'unknown command', 'execute is not allowed');
+        return send(200, 'Welcome to Meetily\nGet Started');
+      }
+      if (req.method === 'GET' && req.url === '/session/s1/element/e1/text') return send(200, 'Welcome to Meetily' + SCRIPT_NOISE);
       if (req.method === 'POST' && req.url === '/session/s1/element/e1/click') return send(200, null);
       send(404, { error: 'unknown command', message: req.url, stacktrace: '' });
     });
@@ -46,7 +52,7 @@ before(async () => {
 });
 
 after(() => server?.close());
-beforeEach(() => { calls = []; mode = { session: 'ok', elements: true }; });
+beforeEach(() => { calls = []; mode = { session: 'ok', elements: true, execute: 'ok' }; });
 
 function ui(args, p = port) {
   return new Promise((resolve) => {
@@ -65,6 +71,23 @@ test('exit 0: read prints the screen text and deletes the session', async () => 
   assert.equal(r.code, 0);
   assert.match(r.stdout, /Welcome to Meetily/);
   assert.equal(deleted(), 1);
+});
+
+test('read prints the visible text from document.body.innerText, with no script text', async () => {
+  const r = await ui(['read']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout, 'Welcome to Meetily\nGet Started\n');
+  assert.ok(!r.stdout.includes(SCRIPT_NOISE));
+  assert.ok(calls.includes('POST /session/s1/execute/sync'));
+  assert.ok(!calls.some((c) => c.endsWith('/element/e1/text')));
+});
+
+test('read falls back to getText when the add-on rejects execute', async () => {
+  mode.execute = 'rejected';
+  const r = await ui(['read']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.stdout, /Welcome to Meetily/);
+  assert.ok(calls.includes('POST /session/s1/element'), 'did not look up body for the fallback');
 });
 
 test('exit 0: wait finds the text', async () => {

@@ -32,6 +32,16 @@ async function find(browser, t, ms) {
   return (await el.isDisplayed().catch(() => false)) ? el : null;
 }
 
+// Only what a person sees: innerText skips <script> and <style>, which getText returns here as raw page text.
+// Fall back to getText if the add-on rejects execute.
+async function readScreen(browser) {
+  try {
+    const text = await browser.execute(() => document.body.innerText);
+    if (typeof text === 'string') return text;
+  } catch { /* add-on rejected execute */ }
+  return browser.$('body').getText();
+}
+
 async function run() {
   if (!['wait', 'click', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|type|read'); return 64; }
   const deadline = Date.now() + secs * 1000;
@@ -44,7 +54,7 @@ async function run() {
         break;
       case 'click': { const el = await find(browser, a, 10000); if (!el) { console.error(`nothing to click: ${a}`); return 1; } await el.click(); break; }
       case 'type': { const el = await find(browser, a, 10000); if (!el) { console.error(`no field: ${a}`); return 1; } await el.setValue(b); break; }
-      case 'read': console.log(await browser.$('body').getText()); break;
+      case 'read': console.log(await readScreen(browser)); break;
     }
     return 0;
   } catch (e) {
