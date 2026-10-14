@@ -84,6 +84,7 @@ chrono = { version = "0.4.31", features = ["serde"] }
 
 # Log
 log = "0.4"
+base64 = "0.22"
 env_logger = "0.11"
 tracing = "0.1.40"
 which = "6.0.1"
