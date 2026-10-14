@@ -181,37 +181,58 @@ test('read prints more than 64 KB, so the exit does not cut piped output', async
 });
 
 // Matching: visible text OR aria-label OR placeholder, exact first, then contains.
-test('click matches an icon-only button by its aria-label: the exact xpath names @aria-label', async () => {
+test('click matches an icon-only button by its aria-label: the exact xpath names @aria-label, lowercased', async () => {
   const r = await ui(['click', 'Start recording']);
   assert.equal(r.code, 0, r.stderr);
-  assert.ok(xpaths[0].includes('@aria-label="Start recording"'), xpaths[0]);
+  assert.ok(xpaths[0].includes('@aria-label') && xpaths[0].includes('="start recording"'), xpaths[0]);
   assert.ok(calls.includes('POST /session/s1/element/e1/click'));
 });
 
-test('exact match wins over contains: both would match, the click goes to the exact one', async () => {
-  mode.find = (xp) => (xp.includes('contains(') ? ['e2', 'e1'] : ['e1']);
-  const r = await ui(['click', 'Start recording']);
+test('click matches trimmed and ignoring case: the target is trimmed and lowercased, the page side translated', async () => {
+  const r = await ui(['click', '  Start   Recording ']);
   assert.equal(r.code, 0, r.stderr);
-  assert.ok(calls.includes('POST /session/s1/element/e1/click'));
-  assert.ok(!calls.some((c) => c.includes('/element/e2/')), 'clicked the contains match');
+  assert.ok(xpaths[0].includes('="start recording"'), xpaths[0]);
+  assert.ok(xpaths[0].includes("translate(normalize-space(@aria-label), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')"), xpaths[0]);
+});
+
+test('exit 1: click never falls back to contains, so "Start" does not press "Get Started"', async () => {
+  mode.find = (xp) => (xp.includes('contains(') ? ['e2'] : []);
+  const r = await ui(['click', 'Start']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /nothing to click: Start/);
+  assert.ok(!calls.some((c) => c.endsWith('/click')), 'clicked something');
+  assert.ok(xpaths.length > 0 && xpaths.every((x) => !x.includes('contains(')), 'click asked for a contains match');
+});
+
+test('exit 1: type never falls back to contains either', async () => {
+  mode.find = (xp) => (xp.includes('contains(') ? ['e2'] : []);
+  const r = await ui(['type', 'Meeting', 'x']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /no field: Meeting/);
+  assert.ok(xpaths.every((x) => !x.includes('contains(')), 'type asked for a contains match');
+});
+
+test('wait: exact match wins over contains, and contains is not asked when the exact one is there', async () => {
+  mode.find = (xp) => (xp.includes('contains(') ? ['e2'] : ['e1']);
+  const r = await ui(['wait', 'Stop recording', '5']);
+  assert.equal(r.code, 0, r.stderr);
   assert.equal(xpaths.length, 1, 'looked up contains although the exact match was there');
 });
 
-test('contains is the fallback: nothing matches exactly, a longer label does', async () => {
+test('wait keeps contains as the fallback: nothing matches exactly, a longer label does', async () => {
   mode.find = (xp) => (xp.includes('contains(') ? ['e2'] : []);
-  const r = await ui(['click', 'Start rec']);
+  const r = await ui(['wait', 'Start rec', '5']);
   assert.equal(r.code, 0, r.stderr);
-  assert.ok(calls.includes('POST /session/s1/element/e2/click'));
   assert.equal(xpaths.length, 2);
   assert.ok(xpaths[1].includes('contains(@aria-label, "Start rec")'), xpaths[1]);
 });
 
-test('wait and type use the same matching (aria-label)', async () => {
-  const w = await ui(['wait', 'Stop recording', '5']);
-  assert.equal(w.code, 0, w.stderr);
-  const t = await ui(['type', 'Meeting title', 'x']);
-  assert.equal(t.code, 0, t.stderr);
-  assert.ok(xpaths.every((x) => x.includes('@aria-label=') && x.includes('@placeholder=')));
+test('wait, click and type all match text, aria-label and placeholder', async () => {
+  for (const args of [['wait', 'Stop recording', '5'], ['click', 'Stop recording'], ['type', 'Meeting title', 'x']]) {
+    const r = await ui(args);
+    assert.equal(r.code, 0, r.stderr);
+  }
+  assert.ok(xpaths.every((x) => x.includes('@aria-label') && x.includes('@placeholder') && x.includes('text()')));
 });
 
 test('the first displayed match is used: a hidden twin is skipped', async () => {

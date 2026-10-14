@@ -8,9 +8,14 @@ const [verb, a, b] = process.argv.slice(2);
 const port = Number(process.env.TESTENV_WEBDRIVER_PORT ?? 4445);
 const secs = Number(b ?? 30);
 // An element matches by its visible text, its aria-label (what an icon-only button is named by) or its placeholder.
-// Exact match is tried first, then contains. Scripts and styles carry page text but are never on screen.
+// `click` and `type` take only a whole match, trimmed and ignoring case, so `click "Start"` never presses "Get Started".
+// `wait` tries that exact match first, then text that contains it. Scripts and styles carry page text but are never on screen.
 const SKIP = 'not(self::script or self::style or self::title)';
-const xpathExact = (t) => `//*[${SKIP} and (normalize-space(text())=${JSON.stringify(t)} or @aria-label=${JSON.stringify(t)} or @placeholder=${JSON.stringify(t)})]`;
+const lower = (x) => `translate(normalize-space(${x}), 'ABCDEFGHIJKLMNOPQRSTUVWXYZ', 'abcdefghijklmnopqrstuvwxyz')`;
+const xpathExact = (t) => {
+  const v = JSON.stringify(t.trim().replace(/\s+/g, ' ').toLowerCase());
+  return `//*[${SKIP} and (text()[${lower('.')}=${v}] or ${lower('@aria-label')}=${v} or ${lower('@placeholder')}=${v})]`;
+};
 const xpathContains = (t) => `//*[${SKIP} and (text()[contains(normalize-space(.), ${JSON.stringify(t)})] or contains(@aria-label, ${JSON.stringify(t)}) or contains(@placeholder, ${JSON.stringify(t)}))]`;
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
@@ -76,13 +81,14 @@ async function firstDisplayed(browser, xpath) {
 // error, such as no such element, counts as "not there yet". A poll that times out propagates too, except for `wait`
 // (`retryTimeouts`): one slow poll must not end it, so it polls on until the deadline. At the deadline it throws the
 // timeout only if no poll was ever answered (the app is hung), else it returns null (the text is not there).
-async function find(browser, t, ms, retryTimeouts = false) {
+// `contains` adds the contains fallback (only `wait` asks for it).
+async function find(browser, t, ms, { retryTimeouts = false, contains = false } = {}) {
   const end = Date.now() + ms;
   let answered = false;
   let slow = null;
   for (;;) {
     try {
-      const el = (await firstDisplayed(browser, xpathExact(t))) ?? (await firstDisplayed(browser, xpathContains(t)));
+      const el = (await firstDisplayed(browser, xpathExact(t))) ?? (contains ? await firstDisplayed(browser, xpathContains(t)) : null);
       answered = true;
       if (el) return el;
     } catch (e) {
@@ -123,7 +129,7 @@ async function run() {
     browser = await connect(verb === 'wait' ? deadline : 0);
     switch (verb) {
       case 'wait':
-        if (!(await find(browser, a, deadline - Date.now(), true))) { console.error(`not found after ${secs}s: ${a}`); return 1; }
+        if (!(await find(browser, a, deadline - Date.now(), { retryTimeouts: true, contains: true }))) { console.error(`not found after ${secs}s: ${a}`); return 1; }
         break;
       case 'click': { const el = await find(browser, a, 10000); if (!el) { console.error(`nothing to click: ${a}`); return 1; } await el.click(); break; }
       case 'type': { const el = await find(browser, a, 10000); if (!el) { console.error(`no field: ${a}`); return 1; } await el.setValue(b); break; }
