@@ -14,7 +14,7 @@ use serde::Serialize;
 
 use super::ask_list::{self, AskItem, AskList};
 use super::claude_cli::{ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS};
-use super::lanes::Runner;
+use super::lanes::{run_with_retry, DeltaCb, FrameBatch, FrameFeed, FrameMode, RegisterCb, Runner};
 use super::transcript::TranscriptLog;
 
 pub const ASK_PROMPT: &str = include_str!("prompts/ask.md");
@@ -86,6 +86,10 @@ struct AskState {
     /// dropped on the floor.
     generation: u64,
     live_runs: Vec<TurnHandle>,
+    /// Zoom window frames, when the assistant can see the window.
+    frames: Option<FrameFeed>,
+    /// Last frame seq sent; advances only when a turn succeeds.
+    frame_cursor: u64,
 }
 
 impl AskState {
@@ -180,7 +184,7 @@ impl AskLane {
     /// running. `force` runs even when nothing changed (the Refresh button);
     /// an automatic request with nothing new is a no-op.
     pub fn request(&self, log: &TranscriptLog, force: bool) {
-        let (turn, generation, sent_version, sent_dismissed, new_cursor, out) = {
+        let (turn, batch, new_frame_cursor, generation, sent_version, sent_dismissed, new_cursor, out) = {
             let mut s = self.state.lock().unwrap();
             let (Some(lane_id), Some(cfg)) = (s.lane_id.clone(), s.cfg.clone()) else {
                 return;
@@ -217,8 +221,14 @@ impl AskLane {
                 safe_mode: true,
                 ..Default::default()
             };
+            let (batch, new_frame_cursor) = match s.frames.clone() {
+                Some(feed) => feed.select(s.frame_cursor, FrameMode::All),
+                None => (FrameBatch::default(), s.frame_cursor),
+            };
             (
                 turn,
+                batch,
+                new_frame_cursor,
                 s.generation,
                 s.brief_version,
                 s.dismissed_unsent.len(),
@@ -233,10 +243,22 @@ impl AskLane {
         let hooks = self.hooks.clone();
         tokio::spawn(async move {
             let register_state = state.clone();
-            let register: Box<dyn FnOnce(TurnHandle) + Send> = Box::new(move |handle| {
-                register_state.lock().unwrap().live_runs.push(handle);
-            });
-            let outcome = (runner)(turn, Box::new(|_| {}), register).await;
+            let outcome = run_with_retry(
+                &runner,
+                turn,
+                batch,
+                move || -> (DeltaCb, RegisterCb) {
+                    let register_state = register_state.clone();
+                    (
+                        Box::new(|_| {}),
+                        Box::new(move |handle| {
+                            register_state.lock().unwrap().live_runs.push(handle);
+                        }),
+                    )
+                },
+                || {},
+            )
+            .await;
             let parsed = match &outcome.error {
                 None => ask_list::parse(&outcome.text),
                 Some(_) => None,
@@ -253,6 +275,7 @@ impl AskLane {
                         let next = ask_list::build(&s.list, raw, &s.dismissed);
                         s.list = next;
                         s.cursor = new_cursor;
+                        s.frame_cursor = new_frame_cursor;
                         s.brief_sent = sent_version;
                         s.dismissed_unsent.drain(..sent_dismissed);
                         s.updated_at = Some(chrono::Utc::now().timestamp_millis());
@@ -280,6 +303,14 @@ impl AskLane {
                 (hooks.rerun)();
             }
         });
+    }
+
+    /// Hands the lane the frames of the Zoom window, or None when the
+    /// assistant cannot see it. The cursor restarts at 0.
+    pub fn set_frames(&self, feed: Option<FrameFeed>) {
+        let mut s = self.state.lock().unwrap();
+        s.frames = feed;
+        s.frame_cursor = 0;
     }
 
     pub fn set_brief(&self, text: String) {
@@ -749,5 +780,77 @@ mod tests {
         assert!(calls[0].fork);
         assert_eq!(calls[0].append_system_prompt.as_deref(), Some(ASK_PROMPT));
         assert_eq!(lane.snapshot().state, "idle");
+    }
+
+    /// A fake encoder: the image data is the frame's file name.
+    fn fake_feed(store: &crate::assistant::vision::FrameStore) -> FrameFeed {
+        FrameFeed::with_encoder(
+            store.clone(),
+            Arc::new(|p: &std::path::Path| {
+                Ok(crate::assistant::vision::ImageBlock {
+                    media_type: "image/jpeg".to_string(),
+                    base64: p.file_name().unwrap().to_string_lossy().to_string(),
+                })
+            }),
+        )
+    }
+
+    fn image_names(t: &ClaudeTurn) -> Vec<String> {
+        t.images.iter().map(|i| i.base64.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn ask_turn_sends_all_frames_since_its_cursor_and_advances_on_success() {
+        let store = crate::assistant::vision::FrameStore::new();
+        store.push("/f/1".into(), 1);
+        store.push("/f/2".into(), 2);
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test(seq_runner(vec![GOOD, GOOD], calls.clone()), AskHooks::default());
+        lane.set_frames(Some(fake_feed(&store)));
+
+        lane.request(&sample_log(), true);
+        settle().await;
+        store.push("/f/3".into(), 3);
+        lane.request(&sample_log(), true);
+        settle().await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(image_names(&calls[0]), vec!["1", "2"]);
+        assert_eq!(image_names(&calls[1]), vec!["3"]);
+    }
+
+    #[tokio::test]
+    async fn ask_turn_that_fails_with_images_is_retried_without_them() {
+        let store = crate::assistant::vision::FrameStore::new();
+        store.push("/f/1".into(), 1);
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let failing = !turn.images.is_empty();
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async move {
+                if failing {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("image rejected".into()) }
+                } else {
+                    ClaudeOutcome { session_id: None, text: GOOD.to_string(), error: None }
+                }
+            })
+        });
+        let lane = AskLane::for_test(runner, AskHooks::default());
+        lane.set_frames(Some(fake_feed(&store)));
+        lane.request(&sample_log(), true);
+        settle().await;
+
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(image_names(&calls[0]), vec!["1"]);
+            assert!(calls[1].images.is_empty());
+            assert_eq!(calls[0].prompt, calls[1].prompt);
+        }
+        assert_eq!(lane.snapshot().asks.len(), 1, "the retry's answer is used");
+        lane.request(&sample_log(), true);
+        settle().await;
+        assert!(calls.lock().unwrap()[2].images.is_empty(), "the frame that broke a turn is not resent");
     }
 }

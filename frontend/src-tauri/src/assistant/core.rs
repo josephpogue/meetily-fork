@@ -20,11 +20,13 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use crate::audio::TranscriptUpdate;
 
 use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut};
-use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, LaneConfig, Runner};
+use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, FrameFeed, LaneConfig, Runner};
 use super::note::{self, NoteDraft, NOTE_PROMPT};
 use super::settings::{self, AssistantSettings};
 use super::transcript::{AssemblerOut, Speaker, TranscriptLog};
 use super::trigger::{TriggerEngine, TriggerMode};
+use super::vision::capture::{self, CaptureConfig, CaptureHandle};
+use super::vision::FrameStore;
 use super::voice_ask::{VoiceAsk, VoiceState};
 use super::AssistantHandle;
 
@@ -129,6 +131,13 @@ pub struct AssistantCore {
     /// Edge-triggered so `on_transcript_update`'s drop condition logs once
     /// per state change instead of once per transcript chunk.
     transcript_ingest_ok: bool,
+
+    /// Frames of the Zoom window for this recording. Kept after the
+    /// recording stops so `draft_note` can send them all; replaced at the
+    /// next open, emptied and dropped when the assistant is turned off.
+    frames: Option<FrameStore>,
+    /// The running capture task, stopped with the recording.
+    capture: Option<CaptureHandle>,
 }
 
 impl Default for AssistantCore {
@@ -163,11 +172,20 @@ impl Default for AssistantCore {
             note_error: None,
             session_transcript: String::new(),
             transcript_ingest_ok: false,
+            frames: None,
+            capture: None,
         }
     }
 }
 
 impl AssistantCore {
+    /// Stops the capture task, if one runs. The frame store stays.
+    fn stop_capture(&mut self) {
+        if let Some(handle) = self.capture.take() {
+            handle.stop();
+        }
+    }
+
     fn status_snapshot(&self) -> StatusOut {
         StatusOut {
             enabled: self.enabled,
@@ -342,6 +360,13 @@ pub async fn set_enabled(handle: &AssistantHandle, enabled: bool) {
         if !enabled {
             core.lanes.close();
             core.ask_lane.close();
+            // Switch off means no capture task and an empty store.
+            core.stop_capture();
+            if let Some(store) = core.frames.take() {
+                store.clear();
+            }
+            core.lanes.set_frames(None);
+            core.ask_lane.set_frames(None);
             if core.session_open {
                 core.pending_brief = Some(core.brief.clone()).filter(|b| !b.trim().is_empty());
             }
@@ -748,6 +773,8 @@ async fn open_lanes_with(
 ) {
     let mut core = handle.0.lock().await;
     core.lanes = AnswerLanes::new(runner.clone());
+    let feed = core.frames.clone().map(FrameFeed::new);
+    core.lanes.set_frames(feed.clone());
     let emit = core.card_emit.clone();
     core.lanes.open(seed, &cfg, emit).await;
     core.lanes_ready = core.lanes.is_ready();
@@ -756,6 +783,7 @@ async fn open_lanes_with(
     // failure leaves the answer lanes alone; it reports "unavailable".
     let hooks = core.ask_hooks.clone();
     core.ask_lane = AskLane::new(runner, hooks);
+    core.ask_lane.set_frames(feed);
     core.brief = brief.clone();
     let trunk = core.lanes.trunk_id();
     let ask_cfg = AskConfig {
@@ -829,6 +857,9 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.session_transcript.clear();
         core.session_open = false;
         core.lanes_ready = false;
+        // A new recording starts with no frames and no capture task.
+        core.stop_capture();
+        core.frames = None;
 
         core.mode = parse_mode(&settings.trigger_mode).unwrap_or(TriggerMode::Gated);
         let names = split_names(&settings.names);
@@ -903,13 +934,47 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         seed.push_str(brief);
     }
 
+    if settings.see_zoom_window {
+        start_capture(handle, app.as_ref()).await;
+    }
+
     open_lanes_with(handle, cfg, seed, brief.unwrap_or_default(), claude_runner(bin)).await;
+}
+
+/// Where this recording's kept Zoom frames are saved: `zoom-frames` inside
+/// the meeting folder, or when the folder is not known yet, `zoom-frames/
+/// <date_time>` under the app data dir. Never the temp session dir.
+async fn zoom_frames_dir(app: Option<&AppHandle<Wry>>) -> Option<PathBuf> {
+    if let Ok(Some(folder)) = crate::audio::recording_commands::get_meeting_folder_path().await {
+        return Some(PathBuf::from(folder).join("zoom-frames"));
+    }
+    let base = app?.path().app_data_dir().ok()?;
+    Some(
+        base.join("zoom-frames")
+            .join(chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string()),
+    )
+}
+
+/// Makes this recording's frame store and starts the capture task (it
+/// returns at once). A missing folder only means no frames: the assistant
+/// carries on without sight.
+async fn start_capture(handle: &AssistantHandle, app: Option<&AppHandle<Wry>>) {
+    let Some(dir) = zoom_frames_dir(app).await else {
+        log::warn!("assistant: no folder for Zoom frames, running without sight");
+        return;
+    };
+    let store = FrameStore::new();
+    let capture = capture::start(CaptureConfig::new(dir), store.clone());
+    let mut core = handle.0.lock().await;
+    core.frames = Some(store);
+    core.capture = Some(capture);
 }
 
 /// Bound to `recording-stopped`. Leaves the transcript and Q&A log in place
 /// for `draft_note`; aborts any turn still in flight.
 async fn close_session(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
+    core.stop_capture();
     if !core.session_open {
         return;
     }
@@ -1339,6 +1404,25 @@ mod tests {
         let core = handle.0.lock().await;
         assert_eq!(core.brief, "Learn their fees");
         assert_eq!(core.ask_lane.snapshot().brief, "Learn their fees");
+    }
+
+    #[tokio::test]
+    async fn frames_survive_the_stop_but_not_switching_the_assistant_off() {
+        let handle = AssistantHandle::new();
+        let store = FrameStore::new();
+        store.push("/f/1".into(), 1);
+        {
+            let mut core = handle.0.lock().await;
+            core.frames = Some(store.clone());
+            core.session_open = true;
+        }
+        close_session(&handle).await;
+        assert_eq!(store.latest_seq(), 1, "the note still needs the frames after the stop");
+        assert!(handle.0.lock().await.frames.is_some());
+
+        set_enabled(&handle, false).await;
+        assert!(handle.0.lock().await.frames.is_none());
+        assert_eq!(store.latest_seq(), 0, "switch off means an empty store");
     }
 
     #[tokio::test]
