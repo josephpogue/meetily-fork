@@ -209,7 +209,7 @@ test('exit 1: type never falls back to contains either', async () => {
   const r = await ui(['type', 'Meeting', 'x']);
   assert.equal(r.code, 1);
   assert.match(r.stderr, /no field: Meeting/);
-  assert.ok(xpaths.every((x) => !x.includes('contains(')), 'type asked for a contains match');
+  assert.ok(xpaths.length > 0 && xpaths.every((x) => !x.includes('contains(')), 'type asked for a contains match');
 });
 
 test('wait: exact match wins over contains, and contains is not asked when the exact one is there', async () => {
