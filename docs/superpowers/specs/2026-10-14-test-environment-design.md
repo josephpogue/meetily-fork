@@ -93,9 +93,8 @@ In `~/.claude/CLAUDE.md`, the "Code goes to dev-lead" section gains one line: de
 
 ## Part 5: proving it works
 
-1. Build the old Meetily (main before PR 10) with the test add-on and run user-mock on it. It must report "Opens on a clean Mac" as failed, with the onnxruntime crash report.
-2. Build current main with the test add-on and run user-mock. All three checks must pass.
-3. Leave a test Mac running, wait past two hours, and confirm the cleanup job deletes it and its Mission Control run is sealed.
+1. Build current main with the test add-on and run user-mock. All three checks must pass, each with a screenshot.
+2. Leave a test Mac running, wait past two hours, and confirm the cleanup job deletes it and its Mission Control run is sealed.
 
 ## Out of scope for this spec
 
