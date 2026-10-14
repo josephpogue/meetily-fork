@@ -1,4 +1,5 @@
-// Pins ui.mjs's exit codes (0, 1, 3, 64) against a stub WebDriver server. Run: node --test testenv/test/
+// Pins ui.mjs's exit codes (0, 1, 3, 64) against a stub WebDriver server. Run: node --test "testenv/test/*.test.mjs"
+// (a bare directory fails on node 25). The first run needs network: `npm ci` installs webdriverio from the lockfile.
 // ui.mjs runs from testenv/build/ui-test (gitignored, outside the recipe hash) so no node_modules lands in testenv/ui.
 import { test, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +15,7 @@ const uiSrc = path.join(here, '..', 'ui');
 const work = path.join(here, '..', 'build', 'ui-test');
 const ELEMENT = 'element-6066-11e4-a52e-4f735466cecf';
 
-let server, port, calls, mode;
+let server, port, calls, bodies, mode;
 const SCRIPT_NOISE = 'self.__next_f.push([1,"1:HL[]"])';
 
 before(async () => {
@@ -23,13 +24,18 @@ before(async () => {
   execFileSync('npm', ['ci', '--omit=dev', '--no-audit', '--no-fund', '--prefer-offline'], { cwd: work, stdio: 'inherit' });
   server = http.createServer((req, res) => {
     calls.push(`${req.method} ${req.url}`);
+    // The app dies after the session opens (session and window handle answered): reset every later request's connection.
+    if (mode.die === 'reset' && req.url !== '/session' && req.url !== '/session/s1/window') return void req.socket.destroy();
     const send = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ value })); };
     const err = (status, error, message) => send(status, { error, message, stacktrace: '' });
     let body = '';
     req.on('data', (d) => (body += d));
     req.on('end', () => {
+      bodies.push(body);
       if (req.method === 'POST' && req.url === '/session') {
-        if (mode.session === 'no-window') return err(404, 'no such window', 'No window could be found')  // the plugin's own reply;
+        if (mode.session === 'no-window') return err(404, 'no such window', 'No window could be found'); // the plugin's own reply
+        // The plugin holds POST /session up to 10 s before it says so; an aborted client leaves the reply unsent.
+        if (mode.session === 'no-window-slow') return void setTimeout(() => { if (!res.destroyed) err(404, 'no such window', 'No window could be found'); }, 6000);
         if (mode.session === 'broken') return err(500, 'session not created', 'stub says the app is unhappy');
         return send(200, { sessionId: 's1', capabilities: {} });
       }
@@ -40,10 +46,12 @@ before(async () => {
       if (req.method === 'POST' && req.url === '/session/s1/execute/sync') {
         if (!body.includes('innerText')) return send(200, true);
         if (mode.execute === 'rejected') return err(404, 'unknown command', 'execute is not allowed');
-        return send(200, 'Welcome to Meetily\nGet Started');
+        return send(200, mode.bigRead ? `${'x'.repeat(mode.bigRead)}\nend` : 'Welcome to Meetily\nGet Started');
       }
       if (req.method === 'GET' && req.url === '/session/s1/element/e1/text') return send(200, 'Welcome to Meetily' + SCRIPT_NOISE);
       if (req.method === 'POST' && req.url === '/session/s1/element/e1/click') return send(200, null);
+      if (req.method === 'POST' && req.url === '/session/s1/element/e1/clear') return send(200, null);
+      if (req.method === 'POST' && req.url === '/session/s1/element/e1/value') return send(200, null);
       send(404, { error: 'unknown command', message: req.url, stacktrace: '' });
     });
   });
@@ -51,8 +59,8 @@ before(async () => {
   port = server.address().port;
 });
 
-after(() => server?.close());
-beforeEach(() => { calls = []; mode = { session: 'ok', elements: true, execute: 'ok' }; });
+after(() => { server?.closeAllConnections(); server?.close(); });
+beforeEach(() => { calls = []; bodies = []; mode = { session: 'ok', elements: true, execute: 'ok' }; });
 
 function ui(args, p = port) {
   return new Promise((resolve) => {
@@ -147,4 +155,68 @@ test('exit 64: unknown verb', async () => {
   assert.equal(r.code, 64);
   assert.match(r.stderr, /usage/);
   assert.deepEqual(calls, []);
+});
+
+test('read prints more than 64 KB, so the exit does not cut piped output', async () => {
+  mode.bigRead = 300000;
+  const r = await ui(['read']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.stdout.length, 300000 + '\nend\n'.length);
+  assert.ok(r.stdout.endsWith('\nend\n'));
+});
+
+test('exit 0: type clears the field and sends the text', async () => {
+  const r = await ui(['type', 'Meeting title', 'Quarterly review']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(calls.includes('POST /session/s1/element/e1/clear'));
+  const i = calls.indexOf('POST /session/s1/element/e1/value');
+  assert.ok(i >= 0, 'no value request');
+  assert.match(bodies[i], /Quarterly review/);
+  assert.equal(deleted(), 1);
+});
+
+test('exit 1: type into a field that is not there says "no field"', async () => {
+  mode.elements = false;
+  const r = await ui(['type', 'Nope', 'text']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /no field: Nope/);
+});
+
+test('exit 3 at once: the app drops the connection after the session opens (wait)', async () => {
+  mode.die = 'reset';
+  const r = await ui(['wait', 'Never shows', '20']);
+  assert.equal(r.code, 3, r.stderr);
+  assert.match(r.stderr, /not answering/);
+  assert.ok(r.ms < 5000, `took ${r.ms} ms, so it polled to the deadline`);
+});
+
+test('exit 3 at once: the app drops the connection after the session opens (click)', async () => {
+  mode.die = 'reset';
+  const r = await ui(['click', 'Start']);
+  assert.equal(r.code, 3, r.stderr);
+  assert.ok(r.ms < 5000, `took ${r.ms} ms`);
+});
+
+test('exit 3 at once: the app stops listening after the session opens', async () => {
+  const dying = http.createServer((req, res) => {
+    req.resume();
+    req.on('end', () => {
+      const send = (v) => { res.writeHead(200, { 'content-type': 'application/json', connection: 'close' }); res.end(JSON.stringify({ value: v })); };
+      if (req.method === 'POST' && req.url === '/session') { send({ sessionId: 's1', capabilities: {} }); setTimeout(() => { dying.close(); dying.closeAllConnections(); }, 400); return; }
+      if (req.method === 'GET' && req.url === '/session/s1/window') return send('w1');
+      return send(null);
+    });
+  });
+  await new Promise((r) => dying.listen(0, '127.0.0.1', r));
+  const r = await ui(['wait', 'Never shows', '20'], dying.address().port);
+  assert.equal(r.code, 3, r.stderr);
+  assert.ok(r.ms < 6000, `took ${r.ms} ms`);
+});
+
+test('exit 1: a slow no-window reply does not push wait past its deadline', async () => {
+  mode.session = 'no-window-slow';
+  const r = await ui(['wait', 'Welcome', '2']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /not found after 2s: Welcome/);
+  assert.ok(r.ms < 4000, `took ${r.ms} ms for a 2 s wait`);
 });

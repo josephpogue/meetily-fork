@@ -9,7 +9,7 @@ eval "$(/opt/homebrew/bin/brew shellenv)"
 brew install --cask blackhole-2ch blackhole-16ch
 brew install sox switchaudio-osx
 # The cask says "reboot to take effect", but restarting coreaudiod loads the new drivers (SIP is off in this image).
-sudo killall coreaudiod
+sudo killall coreaudiod || true
 for _ in $(seq 1 30); do
   devices=$(SwitchAudioSource -a 2>/dev/null || true)
   if grep -qx "BlackHole 2ch" <<<"$devices" && grep -qx "BlackHole 16ch" <<<"$devices"; then found=1; break; fi
