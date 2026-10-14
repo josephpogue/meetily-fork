@@ -18,7 +18,7 @@ The build is not yours. You are handed the path of the built app. It comes from 
   - `click "<text>"` presses the button or link with that text.
   - `type "<field>" "<text>"` types into the field with that name or placeholder.
   - `read` prints all the text on screen.
-- A `ui.mjs` exit of 1 (text never appeared) or 3 (the app is not answering, so it likely crashed) is a failed step, not an environment failure.
+- If a `ui.mjs` verb fails (the text never appears, or the app does not answer), that is a failed step, not an environment failure. Screenshot it and report what is on screen.
 - After every step, take a screenshot: `testenv shot $id <step-name>`
 
 ## 4. Audio
