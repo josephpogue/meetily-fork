@@ -113,11 +113,6 @@ impl FrameFeed {
         (self.batch(frames), latest)
     }
 
-    /// Every frame of the call, for the post-call note.
-    fn all(&self) -> FrameBatch {
-        self.batch(self.store.all())
-    }
-
     fn batch(&self, frames: Vec<KeptFrame>) -> FrameBatch {
         FrameBatch {
             frames,
@@ -187,6 +182,7 @@ pub(super) async fn run_with_retry(
     batch: FrameBatch,
     mut make_cbs: impl FnMut() -> (DeltaCb, RegisterCb),
     mut on_retry: impl FnMut(),
+    should_retry: impl Fn() -> bool,
 ) -> ClaudeOutcome {
     batch.attach(&mut turn).await;
     let had_images = !turn.images.is_empty();
@@ -194,6 +190,11 @@ pub(super) async fn run_with_retry(
     let outcome = (runner)(turn.clone(), delta, register).await;
     if had_images {
         if let Some(err) = &outcome.error {
+            // A turn killed by close() reports an error too; nothing may
+            // start once the session is closed.
+            if !should_retry() {
+                return outcome;
+            }
             log::warn!("assistant turn with images failed ({}), retrying without them", err);
             on_retry();
             turn.images.clear();
@@ -274,6 +275,8 @@ struct LaneState {
     /// Last frame seq each lane sent (0 = none yet).
     fast_frame_cursor: u64,
     deep_frame_cursor: u64,
+    /// Set by `close`: no retry may start after it.
+    closed: bool,
 }
 
 pub struct AnswerLanes {
@@ -453,7 +456,11 @@ fn spawn_turn(
             move || accumulated.lock().unwrap().clear()
         };
 
-        let outcome = run_with_retry(&runner, turn, batch, make_cbs, drop_streamed).await;
+        let open_state = state.clone();
+        let outcome = run_with_retry(&runner, turn, batch, make_cbs, drop_streamed, move || {
+            !open_state.lock().unwrap().closed
+        })
+        .await;
         if let Some(err) = &outcome.error {
             log::warn!("assistant lane turn failed: {}", err);
         }
@@ -645,6 +652,7 @@ impl AnswerLanes {
     pub fn close(&mut self) {
         let handles: Vec<TurnHandle> = {
             let mut s = self.state.lock().unwrap();
+            s.closed = true;
             std::mem::take(&mut s.live_runs)
         };
         for handle in handles {
@@ -667,6 +675,11 @@ impl AnswerLanes {
         s.frames = feed;
         s.fast_frame_cursor = 0;
         s.deep_frame_cursor = 0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_frames(&self) -> bool {
+        self.state.lock().unwrap().frames.is_some()
     }
 
     /// The seeded trunk the lanes forked from, for the ask lane to fork too.
@@ -941,7 +954,22 @@ impl AnswerLanes {
         let Some(cfg) = cfg else {
             return Err("assistant lanes are not configured".to_string());
         };
-        let prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
+        // The note forks the deep session, whose history already holds every
+        // frame the deep lane sent, so it gets only the frames newer than that.
+        let (batch, has_frames) = {
+            let s = self.state.lock().unwrap();
+            let cursor = s.deep_frame_cursor;
+            match s.frames.clone() {
+                Some(feed) => (feed.select(cursor, FrameMode::All).0, true),
+                None => (FrameBatch::none(), false),
+            }
+        };
+        let mut prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
+        if has_frames {
+            prompt.push_str(
+                "\n\nPictures of the Zoom window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
+            );
+        }
         let turn = build_turn(LaneCall {
             lane_id: deep_id,
             model: cfg.deep_model.clone(),
@@ -954,11 +982,8 @@ impl AnswerLanes {
             prompt,
             partial: false,
         });
-        let batch = {
-            let s = self.state.lock().unwrap();
-            s.frames.as_ref().map(|f| f.all()).unwrap_or_else(FrameBatch::none)
-        };
         let state = self.state.clone();
+        let open_state = self.state.clone();
         let outcome = run_with_retry(
             &self.runner,
             turn,
@@ -973,6 +998,7 @@ impl AnswerLanes {
                 )
             },
             || {},
+            move || !open_state.lock().unwrap().closed,
         )
         .await;
         match outcome.error {
@@ -1309,7 +1335,6 @@ mod tests {
         assert_eq!(batch_names(&feed, 0, FrameMode::Newest), (vec![3], 3));
         assert_eq!(batch_names(&feed, 0, FrameMode::All), (vec![1, 2, 3], 3));
         assert_eq!(batch_names(&feed, 3, FrameMode::Newest), (vec![], 3));
-        assert_eq!(feed.all().frames.len(), 3);
     }
 
     #[tokio::test]
@@ -1435,16 +1460,66 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn the_note_sends_every_frame_and_retries_without_them() {
+    async fn the_note_sends_frames_the_deep_lane_has_not_sent_and_retries_without_them() {
         let store = store_with(3);
         let (runner, calls) = fail_with_images_runner();
         let mut lanes = lanes_with_frames(runner, &store);
+        // Deep never ran: the note sends every frame.
         let out = lanes.draft_note("t".to_string(), "qa".to_string()).await;
         assert!(out.is_ok(), "{:?}", out);
+        {
+            let calls = calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(names(&calls[0]), vec!["1", "2", "3"]);
+            assert!(calls[0].prompt.contains("sent earlier in this conversation"));
+            assert!(calls[1].images.is_empty());
+        }
+
+        // Deep has sent up to 2: the note sends only 3 and 4.
+        lanes.state.lock().unwrap().deep_frame_cursor = 2;
+        store.push("/f/4".into(), 4);
+        calls.lock().unwrap().clear();
+        let _ = lanes.draft_note("t".to_string(), "qa".to_string()).await;
+        assert_eq!(names(&calls.lock().unwrap()[0]), vec!["3", "4"]);
+
+        // Switch off: no pictures, and the prompt says nothing about them.
+        let (runner, calls) = skip_runner();
+        let mut off = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
+        let _ = off.draft_note("t".to_string(), "qa".to_string()).await;
         let calls = calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(names(&calls[0]), vec!["1", "2", "3"]);
-        assert!(calls[1].images.is_empty());
+        assert!(calls[0].images.is_empty() && !calls[0].prompt.contains("Pictures of the Zoom"));
+    }
+
+    #[tokio::test]
+    async fn close_during_an_image_turn_starts_no_retry() {
+        let store = store_with(2);
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = calls.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let started_tx = Arc::new(Mutex::new(Some(started_tx)));
+        let gate = Arc::new(tokio::sync::Semaphore::new(0));
+        let g = gate.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            recorded.lock().unwrap().push(turn);
+            if let Some(tx) = started_tx.lock().unwrap().take() {
+                let _ = tx.send(());
+            }
+            let g = g.clone();
+            Box::pin(async move {
+                g.acquire().await.unwrap().forget();
+                ClaudeOutcome { session_id: None, text: String::new(), error: Some("killed".into()) }
+            })
+        });
+        let mut lanes = lanes_with_frames(runner, &store);
+        lanes.answer("q".to_string(), CardKind::Answer, &TranscriptLog::default(), Arc::new(|_| {}));
+        started_rx.await.unwrap();
+        lanes.close();
+        gate.add_permits(10);
+        tokio::time::sleep(Duration::from_millis(80)).await;
+        assert!(
+            calls.lock().unwrap().iter().all(|t| !t.images.is_empty()),
+            "no no-image retry after close"
+        );
     }
 
     #[tokio::test]
@@ -1459,7 +1534,7 @@ mod tests {
         });
         let feed = FrameFeed::with_encoder(store, enc);
         let mut turn = ClaudeTurn::default();
-        feed.all().attach(&mut turn).await;
+        feed.batch(feed.store.all()).attach(&mut turn).await;
         assert_eq!(turn.images.len(), 2);
         assert_eq!(turn.image_labels.len(), 2);
     }

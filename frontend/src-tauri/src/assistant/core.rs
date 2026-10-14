@@ -941,6 +941,56 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
     open_lanes_with(handle, cfg, seed, brief.unwrap_or_default(), claude_runner(bin)).await;
 }
 
+/// The Settings switch "see the Zoom window", applied to a running call.
+/// Off: stop the capture, empty and drop the store, take the frames away
+/// from both lanes. On, with a session open and no capture running: start
+/// one and hand its feed to both lanes. Without a session it only records
+/// the choice; the next open reads the saved row.
+pub async fn apply_see_zoom_window(handle: &AssistantHandle, on: bool) {
+    let dir = if on {
+        let (app, wanted) = {
+            let core = handle.0.lock().await;
+            (core.app.clone(), core.session_open && core.capture.is_none())
+        };
+        if wanted {
+            zoom_frames_dir(app.as_ref()).await
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    apply_see_zoom_window_in(handle, on, dir).await;
+}
+
+/// `apply_see_zoom_window` with the frames folder already resolved.
+async fn apply_see_zoom_window_in(handle: &AssistantHandle, on: bool, dir: Option<PathBuf>) {
+    let mut core = handle.0.lock().await;
+    core.settings.see_zoom_window = on;
+    if !on {
+        core.stop_capture();
+        if let Some(store) = core.frames.take() {
+            store.clear();
+        }
+        core.lanes.set_frames(None);
+        core.ask_lane.set_frames(None);
+        return;
+    }
+    if !core.session_open || core.capture.is_some() {
+        return;
+    }
+    let Some(dir) = dir else {
+        log::warn!("assistant: no folder for Zoom frames, running without sight");
+        return;
+    };
+    let store = FrameStore::new();
+    core.capture = Some(capture::start(CaptureConfig::new(dir), store.clone()));
+    core.frames = Some(store.clone());
+    let feed = FrameFeed::new(store);
+    core.lanes.set_frames(Some(feed.clone()));
+    core.ask_lane.set_frames(Some(feed));
+}
+
 /// Where this recording's kept Zoom frames are saved: `zoom-frames` inside
 /// the meeting folder, or when the folder is not known yet, `zoom-frames/
 /// <date_time>` under the app data dir. Never the temp session dir.
@@ -1423,6 +1473,47 @@ mod tests {
         set_enabled(&handle, false).await;
         assert!(handle.0.lock().await.frames.is_none());
         assert_eq!(store.latest_seq(), 0, "switch off means an empty store");
+    }
+
+    #[tokio::test]
+    async fn the_zoom_switch_reaches_a_running_call_in_both_directions() {
+        let handle = AssistantHandle::new();
+        {
+            let mut core = handle.0.lock().await;
+            core.session_open = true;
+        }
+        let dir = std::env::temp_dir().join(format!("meetily-zoom-switch-{}", uuid::Uuid::new_v4()));
+
+        // On, session open, no capture: one starts and the lanes get the feed.
+        apply_see_zoom_window_in(&handle, true, Some(dir.clone())).await;
+        {
+            let core = handle.0.lock().await;
+            assert!(core.capture.is_some());
+            assert!(core.frames.is_some());
+            assert!(core.lanes.has_frames() && core.ask_lane.has_frames());
+        }
+
+        // On again: nothing restarts.
+        apply_see_zoom_window_in(&handle, true, Some(dir.clone())).await;
+        assert!(handle.0.lock().await.capture.is_some());
+
+        // Off: capture stopped, store emptied and dropped, lanes blind.
+        let store = handle.0.lock().await.frames.clone().unwrap();
+        store.push("/f/1".into(), 1);
+        apply_see_zoom_window_in(&handle, false, None).await;
+        let core = handle.0.lock().await;
+        assert!(core.capture.is_none() && core.frames.is_none());
+        assert_eq!(store.latest_seq(), 0);
+        assert!(!core.lanes.has_frames() && !core.ask_lane.has_frames());
+        assert!(!core.settings.see_zoom_window);
+    }
+
+    #[tokio::test]
+    async fn the_zoom_switch_does_nothing_to_capture_without_a_session() {
+        let handle = AssistantHandle::new();
+        apply_see_zoom_window_in(&handle, true, Some(std::env::temp_dir())).await;
+        let core = handle.0.lock().await;
+        assert!(core.capture.is_none() && core.frames.is_none());
     }
 
     #[tokio::test]

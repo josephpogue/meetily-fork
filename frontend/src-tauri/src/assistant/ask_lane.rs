@@ -257,6 +257,7 @@ impl AskLane {
                     )
                 },
                 || {},
+                || state.lock().unwrap().generation == generation,
             )
             .await;
             let parsed = match &outcome.error {
@@ -311,6 +312,11 @@ impl AskLane {
         let mut s = self.state.lock().unwrap();
         s.frames = feed;
         s.frame_cursor = 0;
+    }
+
+    #[cfg(test)]
+    pub(super) fn has_frames(&self) -> bool {
+        self.state.lock().unwrap().frames.is_some()
     }
 
     pub fn set_brief(&self, text: String) {
