@@ -28,7 +28,8 @@ Each story is one person and one result. Check a change against them: Joseph mus
 
 Decisions Joseph has made for this version. Every feature follows them.
 - Every model call is the local `claude` CLI on his subscription. No API keys, no paid APIs, and Meetily's own summary providers stay untouched.
-- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI.
+- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI, and that path also carries pictures of the Zoom meeting window when "See the Zoom window" is on.
+- The assistant sees only the Zoom meeting window, and only while recording. It keeps a picture only when the window changes, by the /watch rule in `~/.claude/skills/watch/scripts/frames.py` (scene score above 0.20, then a 16x16 thumbnail more than 2.0 from the last kept picture). Kept pictures are saved full-size in the meeting folder.
 - The assistant informs and converses, and never acts. Nothing is written anywhere without a Save press.
 - Output is text only, with no spoken replies.
 - The app runs on macOS on Apple Silicon.

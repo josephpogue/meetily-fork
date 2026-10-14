@@ -24,6 +24,7 @@ The goal, stories and requirements are in `CLAUDE.md`. Update this file in the s
 | Stay on screen until the note is done | With the assistant on, the app waits for Save or Discard on the note before it opens the meeting details. | Built (PR #1) |
 | meetily-fork name | The window, dock, tray and notifications say meetily-fork, so it can sit next to an installed upstream Meetily. | Built (PR #4) |
 | In-app updater off | Meetily's update prompt no longer appears, because it would install plain Meetily over the fork. Upstream updates arrive by merging. | Built (PR #4) |
+| See the Zoom window | While recording, the assistant grabs the Zoom meeting window about once a second, keeps a picture only when it changes (the /watch scene rule), saves kept pictures full-size in the meeting folder's `zoom-frames/`, and sends new ones to Claude inside each turn: the newest one with a suggested answer or Explain, all new ones with Ask, Catch-up and the fuller check, and the call's slides with the note. A Settings switch, on by default, turns it off; a missing Screen Recording permission shows a line with a button to System Settings. A turn that fails with pictures is retried once without them. | Built (PR #9) |
 
 ## Upstream bug fixes
 
@@ -44,4 +45,5 @@ The files most likely to conflict when merging a new upstream release.
 - **Updater off (PR #4):** `services/updateService.ts`.
 - **Mic test (PR #5):** `audio/device_detection.rs`.
 - **Ask next (PR #6):** `lib.rs` (Opt-Q hotkey and two commands), `types/index.ts`. Its own code is under `src-tauri/src/assistant/` and `components/AssistantPanel/`, plus `AssistantContext.tsx`, `assistantService.ts` and `lib/ask-next.ts`.
+- **See the Zoom window (PR #9):** `lib.rs` (two commands), `types/index.ts`, `database/manager.rs` (migrations tolerate a newer database, so an older fork build still opens it), `Cargo.toml` and `Cargo.lock` (`base64`). Its own code is `src-tauri/src/assistant/vision/`, the assistant lanes and prompts, `AssistantSettings.tsx`, `assistantService.ts`, and the `see_zoom_window` migration. `scripts/xcodebuild-shim/` builds cidre without full Xcode.
 - **Docs (PR #2, #7):** `CLAUDE.md` trimmed, with reference sections moved into `docs/architecture.md` and `docs/common-tasks.md`.
