@@ -243,6 +243,7 @@ $env:RUST_LOG="debug"; ./clean_run_windows.bat
 - **Permissions**: Requires microphone + screen recording permissions
 - **System Audio**: Requires virtual audio device (BlackHole) for system capture
 - **Worktree builds without Xcode**: Full Xcode is not installed (only Command Line Tools), and the `cidre` build script calls `xcodebuild` to build its pomace Objective-C libraries. `scripts/xcodebuild-shim/xcodebuild` stands in for it: it compiles each requested pomace target with clang into the folder cidre links from. Put it first on PATH for every cargo or tauri command: `PATH=$PWD/scripts/xcodebuild-shim:$HOME/.cargo/bin:$PATH`. A fresh worktree builds from cold this way (about 10 minutes). Also copy `<main>/frontend/src-tauri/binaries/*` into the worktree (gitignored sidecars the tauri build requires).
+- **No Homebrew libraries in the app**: `frontend/src-tauri/.cargo/config.toml` sets `LIBONNXRUNTIME_NO_PKG_CONFIG`, so onnxruntime links statically even on a Mac with Homebrew's onnxruntime. It applies only to cargo run from `frontend/src-tauri` (tauri does that), not to `cargo test` from the repo root. Check a built app with `otool -L <app>/Contents/MacOS/meetily | grep /opt/homebrew`, which must print nothing.
 
 ### Windows
 - **Audio Capture**: Uses WASAPI (Windows Audio Session API)
