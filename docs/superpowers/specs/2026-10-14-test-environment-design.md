@@ -15,7 +15,7 @@ The tool that creates the test Macs is shared, so other Mac apps and later the R
 1. A developer finishes a slice and builds the app with the test add-on (below).
 2. Dev-lead reviews the code, runs the tests and the fresh code review, exactly as today.
 3. Dev-lead starts user-mock with Joseph's request, each slice's "done when" check, the path to the built app, and the repo name.
-4. User-mock runs `testenv up meetily-fork --app <path>`, which clones a fresh test Mac from the prepared image, starts it with no access to the real microphone, and copies the app in.
+4. User-mock runs `testenv up meetily-fork --app <path> --recipe <repo>/testenv`, which clones a fresh test Mac from the prepared image, starts it with no access to the real microphone, and copies the app in.
 5. User-mock walks the new feature's checks and then the app's user stories, taking a screenshot at each step.
 6. User-mock runs `testenv down <id>` and returns its report.
 7. A failed step goes back to the developer who built that part; after the fix, user-mock runs again on the new build.
@@ -30,11 +30,11 @@ Images are built with Packer (free under HashiCorp's license for this use) and `
 | Command | What it does |
 |---|---|
 | `testenv bake <app>` | Runs `packer build` on the app repo's `testenv/golden.pkr.hcl`, which starts from the Cirrus `macos-sequoia-base` image and saves the result as `<app>-golden`, tagged with a hash of the `testenv/` folder |
-| `testenv up <app> --app <path>` | Clones `<app>-golden` into `run-<app>-<id>`, starts it headless with `--no-audio`, waits until it answers, copies the app into `/Applications`, prints the id |
+| `testenv up <app> --app <path> --recipe <repo>/testenv` | Checks the recipe folder against the image, clones `<app>-golden` into `run-<app>-<id>`, starts it headless with `--no-audio`, waits until it answers, copies the app into `/Applications`, prints the id |
 | `testenv exec <id> -- <cmd>` | Runs a command in the test Mac |
 | `testenv shot <id> <file>` | Saves a screenshot of the test Mac's screen |
-| `testenv play <id> mic\|call <clip>` | Plays a clip into the fake microphone (BlackHole) or as call audio through the speakers |
-| `testenv collect <id> <dir>` | Copies out the app's logs and any crash reports |
+| `testenv play <id> mic\|call <clip>` | Plays a clip into the fake microphone or as call audio through the fake speakers |
+| `testenv collect <id>` | Copies the app's logs and any crash reports into the run folder |
 | `testenv down <id>` | Stops and deletes the test Mac |
 | `testenv ls` | Lists test Macs and their age |
 | `testenv reap` | Deletes `run-*` test Macs older than two hours |
@@ -52,7 +52,7 @@ Run output (screenshots, logs, the report) goes to `~/.cache/testenv/runs/<id>/`
 A `testenv/` folder in the Meetily repo:
 
 - **`golden.pkr.hcl`:** the Packer template for the prepared image, using Cirrus's Tart plugin for Packer, in the same layered style as Cirrus's own `macos-image-templates`: their tools image is the base and this template adds one Meetily layer.
-  - Installs BlackHole 2ch, sox and switchaudio-osx, and makes BlackHole the default input, so the app hears a fake microphone.
+  - Installs BlackHole 2ch as the fake microphone (default input) and BlackHole 16ch as the fake speakers (default output), plus sox and switchaudio-osx. Two devices keep call audio out of the microphone.
   - Copies the Parakeet transcription model (640 MB) from Joseph's Mac into the guest's app data, so a run never downloads it.
   - Builds and installs the Zoom stand-in (below).
   - Writes the permission rows before the app has ever launched: microphone and system-audio capture for `com.meetily.ai` in the user permission database, screen recording in the system one. The base image already has SIP off, which this needs.
