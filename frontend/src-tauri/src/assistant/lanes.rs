@@ -1489,19 +1489,6 @@ mod tests {
         ("system", "Joseph, can you walk us through the wave plan, which sites go in which wave and how long each wave takes?"),
     ];
 
-    fn speed_b64(bytes: &[u8]) -> String {
-        const T: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-        let mut out = String::with_capacity(bytes.len() / 3 * 4 + 4);
-        for c in bytes.chunks(3) {
-            let n = (c[0] as u32) << 16 | (*c.get(1).unwrap_or(&0) as u32) << 8 | *c.get(2).unwrap_or(&0) as u32;
-            out.push(T[(n >> 18) as usize & 63] as char);
-            out.push(T[(n >> 12) as usize & 63] as char);
-            out.push(if c.len() > 1 { T[(n >> 6) as usize & 63] as char } else { '=' });
-            out.push(if c.len() > 2 { T[n as usize & 63] as char } else { '=' });
-        }
-        out
-    }
-
     /// Milliseconds from firing `answer` to the first drafting card, with the
     /// default settings' models, a fresh session each run.
     async fn speed_run(with_frame: bool, image: &Path) -> Result<u128, String> {
@@ -1523,12 +1510,8 @@ mod tests {
         if with_frame {
             store.push(image.to_path_buf(), now_ms());
         }
-        // Test-only encoder: the file's bytes as-is, no downscale.
-        let enc: Encoder = Arc::new(|p: &Path| {
-            let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
-            Ok(ImageBlock { media_type: "image/png".to_string(), base64: speed_b64(&bytes) })
-        });
-        lanes.set_frames(Some(FrameFeed::with_encoder(store, enc)));
+        // The production encoder: downscaled to 1280 wide, JPEG, as in a call.
+        lanes.set_frames(Some(FrameFeed::new(store)));
         let noop: EmitFn = Arc::new(|_| {});
         lanes
             .open(
@@ -1578,7 +1561,7 @@ mod tests {
             eprintln!("skipping live_speed_with_and_without_a_frame: set ASSISTANT_SPEED_TEST=1 to run");
             return;
         }
-        let image = PathBuf::from(std::env::var("VISION_SPEED_IMAGE").expect("set VISION_SPEED_IMAGE to a png"));
+        let image = PathBuf::from(std::env::var("VISION_SPEED_IMAGE").expect("set VISION_SPEED_IMAGE to an image file"));
         let (mut off, mut on) = (Vec::new(), Vec::new());
         for run in 0..10 {
             let with_frame = run % 2 == 1;
