@@ -15,7 +15,7 @@ const uiSrc = path.join(here, '..', 'ui');
 const work = path.join(here, '..', 'build', 'ui-test');
 const ELEMENT = 'element-6066-11e4-a52e-4f735466cecf';
 
-let server, port, calls, bodies, mode;
+let server, port, calls, bodies, mode, sessionAttempts;
 const SCRIPT_NOISE = 'self.__next_f.push([1,"1:HL[]"])';
 
 before(async () => {
@@ -25,6 +25,8 @@ before(async () => {
   server = http.createServer((req, res) => {
     calls.push(`${req.method} ${req.url}`);
     // The app dies after the session opens (session and window handle answered): reset every later request's connection.
+    // The app answers the session and the window handle, then goes quiet (hang) or answers late (elementDelay ms).
+    if (mode.hang && req.url.startsWith('/session/s1/') && req.url !== '/session/s1/window') return;
     if (mode.die === 'reset' && req.url !== '/session' && req.url !== '/session/s1/window') return void req.socket.destroy();
     const send = (status, value) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify({ value })); };
     const err = (status, error, message) => send(status, { error, message, stacktrace: '' });
@@ -33,14 +35,17 @@ before(async () => {
     req.on('end', () => {
       bodies.push(body);
       if (req.method === 'POST' && req.url === '/session') {
+        sessionAttempts++;
         if (mode.session === 'no-window') return err(404, 'no such window', 'No window could be found'); // the plugin's own reply
-        // The plugin holds POST /session up to 10 s before it says so; an aborted client leaves the reply unsent.
-        if (mode.session === 'no-window-slow') return void setTimeout(() => { if (!res.destroyed) err(404, 'no such window', 'No window could be found'); }, 6000);
+        if (mode.session === 'hang') return; // never answered: the client's own timeout must end it
+        if (mode.session === 'hang-first' && sessionAttempts === 1) return;
+        if (mode.session === 'reset') return void req.socket.destroy();
         if (mode.session === 'broken') return err(500, 'session not created', 'stub says the app is unhappy');
         return send(200, { sessionId: 's1', capabilities: {} });
       }
       if (req.method === 'DELETE' && req.url === '/session/s1') return send(200, null);
       if (req.method === 'GET' && req.url === '/session/s1/window') return send(200, 'w1');
+      if (req.method === 'POST' && req.url === '/session/s1/element' && mode.elementDelay) return void setTimeout(() => { if (!res.destroyed) err(404, 'no such element', 'Unable to locate element'); }, mode.elementDelay);
       if (req.method === 'POST' && req.url === '/session/s1/element') return mode.elements ? send(200, { [ELEMENT]: 'e1' }) : err(404, 'no such element', 'Unable to locate element');
       // webdriverio's isDisplayed runs a script instead of calling GET .../displayed.
       if (req.method === 'POST' && req.url === '/session/s1/execute/sync') {
@@ -60,12 +65,12 @@ before(async () => {
 });
 
 after(() => { server?.closeAllConnections(); server?.close(); });
-beforeEach(() => { calls = []; bodies = []; mode = { session: 'ok', elements: true, execute: 'ok' }; });
+beforeEach(() => { calls = []; bodies = []; sessionAttempts = 0; mode = { session: 'ok', elements: true, execute: 'ok' }; });
 
-function ui(args, p = port) {
+function ui(args, p = port, env = {}) {
   return new Promise((resolve) => {
     const started = Date.now();
-    const child = spawn('node', ['ui.mjs', ...args], { cwd: work, env: { ...process.env, TESTENV_WEBDRIVER_PORT: String(p) } });
+    const child = spawn('node', ['ui.mjs', ...args], { cwd: work, env: { ...process.env, TESTENV_WEBDRIVER_PORT: String(p), TESTENV_UI_TIMEOUT_SECS: '2', ...env } });
     let stdout = '', stderr = '';
     child.stdout.on('data', (d) => (stdout += d));
     child.stderr.on('data', (d) => (stderr += d));
@@ -213,10 +218,45 @@ test('exit 3 at once: the app stops listening after the session opens', async ()
   assert.ok(r.ms < 6000, `took ${r.ms} ms`);
 });
 
-test('exit 1: a slow no-window reply does not push wait past its deadline', async () => {
-  mode.session = 'no-window-slow';
-  const r = await ui(['wait', 'Welcome', '2']);
+// A slow or hung app that does answer late is a timeout (exit 1), never "nothing is answering" (exit 3).
+test('exit 1, not 3: a slow but alive app answers "no such element" after 3 s and wait Missing 2 ends as not found', async () => {
+  mode.elementDelay = 3000;
+  const r = await ui(['wait', 'Missing', '2'], port, { TESTENV_UI_TIMEOUT_SECS: '5' });
+  assert.equal(r.code, 1, r.stderr);
+  assert.match(r.stderr, /not found after 2s: Missing/);
+  assert.doesNotMatch(r.stderr, /not answering|did not answer/);
+  assert.ok(r.ms < 8000, `took ${r.ms} ms`);
+});
+
+for (const [verb, args] of [['wait', ['wait', 'Missing', '30']], ['click', ['click', 'Start']], ['type', ['type', 'Field', 'x']], ['read', ['read']]]) {
+  test(`exit 1: a hung app makes ${verb} say "app did not answer within 2s" and not exit 3`, async () => {
+    mode.hang = true;
+    const r = await ui(args);
+    assert.equal(r.code, 1, r.stderr);
+    assert.match(r.stderr, /app did not answer within 2s/);
+    assert.doesNotMatch(r.stderr, /not answering/);
+    assert.ok(r.ms < 9000, `took ${r.ms} ms`);
+  });
+}
+
+test('exit 1: POST /session that never answers ends wait after one request timeout, not the whole wait', async () => {
+  mode.session = 'hang';
+  const r = await ui(['wait', 'Welcome', '1']);
   assert.equal(r.code, 1);
-  assert.match(r.stderr, /not found after 2s: Welcome/);
-  assert.ok(r.ms < 4000, `took ${r.ms} ms for a 2 s wait`);
+  assert.match(r.stderr, /app did not answer within 2s/);
+  assert.ok(r.ms < 6000, `took ${r.ms} ms`);
+});
+
+test('exit 0: wait retries a POST /session that timed out and succeeds on the next attempt', async () => {
+  mode.session = 'hang-first';
+  const r = await ui(['wait', 'Welcome', '20']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.ok(sessionAttempts >= 2, `only ${sessionAttempts} POST /session`);
+});
+
+test('exit 3: the app resets the connection on POST /session itself', async () => {
+  mode.session = 'reset';
+  const r = await ui(['wait', 'Welcome', '20']);
+  assert.equal(r.code, 3, r.stderr);
+  assert.ok(r.ms < 5000, `took ${r.ms} ms`);
 });

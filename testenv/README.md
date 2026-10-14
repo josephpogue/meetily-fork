@@ -20,7 +20,7 @@ The build is not yours. You are handed the path of the built app. It comes from 
   - `click "<text>"` presses the button or link with that text.
   - `type "<field>" "<text>"` types into the field with that name or placeholder.
   - `read` prints all the text on screen.
-- If a `ui.mjs` verb fails (the text never appears, or the app does not answer), that is a failed step, not an environment failure. Screenshot it and report what is on screen. Exit 1 means the text was not found, exit 3 means no WebDriver server answered, and exit 64 means you called `ui.mjs` wrongly: fix the command, it is not an app failure.
+- If a `ui.mjs` verb fails (the text never appears, or the app does not answer), that is a failed step, not an environment failure. Screenshot it and report what is on screen. Exit 1 means the text was not found or the app answered too slowly ("app did not answer within 5s"), exit 3 means nothing answered the WebDriver port at all (refused, reset or closed), and exit 64 means you called `ui.mjs` wrongly: fix the command, it is not an app failure.
 - After every step, take a screenshot: `testenv shot <id> <step-name>`
 
 ## 4. Audio
