@@ -7,7 +7,11 @@ packer {
 }
 
 variable "vm_name" { type = string }
-variable "model_dir" { type = string }
+# The Parakeet speech model folder on the host, staged into the guest so the app needs no download.
+variable "model_dir" {
+  type    = string
+  default = "${env("HOME")}/Library/Application Support/com.meetily.ai/models/parakeet"
+}
 
 source "tart-cli" "golden" {
   vm_base_name   = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
