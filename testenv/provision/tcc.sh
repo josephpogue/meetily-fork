@@ -15,6 +15,8 @@ sudo sqlite3 "$sys_db" "$(row kTCCServiceScreenCapture com.meetily.ai 0)"
 # the app capturing the screen and covers the screen with "tart-guest-agent is requesting to bypass the system private
 # window picker". Grant it by path in TCC (the symlink and the Cellar file it points at) and pre-approve it in replayd's
 # approvals file with a far-future privacy-hint date, so the one-month prompt never shows. An image for any app needs this for `shot`.
+# Meetily needs the same pre-approval: once the assistant session opens, it captures the Zoom window, and Sequoia shows the
+# same prompt for "meetily-fork". replayd keys an app by bundle id (it wrote "com.meetily.ai" when it showed the prompt).
 # The approvals file is overwritten (any existing content is replaced) and replayd is restarted so it reads the new one.
 agent_link=/opt/homebrew/bin/tart-guest-agent
 agent_real=$(readlink -f "$agent_link")
@@ -27,7 +29,7 @@ stamp=$(date -u +%Y-%m-%dT%H:%M:%SZ)
   echo '<?xml version="1.0" encoding="UTF-8"?>'
   echo '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">'
   echo '<plist version="1.0"><dict>'
-  for p in "$agent_link" "$agent_real"; do
+  for p in "$agent_link" "$agent_real" com.meetily.ai; do
     echo "<key>$p</key><dict>"
     echo '<key>kScreenCaptureAlertableUsageCount</key><integer>1</integer>'
     echo "<key>kScreenCaptureApprovalLastAlerted</key><date>$stamp</date>"
