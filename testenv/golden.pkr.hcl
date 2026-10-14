@@ -6,18 +6,18 @@ packer {
   }
 }
 
-variable "vm_name"   { type = string }
+variable "vm_name" { type = string }
 variable "model_dir" { type = string }
 
 source "tart-cli" "golden" {
-  vm_base_name = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
-  vm_name      = var.vm_name
-  cpu_count    = 4
-  memory_gb    = 8
-  headless     = true
-  ssh_username = "admin"
-  ssh_password = "admin"
-  ssh_timeout  = "180s"
+  vm_base_name   = "ghcr.io/cirruslabs/macos-sequoia-base:latest"
+  vm_name        = var.vm_name
+  cpu_count      = 4
+  memory_gb      = 8
+  headless       = true
+  ssh_username   = "admin"
+  ssh_password   = "admin"
+  ssh_timeout    = "180s"
   run_extra_args = ["--no-audio"]
 }
 
@@ -29,7 +29,7 @@ build {
     inline = ["bash clips/make-clips.sh build/clips", "bash zoom-standin/build.sh build/zoom-standin"]
   }
   provisioner "shell" {
-    inline = ["mkdir -p ~/clips ~/testenv-ui '/Users/admin/Library/Application Support/com.meetily.ai/models'"]
+    inline = ["mkdir -p ~/clips ~/testenv-ui ~/model-staging '/Users/admin/Library/Application Support/com.meetily.ai/models'"]
   }
   provisioner "file" {
     source      = "build/clips/"
@@ -41,9 +41,13 @@ build {
     destination = "/Users/admin/"
     generated   = true
   }
+  # scp rejects a destination with a space, so stage the model first and move it in.
   provisioner "file" {
     source      = var.model_dir
-    destination = "/Users/admin/Library/Application Support/com.meetily.ai/models/"
+    destination = "/Users/admin/model-staging/"
+  }
+  provisioner "shell" {
+    inline = ["mv /Users/admin/model-staging/* '/Users/admin/Library/Application Support/com.meetily.ai/models/' && rmdir /Users/admin/model-staging"]
   }
   provisioner "file" {
     source      = "ui/"
