@@ -1,7 +1,7 @@
 # Changes from upstream Meetily
 
 Every way this fork differs from upstream Meetily ([Zackriya-Solutions/meetily](https://github.com/Zackriya-Solutions/meetily)), built or planned.
-The goal, stories and requirements are in `CLAUDE.md`. Update this file in the same PR as any change from upstream.
+The goal, stories and requirements are in `docs/GOAL.md`. Update this file in the same PR as any change from upstream.
 
 **Upstream base:** v0.4.1 (merged in PR #3). Upstream's newest release on 2026-10-13 is also v0.4.1.
 
