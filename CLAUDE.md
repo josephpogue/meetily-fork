@@ -17,7 +17,7 @@ Every difference from upstream Meetily, built or planned, is listed in `docs/FOR
 
 Each story is one person and one result. Check a change against them: Joseph must still get each result.
 - **Answer on the spot:** Someone on the call asks Joseph a question, and a suggested answer is on screen before he has to reply.
-- **Fill the gaps:** On a discovery or knowledge-transfer call, Joseph sees what is still unknown and a question to ask for each gap.
+- **Fill the gaps:** On any call, Joseph sees what is still unknown and a question to ask for each gap.
 - **Gaps clear themselves:** Once the call answers a gap question, it leaves the list without Joseph touching it.
 - **Point of the call:** Joseph types a brief before or during the call, or none at all, and the assistant still knows what the call is for.
 - **Ask privately:** Joseph types or speaks a question mid-call and gets an answer that uses the call so far.
