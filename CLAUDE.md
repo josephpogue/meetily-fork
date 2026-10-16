@@ -4,11 +4,12 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Goal
 
-Joseph's own build of Meetily that helps him run a call while it happens, mainly as a consultant on discovery and knowledge-transfer calls.
-- Follow the live transcript and the point of the call, so a suggested answer is ready when someone asks him a question.
-- Keep a live list of the gaps it sees, given the point of the call, with a question he can ask to fill each one.
-- Take the point of the call from an optional meeting brief he can edit during the call, and from the conversation itself.
-- Stay close to upstream Meetily, so every upstream release merges in cheaply, and add only what his use needs.
+Joseph's own build of Meetily: a sidekick that sits beside him during a call, mainly as a consultant on discovery and knowledge-transfer calls. It keeps track of what the call has covered and tells him what to say, both answers to questions he is asked and questions he should ask. He can also chat with it on the side at any point in the call.
+- **Track the call:** Follow the live transcript and the point of the call, taken from an optional meeting brief he can edit during the call and from the conversation itself.
+- **Know what he knows:** Have the same context as his Second Brain vault, and before the call starts, read what the vault holds on the client, project and people involved, so the sidekick is ready from the first minute.
+- **Tell him what to say:** Have a suggested answer ready when someone asks him a question, and keep a live list of the gaps it sees, each with a question he can ask to fill it.
+- **Chat on the side:** Answer anything he types or speaks to it mid-call, using the call so far and his vault.
+- **Stay close to upstream:** Add only what his use needs, so every upstream Meetily release merges in cheaply.
 
 Every difference from upstream Meetily, built or planned, is listed in `docs/FORK_CHANGES.md`.
 
