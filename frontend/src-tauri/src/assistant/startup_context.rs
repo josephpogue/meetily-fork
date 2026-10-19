@@ -150,6 +150,9 @@ fn candidates(index: &str) -> Vec<String> {
         let end = rest.find("]]").unwrap_or(rest.len());
         let inner = &rest[..end];
         let slug = inner.split('|').next().unwrap_or("").trim();
+        // `[[Projects/foo#Section]]` and `[[Projects/foo.md]]` both mean `foo`.
+        let slug = slug.split('#').next().unwrap_or("").trim();
+        let slug = slug.strip_suffix(".md").unwrap_or(slug);
         let safe = !slug.is_empty()
             && !slug.contains(['/', '\\', '[', ']', '\n'])
             && !slug.starts_with('.');
@@ -269,6 +272,13 @@ mod tests {
     fn tie_goes_to_the_earlier_candidate() {
         let idx = "[[Projects/alpha-beta]] [[Projects/beta-alpha]]";
         assert_eq!(resolve_project(idx, "alpha beta and beta alpha").as_deref(), Some("alpha-beta"));
+    }
+
+    #[test]
+    fn heading_and_extension_links_resolve_to_the_slug() {
+        let idx = "[[Projects/foo#Section]] [[Projects/bar.md]] [[Projects/baz.md#Top|Baz]] [[Projects/foo]]";
+        assert_eq!(candidates(idx), vec!["foo", "bar", "baz"]);
+        assert_eq!(resolve_project(idx, "bar sync").as_deref(), Some("bar"));
     }
 
     #[test]

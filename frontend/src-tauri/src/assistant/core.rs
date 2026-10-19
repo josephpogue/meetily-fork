@@ -467,16 +467,32 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
         return;
     }
     core.brief = text.clone();
-    if let Some(startup) = &core.startup {
-        let (ctx, slug) = startup.render(&text);
-        super::startup_context::log_built(&ctx, slug.as_deref(), "re-resolved on brief change");
-        super::startup_context::set_context(&core.startup_ctx, &ctx);
-    }
     core.lanes.set_brief(text.clone());
-    core.ask_lane.set_brief(text);
+    core.ask_lane.set_brief(text.clone());
     if core.enabled {
         core.ask_lane.request(&core.transcript, false);
     }
+    drop(core);
+    refresh_startup(handle, text).await;
+}
+
+/// Re-resolves the project page for `brief` and updates the startup context
+/// handle. The page is read on a blocking thread with no lock held; if the
+/// brief changed again meanwhile, the later call wins and this one drops its
+/// result.
+async fn refresh_startup(handle: &AssistantHandle, brief: String) {
+    let startup = handle.0.lock().await.startup.clone();
+    let Some(startup) = startup else { return };
+    let b = brief.clone();
+    let Ok((ctx, slug)) = tokio::task::spawn_blocking(move || startup.render(&b)).await else {
+        return;
+    };
+    let core = handle.0.lock().await;
+    if core.brief != brief {
+        return;
+    }
+    super::startup_context::log_built(&ctx, slug.as_deref(), "re-resolved on brief change");
+    super::startup_context::set_context(&core.startup_ctx, &ctx);
 }
 
 /// The Refresh button and Option-Q. Runs even when nothing changed and
@@ -808,6 +824,17 @@ async fn open_lanes_with(
     };
     core.ask_lane.open(trunk, ask_cfg, brief).await;
 
+    // A brief set while the lanes were opening went to `pending_brief` (the
+    // session was not open yet). It is newer than `brief`: the session uses it.
+    let newer = core
+        .pending_brief
+        .take()
+        .filter(|b| *b != core.brief);
+    if let Some(newer) = &newer {
+        core.brief = newer.clone();
+        core.lanes.set_brief(newer.clone());
+        core.ask_lane.set_brief(newer.clone());
+    }
     core.session_open = true;
     let lanes_ready = core.lanes_ready;
     core.set_last_error(if lanes_ready {
@@ -820,6 +847,10 @@ async fn open_lanes_with(
         core.lanes_ready
     );
     core.emit_status();
+    drop(core);
+    if let Some(newer) = newer {
+        refresh_startup(handle, newer).await;
+    }
 }
 
 /// Bound to `recording-started`. Reloads settings fresh (so a save made
@@ -957,21 +988,24 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
     // The fixed files are read once here; a later brief change only
     // re-resolves the project page.
     let brief = brief.unwrap_or_default();
-    let startup = tokio::task::spawn_blocking(super::startup_context::Startup::load_from_home)
-        .await
-        .ok()
-        .flatten();
+    let b = brief.clone();
+    let (startup, rendered) = tokio::task::spawn_blocking(move || {
+        let startup = super::startup_context::Startup::load_from_home();
+        let rendered = startup.as_ref().map(|s| s.render(&b));
+        (startup, rendered)
+    })
+    .await
+    .unwrap_or((None, None));
     let ctx_handle = {
         let mut core = handle.0.lock().await;
-        let ctx = match &startup {
-            Some(s) => {
-                let (ctx, slug) = s.render(&brief);
-                super::startup_context::log_built(&ctx, slug.as_deref(), "built at open");
-                ctx
+        let ctx = match &rendered {
+            Some((ctx, slug)) => {
+                super::startup_context::log_built(ctx, slug.as_deref(), "built at open");
+                ctx.as_str()
             }
-            None => String::new(),
+            None => "",
         };
-        super::startup_context::set_context(&core.startup_ctx, &ctx);
+        super::startup_context::set_context(&core.startup_ctx, ctx);
         core.startup = startup;
         core.startup_ctx.clone()
     };
@@ -1615,6 +1649,40 @@ mod tests {
         assert_eq!(core.ask_lane.snapshot().brief, "next call");
         assert_eq!(emitted.lock().unwrap().last().unwrap().brief, "next call");
         assert_eq!(ask_turns(&calls).len(), 1, "closed sessions must not refresh");
+    }
+
+    /// The open path takes `pending_brief`, drops the lock, and opens the
+    /// lanes later; a `set_brief` in that gap lands in `pending_brief`. The
+    /// session must end up with it everywhere, and the context must name its
+    /// project page.
+    #[tokio::test]
+    async fn a_brief_set_while_the_lanes_open_becomes_the_session_brief() {
+        let home = std::env::temp_dir().join(format!("core-brief-race-{}", uuid::Uuid::new_v4()));
+        let wiki = home.join("brain/wiki/Wiki");
+        std::fs::create_dir_all(wiki.join("Projects")).unwrap();
+        std::fs::write(wiki.join("index.md"), "[[Projects/fesco]]").unwrap();
+        std::fs::write(wiki.join("Projects/fesco.md"), "FESCO PAGE TEXT").unwrap();
+
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.startup = Some(crate::assistant::startup_context::Startup::load(&home));
+        }
+        // The open path already took "old" (pending is empty); the user then
+        // edits the brief before open_lanes_with runs.
+        set_brief(&handle, "FESCO kickoff".to_string()).await;
+        open_lanes_with(&handle, test_lane_cfg(), "seed".into(), "old".into(), ask_runner(calls.clone())).await;
+
+        let core = handle.0.lock().await;
+        assert!(core.session_open);
+        assert_eq!(core.brief, "FESCO kickoff");
+        assert_eq!(core.pending_brief, None);
+        assert_eq!(core.ask_lane.snapshot().brief, "FESCO kickoff");
+        let ctx = core.startup_ctx.read().unwrap().clone();
+        assert!(ctx.contains("FESCO PAGE TEXT"), "context was: {ctx}");
+        drop(core);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]

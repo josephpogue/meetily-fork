@@ -16,12 +16,12 @@ use super::vision::ImageBlock;
 /// fetches or reads anything; the deep lane reads local files and never
 /// writes or reaches the network.
 pub const NO_TOOLS: &[&str] = &[
-    "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Read", "Grep",
+    "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent", "Read", "Grep",
     "Glob", "TodoWrite",
 ];
 pub const READ_ONLY_TOOLS: &[&str] = &["Read", "Grep", "Glob"];
 pub const WRITE_TOOLS: &[&str] = &[
-    "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task",
+    "Bash", "Edit", "Write", "NotebookEdit", "WebFetch", "WebSearch", "Task", "Agent",
 ];
 
 #[derive(Debug, Clone, Default)]
