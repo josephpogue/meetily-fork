@@ -154,8 +154,9 @@ struct AskState {
     /// Transcript point the shown list covers, and who wrote it.
     shown_point: usize,
     shown_by: Shown,
-    /// The largest point a quick result was applied at.
-    fast_applied_point: usize,
+    /// The list the running (or last) deep turn was given as CURRENT LIST.
+    /// Deep runs one turn at a time, so one slot is enough.
+    deep_base: AskList,
     changed: Vec<String>,
 }
 
@@ -188,13 +189,16 @@ impl AskState {
     }
 
     fn snapshot(&self) -> AsksOut {
-        let any_flight = self.subs.iter().any(|s| s.in_flight);
+        // The state follows the quick sub-lane; deep work shows only through
+        // `checking`, unless nothing has been shown yet.
         let state = if self.unavailable {
             "unavailable"
-        } else if any_flight {
+        } else if self.sub(Which::Fast).in_flight {
             "thinking"
         } else if self.failed {
             "failed"
+        } else if self.shown_by == Shown::None && self.sub(Which::Deep).in_flight {
+            "thinking"
         } else {
             "idle"
         };
@@ -250,6 +254,9 @@ impl AskState {
         };
         let turn = lane_turn(&cfg, which, lane_id, prompt, false);
         let generation = self.generation;
+        if which == Which::Deep {
+            self.deep_base = self.list.clone();
+        }
         let sub = self.sub_mut(which);
         sub.in_flight = true;
         sub.dirty = false;
@@ -271,7 +278,6 @@ impl AskState {
     fn land(&mut self, job: &Job, parsed: Option<RawList>, error: Option<String>) -> Landed {
         let which = job.which;
         let point = job.new_cursor;
-        let mut owes_fast = false;
         let sub = self.sub_mut(which);
         sub.in_flight = false;
         let error = match parsed {
@@ -289,7 +295,6 @@ impl AskState {
                             self.changed.clear();
                             self.shown_by = Shown::Fast;
                             self.shown_point = point;
-                            self.fast_applied_point = self.fast_applied_point.max(point);
                             self.updated_at = Some(chrono::Utc::now().timestamp_millis());
                             self.failed = false;
                         } else {
@@ -301,36 +306,68 @@ impl AskState {
                         }
                     }
                     Which::Deep => {
+                        // A deep list built from less transcript than the
+                        // shown quick list keeps the quick list's newer items.
+                        let raw = if point < self.shown_point {
+                            merge_raw(&self.list, &self.deep_base, raw)
+                        } else {
+                            raw
+                        };
                         let next = ask_list::build(&self.list, raw, &self.dismissed);
                         self.changed = changed_ids(&self.list, &next);
                         self.list = next;
                         self.shown_by = Shown::Deep;
-                        self.shown_point = point;
+                        self.shown_point = self.shown_point.max(point);
                         self.updated_at = Some(chrono::Utc::now().timestamp_millis());
                         self.failed = false;
-                        // The quick lane already heard more than this list
-                        // covers: let it lay that over the checked list.
-                        owes_fast = self.fast_applied_point > point;
                     }
                 }
                 None
             }
             None => {
-                let on_screen = !self.list.asks.is_empty() || !self.list.for_you.is_empty();
-                if which == Which::Fast || !on_screen {
+                // A deep failure only reports once some result has been shown.
+                if which == Which::Fast || self.shown_by == Shown::None {
                     self.failed = true;
                 }
                 Some(error.unwrap_or_else(|| "Ask next could not read the model's reply.".to_string()))
             }
         };
-        if owes_fast && self.sub(Which::Fast).lane_id.is_some() {
-            self.sub_mut(Which::Fast).dirty = true;
-        } else {
-            owes_fast = false;
-        }
-        let rerun = owes_fast || self.sub(which).dirty;
+        let rerun = self.sub(which).dirty;
         Landed { out: self.snapshot(), rerun, error }
     }
+}
+
+/// A deep list that was built from less transcript than the shown quick list:
+/// deep's items in deep's order, then each shown item that deep neither kept
+/// nor was given (it came from transcript deep never heard). Items deep was
+/// given and dropped stay dropped. Capped like any list, deep's first.
+fn merge_raw(shown: &AskList, base: &AskList, mut raw: RawList) -> RawList {
+    let newer = |items: &[AskItem], base: &[AskItem], have: &dyn Fn(&str) -> bool| -> Vec<String> {
+        items
+            .iter()
+            .filter(|i| !have(&i.question) && !base.iter().any(|b| ask_list::same_item(&b.question, &i.question)))
+            .map(|i| i.question.clone())
+            .collect()
+    };
+    let ask_extra: Vec<(String, String)> = {
+        let have = |q: &str| raw.asks.iter().any(|(d, _)| ask_list::same_item(d, q));
+        let qs = newer(&shown.asks, &base.asks, &have);
+        shown
+            .asks
+            .iter()
+            .filter(|i| qs.contains(&i.question))
+            .map(|i| (i.question.clone(), i.why.clone()))
+            .collect()
+    };
+    let you_extra = {
+        let have = |q: &str| raw.for_you.iter().any(|d| ask_list::same_item(d, q));
+        newer(&shown.for_you, &base.for_you, &have)
+    };
+    raw.asks.extend(ask_extra);
+    raw.asks.truncate(ask_list::MAX_ASKS);
+    raw.for_you.extend(you_extra);
+    raw.for_you.truncate(ask_list::MAX_FOR_YOU);
+    raw
 }
 
 /// Ids of the items in `next` that are new, or worded differently, relative
@@ -375,6 +412,39 @@ fn lane_turn(cfg: &AskConfig, which: Which, lane_id: String, prompt: String, for
         }
     }
     turn
+}
+
+/// Held by a spawned turn task until its result lands. If the task dies first
+/// the sub-lane would stay "in flight" for good, so the drop clears it.
+struct InFlightGuard {
+    state: Arc<Mutex<AskState>>,
+    hooks: AskHooks,
+    which: Which,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (out, dirty) = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.generation != self.generation {
+                return;
+            }
+            let sub = s.sub_mut(self.which);
+            sub.in_flight = false;
+            let dirty = sub.dirty;
+            (s.snapshot(), dirty)
+        };
+        log::warn!("assistant ask {:?} turn ended without a result", self.which);
+        (self.hooks.emit)(out);
+        if dirty {
+            (self.hooks.rerun)();
+        }
+    }
 }
 
 pub struct AskLane {
@@ -488,6 +558,14 @@ impl AskLane {
         let state = self.state.clone();
         let hooks = self.hooks.clone();
         tokio::spawn(async move {
+            // Clears in_flight if this task panics or is dropped before `land`.
+            let mut guard = InFlightGuard {
+                state: state.clone(),
+                hooks: hooks.clone(),
+                which: job.which,
+                generation: job.generation,
+                armed: true,
+            };
             let register_state = state.clone();
             let generation = job.generation;
             let outcome = run_with_retry(
@@ -517,6 +595,7 @@ impl AskLane {
                 if s.generation != generation {
                     return;
                 }
+                guard.armed = false;
                 s.land(&job, parsed, outcome.error.clone())
             };
             (hooks.emit)(landed.out);
@@ -1154,7 +1233,7 @@ mod tests {
         assert_eq!(quick.asks.len(), 1);
         assert!(!quick.checked);
         assert!(quick.checking, "the deep sub-lane is still working");
-        assert_eq!(quick.state, "thinking");
+        assert_eq!(quick.state, "idle", "deep work shows only through checking");
         assert!(quick.changed.is_empty());
         let first_id = quick.asks[0].id.clone();
 
@@ -1217,46 +1296,199 @@ mod tests {
         assert_eq!(out.asks.len(), 2, "the deep list already covers that much transcript");
     }
 
-    #[tokio::test]
-    async fn checked_list_built_earlier_applies_then_one_quick_rerun_lays_the_news_over_it() {
-        let calls: Calls = Arc::default();
-        let deep_gate = Arc::new(Semaphore::new(0));
-        let rec = recorded_hooks();
-        let lane = AskLane::for_test_two(
-            two_runner(
-                "ASK: Who handles backups? | WHY: owner unknown",
-                CHECKED,
-                None,
-                Some(deep_gate.clone()),
-                calls.clone(),
-            ),
-            rec.hooks.clone(),
-        );
-        let mut log = sample_log();
-        lane.request(&log, false); // both fire at point 1; deep is held
-        settle().await;
-        assert_eq!(lane.snapshot().asks[0].question, "Who handles backups?");
+    const Q_A: &str = "ASK: What storage do you run today? | WHY: storage platform unknown";
 
+    /// Per-model reply queues (then NONE). The deep model's first turn passes
+    /// the gate; every later one waits for a permit from the test.
+    fn scripted(
+        fast: Vec<&'static str>,
+        deep: Vec<&'static str>,
+        deep_gate: Arc<Semaphore>,
+        calls: Calls,
+    ) -> Runner {
+        let fast = Arc::new(Mutex::new(VecDeque::from(fast)));
+        let deep = Arc::new(Mutex::new(VecDeque::from(deep)));
+        Arc::new(move |turn, _on_delta, _register| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            calls.lock().unwrap().push(turn);
+            let queue = if is_deep { deep.clone() } else { fast.clone() };
+            let text = queue.lock().unwrap().pop_front().unwrap_or("NONE");
+            let gate = is_deep.then(|| deep_gate.clone());
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+                ClaudeOutcome { session_id: None, text: text.to_string(), error: None }
+            })
+        })
+    }
+
+    /// Drives a lane to: shown list from the quick lane at point 2, a deep
+    /// turn built at point 1 (given the list shown then) still running.
+    /// Returns the lane, the gate holding the deep turn and the call log.
+    async fn stale_deep_setup(
+        fast: Vec<&'static str>,
+        deep: Vec<&'static str>,
+    ) -> (AskLane, Arc<Semaphore>, Calls) {
+        let calls: Calls = Arc::default();
+        let gate = Arc::new(Semaphore::new(1));
+        let lane = AskLane::for_test_two(scripted(fast, deep, gate.clone(), calls.clone()), AskHooks::default());
+        let mut log = sample_log();
+        lane.request(&log, false); // both fire at point 1; deep's first turn passes
+        settle().await;
+        lane.request(&log, true); // deep fires at point 1 again, held; quick reply is dropped
+        settle().await;
         log.ingest(&tu("system", "someone else handles backups", 4.0, 5.0));
         log.ingest(&tu("mic", "right", 6.0, 7.0));
-        lane.request(&log, false); // fast fires at point 2; deep is busy
+        lane.request(&log, false); // quick fires at point 2; deep is busy
         settle().await;
-        assert_eq!(model_calls(&calls, "ask-model"), 2);
+        (lane, gate, calls)
+    }
 
-        deep_gate.add_permits(1); // deep lands, built at point 1
+    #[tokio::test]
+    async fn a_stale_checked_list_is_merged_with_the_quick_items_it_never_heard() {
+        let ab = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Who handles backups? | WHY: owner unknown";
+        let a2c = "ASK: Which storage platform do you run today? | WHY: platform unknown\nASK: When does your support contract end? | WHY: renewal date vague";
+        // Deep's first turn sees [A]; the quick lane later adds B at point 2.
+        let (lane, gate, calls) = stale_deep_setup(vec![Q_A, Q_A, ab], vec![Q_A, a2c]).await;
+        let shown = lane.snapshot();
+        assert!(!shown.checked, "the quick list is on screen");
+        assert_eq!(shown.asks.len(), 2);
+        let (id_a, id_b) = (shown.asks[0].id.clone(), shown.asks[1].id.clone());
+        let fast_before = model_calls(&calls, "ask-model");
+
+        gate.add_permits(1); // deep lands, built at point 1
         settle().await;
         let out = lane.snapshot();
-        assert!(out.checked, "a deep result always applies");
-        assert_eq!(out.asks.len(), 2);
-        assert_eq!(rec.reruns.load(Ordering::SeqCst), 1);
-        assert_eq!(model_calls(&calls, "ask-model"), 2, "the rerun waits for core to call rerun");
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            vec![
+                "Which storage platform do you run today?",
+                "When does your support contract end?",
+                "Who handles backups?"
+            ]
+        );
+        assert!(out.checked);
+        assert_eq!(out.asks[0].id, id_a, "the reworded question keeps its id");
+        assert_eq!(out.asks[2].id, id_b);
+        assert_eq!(out.changed, vec![id_a, out.asks[1].id.clone()]);
+        assert_eq!(model_calls(&calls, "ask-model"), fast_before, "no forced quick rerun");
+    }
 
-        lane.rerun(&log); // deep holds a follow-up of its own; hold it
+    #[tokio::test]
+    async fn a_stale_checked_list_keeps_dropping_what_it_was_given_and_dropped() {
+        let ab = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Who handles backups? | WHY: owner unknown";
+        let (lane, gate, _calls) = stale_deep_setup(vec![ab, ab, ab], vec![ab, Q_A]).await;
+        assert_eq!(lane.snapshot().asks.len(), 2);
+        gate.add_permits(1);
         settle().await;
-        assert_eq!(model_calls(&calls, "ask-model"), 3, "exactly one more quick call");
-        let after = lane.snapshot();
-        assert_eq!(after.asks[0].question, "Who handles backups?", "the quick lane re-applied what it heard");
-        assert!(!after.checked);
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(questions, vec!["What storage do you run today?"], "deep judged B and dropped it");
+        assert!(out.checked);
+    }
+
+    #[tokio::test]
+    async fn a_stale_checked_list_cuts_the_newer_quick_item_at_the_cap() {
+        let an = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Do you use encryption at rest? | WHY: security unknown";
+        let five = "ASK: What is your total headcount? | WHY: size\nASK: Which cloud provider hosts production? | WHY: hosting\nASK: How often do backups run? | WHY: rpo\nASK: Who approves capital purchases? | WHY: buyer\nASK: When does the lease expire? | WHY: timing";
+        let (lane, gate, _calls) = stale_deep_setup(vec![Q_A, Q_A, an], vec![Q_A, five]).await;
+        gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            vec![
+                "What is your total headcount?",
+                "Which cloud provider hosts production?",
+                "How often do backups run?",
+                "Who approves capital purchases?",
+                "When does the lease expire?"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quick_failure_shows_failed_even_while_the_deep_turn_runs() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let gate = Arc::new(Semaphore::new(0));
+        let g = gate.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            let g = g.clone();
+            Box::pin(async move {
+                if is_deep {
+                    g.acquire().await.unwrap().forget();
+                    ClaudeOutcome { session_id: None, text: QUICK.into(), error: None }
+                } else {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("quick broke".into()) }
+                }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, AskHooks::default());
+        lane.request(&sample_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.state, "failed");
+        assert!(out.checking, "deep is still running");
+    }
+
+    #[tokio::test]
+    async fn a_deep_failure_after_an_empty_quick_result_does_not_show_failed() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let rec = recorded_hooks();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async move {
+                if is_deep {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("deep broke".into()) }
+                } else {
+                    ClaudeOutcome { session_id: None, text: "NONE".into(), error: None }
+                }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, rec.hooks.clone());
+        lane.request(&sample_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(out.asks.is_empty());
+        assert_eq!(out.state, "idle", "the empty quick list was applied, so no failure shows");
+        assert_eq!(rec.errors.lock().unwrap().as_slice(), ["deep broke"]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_does_not_leave_its_sub_lane_in_flight() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let first_deep = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            if is_deep && first_deep.swap(false, Ordering::SeqCst) {
+                panic!("runner blew up");
+            }
+            Box::pin(async move {
+                ClaudeOutcome { session_id: None, text: QUICK.to_string(), error: None }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(!out.checking, "the dead deep turn no longer counts as running");
+        assert_eq!(out.state, "idle");
+
+        lane.request(&log, true);
+        settle().await;
+        assert_eq!(model_calls(&calls, "deep-model"), 2, "the deep sub-lane fires again");
+        assert!(lane.snapshot().checked);
     }
 
     #[tokio::test]
