@@ -440,28 +440,30 @@ mod tests {
         }
         let handle = new_handle();
         let run = with_context(live_runner(), handle.clone());
-        let ask = "Reply with only the codeword written in your system prompt.";
+        // A codeword read twice reads like an injection to the model, so the seed
+        // only says READY and the later turns ask for a plain reference fact.
+        let ask = "What is the meeting room called today, per your reference notes? One word.";
         let base = |prompt: &str| ClaudeTurn {
             prompt: prompt.into(),
             cwd: std::env::temp_dir(),
             model: Some("claude-sonnet-5".into()),
             safe_mode: true,
             disallowed_tools: NO_TOOLS.iter().map(|s| s.to_string()).collect(),
-            append_system_prompt: Some("LANE PROMPT".into()),
+            append_system_prompt: Some("You answer from your reference notes.".into()),
             ..Default::default()
         };
-        set_context(&handle, "The codeword is ALPHA.");
+        set_context(&handle, "Reference: the meeting room today is called Juniper.");
         let sid = uuid::Uuid::new_v4().to_string();
-        let seed = run_one(&run, ClaudeTurn { session_id: Some(sid.clone()), ..base(ask) }).await;
+        let seed = run_one(&run, ClaudeTurn { session_id: Some(sid.clone()), ..base("Say READY.") }).await;
         println!("seed reply: {}", seed.text);
-        set_context(&handle, "The codeword is BRAVO.");
+        set_context(&handle, "Reference: the meeting room today is called Maple.");
         let resumed = run_one(&run, ClaudeTurn { resume: Some(sid.clone()), ..base(ask) }).await;
         println!("resume reply: {}", resumed.text);
         let forked = run_one(&run, ClaudeTurn { resume: Some(sid), fork: true, ..base(ask) }).await;
         println!("resume+fork reply: {}", forked.text);
-        assert!(seed.text.contains("ALPHA"), "{}", seed.text);
-        assert!(resumed.text.contains("BRAVO") && !resumed.text.contains("ALPHA"), "{}", resumed.text);
-        assert!(forked.text.contains("BRAVO") && !forked.text.contains("ALPHA"), "{}", forked.text);
+        assert!(seed.text.contains("READY"), "{}", seed.text);
+        assert!(resumed.text.contains("Maple") && !resumed.text.contains("Juniper"), "{}", resumed.text);
+        assert!(forked.text.contains("Maple") && !forked.text.contains("Juniper"), "{}", forked.text);
     }
 
     fn fast_turn(prompt: &str) -> ClaudeTurn {
