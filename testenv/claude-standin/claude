@@ -1,19 +1,21 @@
 #!/bin/bash
 # Claude stand-in for the test Mac, as the Zoom stand-in fakes Zoom. It holds no login, makes no network call and
 # reads no credentials. Its only job is to let Meetily's assistant session open (core.rs `open_session` stops when
-# `claude --version` fails), so the Zoom window capture runs. Every answer is canned: assistant output is not tested here.
+# `claude --version` fails), so the Zoom window capture runs. Every answer is canned: assistant output is not tested here
+# (the one exception is Ask next, whose quick-then-checked lists are canned so a walk can see both).
 # It answers `claude -p ... --output-format stream-json` with the two lines the app reads (claude_cli.rs `parse_line`):
 # a system/init line carrying the session id and a result line, whose text fits the lane that asked (by its system prompt).
 set -u
 [ "${1:-}" = "--version" ] && { echo "0.0.0 (Claude stand-in, test Mac)"; exit 0; }
 
-all="$*" input="" session="" resume="" fork=0 system="" stdin_json=0
+all="$*" input="" session="" resume="" fork=0 system="" stdin_json=0 model=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --session-id) session="${2:-}"; shift ;;
     --resume) resume="${2:-}"; shift ;;
     --fork-session) fork=1 ;;
     --append-system-prompt) system="${2:-}"; shift ;;
+    --model) model="${2:-}"; shift ;;
     --input-format) [ "${2:-}" = "stream-json" ] && stdin_json=1; shift ;;
   esac
   shift
@@ -26,9 +28,21 @@ if [ -z "$session" ]; then
   if [ -n "$resume" ] && [ "$fork" = 0 ]; then session="$resume"; else session=$(uuidgen | tr '[:upper:]' '[:lower:]'); fi
 fi
 
+# An Ask next turn names its list in the prompt (ask_lane.rs `ask_prompt`: "CURRENT LIST:"). The quick (fast model) lane
+# answers at once with one question; the deep (opus) lane waits 4 s, then answers with that question and a second one,
+# so the test Mac can see a quick list followed by a checked one.
+ask_turn=0
+case "$all$input" in *"CURRENT LIST:"*) ask_turn=1 ;; esac
+
+if [ "$ask_turn" = 1 ]; then
+  text=$'ASK: What storage do you run today? | WHY: storage platform unknown'
+  case "$model" in
+    *opus*) sleep 4; text+=$'\nASK: When does your support contract end? | WHY: renewal date vague' ;;
+  esac
+else
 case "$system" in
   *"=== SLUG ==="*) text=$'=== SLUG ===\ntest-mac-canned-note\n=== NOTE ===\n## Summary\n\nCanned note from the test Mac Claude stand-in.' ;; # note.rs parse_note
-  *"ASK:"*) text="NONE" ;;  # ask_list.rs parse: an empty gap list
+  *"ASK:"*) text="NONE" ;;  # ask_list.rs parse: an empty gap list (the fork's standby turn has no CURRENT LIST)
   *) case "$all$input" in
        # A question Joseph asks directly (typed or spoken) says so in its prompt (commands.rs `assistant_ask`):
        # answer with a one-line card (card.rs parse: LEAD and a bullet), so the Ask box shows a reply.
@@ -36,6 +50,7 @@ case "$system" in
        *) text="SKIP" ;;    # card.rs parse: other answer turns render nothing; trunk and forks only need a session id
      esac ;;
 esac
+fi
 
 json() { local s=${1//\\/\\\\}; s=${s//\"/\\\"}; s=${s//$'\n'/\\n}; printf '"%s"' "$s"; }
 printf '{"type":"system","subtype":"init","session_id":%s}\n' "$(json "$session")"

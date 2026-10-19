@@ -500,8 +500,9 @@ async fn rerun_asks(handle: &AssistantHandle) {
     if !core.session_open || !core.enabled {
         return;
     }
-    // The dirty flag includes manual refreshes even with no new transcript.
-    core.ask_lane.request(&core.transcript, true);
+    // Fires only the sub-lanes that owe a follow-up. Their dirty flag
+    // includes manual refreshes even with no new transcript.
+    core.ask_lane.rerun(&core.transcript);
 }
 
 pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
@@ -801,6 +802,9 @@ async fn open_lanes_with(
     let ask_cfg = AskConfig {
         cwd: cfg.cwd.clone(),
         model: cfg.fast_model.clone(),
+        deep_model: cfg.deep_model.clone(),
+        deep_effort: cfg.deep_effort.clone(),
+        deep_read_dirs: cfg.deep_read_dirs.clone(),
     };
     core.ask_lane.open(trunk, ask_cfg, brief).await;
 
@@ -1418,7 +1422,8 @@ mod tests {
     /// past the fork) get a one-item list; everything else gets READY.
     fn ask_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
         Arc::new(move |turn, _on_delta, _register| {
-            let is_ask_turn = turn.append_system_prompt.as_deref() == Some(ASK_PROMPT)
+            // The deep sub-lane's prompt is ASK_PROMPT plus its own addendum.
+            let is_ask_turn = turn.append_system_prompt.as_deref().is_some_and(|p| p.starts_with(ASK_PROMPT))
                 && !turn.prompt.starts_with("Standing by");
             calls.lock().unwrap().push(turn);
             let text = if is_ask_turn {
@@ -1436,12 +1441,14 @@ mod tests {
         })
     }
 
+    /// The quick sub-lane's ask turns. The deep sub-lane runs a turn beside
+    /// each one, so counting both would double every number.
     fn ask_turns(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Vec<String> {
         calls
             .lock()
             .unwrap()
             .iter()
-            .filter(|t| t.prompt.contains("CURRENT LIST:"))
+            .filter(|t| t.prompt.contains("CURRENT LIST:") && t.model.as_deref() == Some("fast"))
             .map(|t| t.prompt.clone())
             .collect()
     }
@@ -1669,7 +1676,8 @@ mod tests {
         let base = ask_runner(calls.clone());
         let runner_gate = gate.clone();
         let runner: Runner = Arc::new(move |turn, delta, register| {
-            let is_ask = turn.prompt.contains("CURRENT LIST:");
+            // Gate the quick sub-lane only; the deep one runs straight through.
+            let is_ask = turn.prompt.contains("CURRENT LIST:") && turn.model.as_deref() == Some("fast");
             let reply = base(turn, delta, register);
             let gate = runner_gate.clone();
             Box::pin(async move {

@@ -7,9 +7,13 @@ import { Input } from '@/components/ui/input';
 import { useAssistant } from '@/contexts/AssistantContext';
 import { AssistantAskItem } from '@/types';
 import { appendBriefAnswer, formatUpdatedAgo } from '@/lib/ask-next';
+import { cn } from '@/lib/utils';
 
 // How often the "updated 12s ago" stamp re-renders.
 const STAMP_TICK_MS = 5000;
+// How long the items a deep check added or reworded stay highlighted, as on
+// a corrected answer card.
+const CHANGED_HIGHLIGHT_MS = 2500;
 
 interface AskNextProps {
   disabled: boolean;
@@ -29,6 +33,22 @@ export function AskNext({ disabled }: AskNextProps) {
     const timer = setInterval(() => setNow(Date.now()), STAMP_TICK_MS);
     return () => clearInterval(timer);
   }, []);
+
+  // A new deep result lights its changed items for a moment. Keyed on the
+  // result (updatedAt moves only when a list is applied), so a snapshot that
+  // repeats the same changed ids, such as a brief edit, does not relight them.
+  const [highlightChanged, setHighlightChanged] = useState(false);
+  const changedKey = asks.changed.length > 0 ? `${asks.updatedAt}:${asks.changed.join(',')}` : '';
+  useEffect(() => {
+    if (!changedKey) {
+      setHighlightChanged(false);
+      return;
+    }
+    setHighlightChanged(true);
+    const timer = setTimeout(() => setHighlightChanged(false), CHANGED_HIGHLIGHT_MS);
+    return () => clearTimeout(timer);
+  }, [changedKey]);
+  const isChanged = (id: string) => highlightChanged && asks.changed.includes(id);
 
   const hasItems = asks.asks.length > 0 || asks.forYou.length > 0;
   if (!status.sessionOpen && !hasItems) return null;
@@ -53,7 +73,16 @@ export function AskNext({ disabled }: AskNextProps) {
   return (
     <div className="max-h-80 overflow-y-auto border-b border-gray-200 p-3">
       <div className="mb-2 flex items-center justify-between gap-2">
-        <span className="text-xs font-medium text-gray-500">Ask next</span>
+        <div className="flex items-center gap-1.5">
+          <span className="text-xs font-medium text-gray-500">Ask next</span>
+          {asks.checking && (
+            <span className="flex items-center gap-1 text-[11px] text-gray-400">
+              <span className="h-1.5 w-1.5 animate-pulse rounded-full bg-amber-400" />
+              Checking
+            </span>
+          )}
+          {asks.checked && <span className="text-[11px] text-gray-400">Checked</span>}
+        </div>
         <div className="flex items-center gap-2">
           <span className={failed ? 'text-xs text-amber-600' : 'text-xs text-gray-400'}>
             {failed ? 'refresh failed' : formatUpdatedAgo(asks.updatedAt, now)}
@@ -78,7 +107,12 @@ export function AskNext({ disabled }: AskNextProps) {
         <ul className="flex flex-col gap-2">
           {asks.asks.map((item) => (
             <li key={item.id} className="group flex items-start gap-2">
-              <div className="flex-1">
+              <div
+                className={cn(
+                  'flex-1 rounded transition-colors duration-1000',
+                  isChanged(item.id) && 'bg-blue-50'
+                )}
+              >
                 <p className="text-sm text-gray-900">{item.question}</p>
                 {item.why && <p className="text-xs text-gray-400">{item.why}</p>}
               </div>
@@ -105,6 +139,7 @@ export function AskNext({ disabled }: AskNextProps) {
               <ForYouItem
                 key={item.id}
                 item={item}
+                changed={isChanged(item.id)}
                 disabled={disabled}
                 onAnswer={(answer) => answerForYou(item, answer)}
                 onDismiss={() => dismissAsk(item.id)}
@@ -119,11 +154,13 @@ export function AskNext({ disabled }: AskNextProps) {
 
 function ForYouItem({
   item,
+  changed,
   disabled,
   onAnswer,
   onDismiss,
 }: {
   item: AssistantAskItem;
+  changed: boolean;
   disabled: boolean;
   onAnswer: (answer: string) => void;
   onDismiss: () => void;
@@ -141,7 +178,9 @@ function ForYouItem({
   return (
     <li className="flex flex-col gap-1">
       <div className="flex items-start gap-2">
-        <p className="flex-1 text-sm text-gray-900">{item.question}</p>
+        <p className={cn('flex-1 rounded text-sm text-gray-900 transition-colors duration-1000', changed && 'bg-blue-50')}>
+          {item.question}
+        </p>
         <button
           type="button"
           onClick={onDismiss}
