@@ -95,6 +95,11 @@ pub struct AssistantCore {
     /// The brief as it stands in an open session. Edits land here and in
     /// both lane sets; `pending_brief` is only for before a session opens.
     brief: String,
+    /// The startup context every lane's turn carries; read by the wrapped
+    /// runner at call time. `startup` keeps the fixed files for re-resolving
+    /// the project page when the brief changes.
+    startup_ctx: super::startup_context::ContextHandle,
+    startup: Option<super::startup_context::Startup>,
     voice: VoiceAsk,
     /// The open You-utterance's text at the moment voice-ask's hotkey was
     /// pressed, if any. Stripped as a prefix from transcript text fed to
@@ -121,6 +126,10 @@ pub struct AssistantCore {
     /// and is cleared once used. A closing session puts its brief back here,
     /// because the panel's box still shows it.
     pending_brief: Option<String>,
+    /// Set by a `set_brief` made while no session is open, cleared when an
+    /// open takes the brief. `open_lanes_with` reads it to tell "cleared in
+    /// the gap" (`pending_brief` is None) from "no edit in the gap".
+    brief_edited: bool,
 
     note_state: NoteState,
     note_draft: Option<NoteDraft>,
@@ -152,6 +161,8 @@ impl Default for AssistantCore {
             ask_lane: AskLane::new(claude_runner(PathBuf::new()), AskHooks::default()),
             ask_hooks: AskHooks::default(),
             brief: String::new(),
+            startup_ctx: super::startup_context::new_handle(),
+            startup: None,
             voice: VoiceAsk::new(|_| {}, |_| {}),
             voice_baseline: String::new(),
             app: None,
@@ -166,6 +177,7 @@ impl Default for AssistantCore {
             mode: TriggerMode::Gated,
             listening: true,
             pending_brief: None,
+            brief_edited: false,
             note_state: NoteState::Idle,
             note_draft: None,
             note_markdown: String::new(),
@@ -454,6 +466,7 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
         // Keep the panel's copy current before and after a recording too.
         core.ask_lane.set_brief(text.clone());
         core.pending_brief = if text.trim().is_empty() { None } else { Some(text) };
+        core.brief_edited = true;
         return;
     }
     if core.brief == text {
@@ -461,10 +474,31 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
     }
     core.brief = text.clone();
     core.lanes.set_brief(text.clone());
-    core.ask_lane.set_brief(text);
+    core.ask_lane.set_brief(text.clone());
     if core.enabled {
         core.ask_lane.request(&core.transcript, false);
     }
+    drop(core);
+    refresh_startup(handle, text).await;
+}
+
+/// Re-resolves the project page for `brief` and updates the startup context
+/// handle. The page is read on a blocking thread with no lock held; if the
+/// brief changed again meanwhile, the later call wins and this one drops its
+/// result.
+async fn refresh_startup(handle: &AssistantHandle, brief: String) {
+    let startup = handle.0.lock().await.startup.clone();
+    let Some(startup) = startup else { return };
+    let b = brief.clone();
+    let Ok((ctx, slug)) = tokio::task::spawn_blocking(move || startup.render(&b)).await else {
+        return;
+    };
+    let core = handle.0.lock().await;
+    if core.brief != brief {
+        return;
+    }
+    super::startup_context::log_built(&ctx, slug.as_deref(), "re-resolved on brief change");
+    super::startup_context::set_context(&core.startup_ctx, &ctx);
 }
 
 /// The Refresh button and Option-Q. Runs even when nothing changed and
@@ -488,8 +522,9 @@ async fn rerun_asks(handle: &AssistantHandle) {
     if !core.session_open || !core.enabled {
         return;
     }
-    // The dirty flag includes manual refreshes even with no new transcript.
-    core.ask_lane.request(&core.transcript, true);
+    // Fires only the sub-lanes that owe a follow-up. Their dirty flag
+    // includes manual refreshes even with no new transcript.
+    core.ask_lane.rerun(&core.transcript);
 }
 
 pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
@@ -789,9 +824,27 @@ async fn open_lanes_with(
     let ask_cfg = AskConfig {
         cwd: cfg.cwd.clone(),
         model: cfg.fast_model.clone(),
+        deep_model: cfg.deep_model.clone(),
+        deep_effort: cfg.deep_effort.clone(),
+        deep_read_dirs: cfg.deep_read_dirs.clone(),
     };
     core.ask_lane.open(trunk, ask_cfg, brief).await;
 
+    // A brief set while the lanes were opening went to `pending_brief` (the
+    // session was not open yet). It is newer than `brief`: the session uses it.
+    // An edit that cleared the brief counts too: it wins over `brief`.
+    let edited = std::mem::take(&mut core.brief_edited);
+    let pending = core.pending_brief.take();
+    let newer = if edited {
+        Some(pending.unwrap_or_default()).filter(|b| *b != core.brief)
+    } else {
+        pending.filter(|b| *b != core.brief)
+    };
+    if let Some(newer) = &newer {
+        core.brief = newer.clone();
+        core.lanes.set_brief(newer.clone());
+        core.ask_lane.set_brief(newer.clone());
+    }
     core.session_open = true;
     let lanes_ready = core.lanes_ready;
     core.set_last_error(if lanes_ready {
@@ -804,6 +857,10 @@ async fn open_lanes_with(
         core.lanes_ready
     );
     core.emit_status();
+    drop(core);
+    if let Some(newer) = newer {
+        refresh_startup(handle, newer).await;
+    }
 }
 
 /// Bound to `recording-started`. Reloads settings fresh (so a save made
@@ -911,7 +968,11 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
 
     // Take the brief only now that the session is sure to open: an early
     // return above leaves it pending, so the next attempt still has it.
-    let brief = handle.0.lock().await.pending_brief.take();
+    let brief = {
+        let mut core = handle.0.lock().await;
+        core.brief_edited = false;
+        core.pending_brief.take()
+    };
 
     let cfg = LaneConfig {
         cwd: session_dir,
@@ -938,7 +999,32 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         start_capture(handle, app.as_ref()).await;
     }
 
-    open_lanes_with(handle, cfg, seed, brief.unwrap_or_default(), claude_runner(bin)).await;
+    // The fixed files are read once here; a later brief change only
+    // re-resolves the project page.
+    let brief = brief.unwrap_or_default();
+    let b = brief.clone();
+    let (startup, rendered) = tokio::task::spawn_blocking(move || {
+        let startup = super::startup_context::Startup::load_from_home();
+        let rendered = startup.as_ref().map(|s| s.render(&b));
+        (startup, rendered)
+    })
+    .await
+    .unwrap_or((None, None));
+    let ctx_handle = {
+        let mut core = handle.0.lock().await;
+        let ctx = match &rendered {
+            Some((ctx, slug)) => {
+                super::startup_context::log_built(ctx, slug.as_deref(), "built at open");
+                ctx.as_str()
+            }
+            None => "",
+        };
+        super::startup_context::set_context(&core.startup_ctx, ctx);
+        core.startup = startup;
+        core.startup_ctx.clone()
+    };
+    let runner = super::startup_context::with_context(claude_runner(bin), ctx_handle);
+    open_lanes_with(handle, cfg, seed, brief, runner).await;
 }
 
 /// The Settings switch "see the Zoom window", applied to a running call.
@@ -1384,7 +1470,8 @@ mod tests {
     /// past the fork) get a one-item list; everything else gets READY.
     fn ask_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
         Arc::new(move |turn, _on_delta, _register| {
-            let is_ask_turn = turn.append_system_prompt.as_deref() == Some(ASK_PROMPT)
+            // The deep sub-lane's prompt is ASK_PROMPT plus its own addendum.
+            let is_ask_turn = turn.append_system_prompt.as_deref().is_some_and(|p| p.starts_with(ASK_PROMPT))
                 && !turn.prompt.starts_with("Standing by");
             calls.lock().unwrap().push(turn);
             let text = if is_ask_turn {
@@ -1402,12 +1489,14 @@ mod tests {
         })
     }
 
+    /// The quick sub-lane's ask turns. The deep sub-lane runs a turn beside
+    /// each one, so counting both would double every number.
     fn ask_turns(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Vec<String> {
         calls
             .lock()
             .unwrap()
             .iter()
-            .filter(|t| t.prompt.contains("CURRENT LIST:"))
+            .filter(|t| t.prompt.contains("CURRENT LIST:") && t.model.as_deref() == Some("fast"))
             .map(|t| t.prompt.clone())
             .collect()
     }
@@ -1576,6 +1665,40 @@ mod tests {
         assert_eq!(ask_turns(&calls).len(), 1, "closed sessions must not refresh");
     }
 
+    /// The open path takes `pending_brief`, drops the lock, and opens the
+    /// lanes later; a `set_brief` in that gap lands in `pending_brief`. The
+    /// session must end up with it everywhere, and the context must name its
+    /// project page.
+    #[tokio::test]
+    async fn a_brief_set_while_the_lanes_open_becomes_the_session_brief() {
+        let home = std::env::temp_dir().join(format!("core-brief-race-{}", uuid::Uuid::new_v4()));
+        let wiki = home.join("brain/wiki/Wiki");
+        std::fs::create_dir_all(wiki.join("Projects")).unwrap();
+        std::fs::write(wiki.join("index.md"), "[[Projects/fesco]]").unwrap();
+        std::fs::write(wiki.join("Projects/fesco.md"), "FESCO PAGE TEXT").unwrap();
+
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.startup = Some(crate::assistant::startup_context::Startup::load(&home));
+        }
+        // The open path already took "old" (pending is empty); the user then
+        // edits the brief before open_lanes_with runs.
+        set_brief(&handle, "FESCO kickoff".to_string()).await;
+        open_lanes_with(&handle, test_lane_cfg(), "seed".into(), "old".into(), ask_runner(calls.clone())).await;
+
+        let core = handle.0.lock().await;
+        assert!(core.session_open);
+        assert_eq!(core.brief, "FESCO kickoff");
+        assert_eq!(core.pending_brief, None);
+        assert_eq!(core.ask_lane.snapshot().brief, "FESCO kickoff");
+        let ctx = core.startup_ctx.read().unwrap().clone();
+        assert!(ctx.contains("FESCO PAGE TEXT"), "context was: {ctx}");
+        drop(core);
+        let _ = std::fs::remove_dir_all(&home);
+    }
+
     #[tokio::test]
     async fn closing_the_session_carries_the_brief_into_the_next_one() {
         let handle = AssistantHandle::new();
@@ -1583,6 +1706,38 @@ mod tests {
         open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls)).await;
         close_session(&handle).await;
         assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"));
+    }
+
+    /// A brief cleared while the lanes open wins over the one the open path
+    /// took, and the next session does not inherit the old text.
+    #[tokio::test]
+    async fn a_brief_cleared_while_the_lanes_open_wins() {
+        let home = std::env::temp_dir().join(format!("core-brief-clear-{}", uuid::Uuid::new_v4()));
+        let wiki = home.join("brain/wiki/Wiki");
+        std::fs::create_dir_all(wiki.join("Projects")).unwrap();
+        std::fs::write(wiki.join("index.md"), "[[Projects/fesco]]").unwrap();
+        std::fs::write(wiki.join("Projects/fesco.md"), "FESCO PAGE TEXT").unwrap();
+
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.startup = Some(crate::assistant::startup_context::Startup::load(&home));
+        }
+        set_brief(&handle, String::new()).await;
+        open_lanes_with(&handle, test_lane_cfg(), "seed".into(), "old".into(), ask_runner(calls.clone())).await;
+
+        {
+            let core = handle.0.lock().await;
+            assert!(core.session_open);
+            assert_eq!(core.brief, "");
+            assert_eq!(core.ask_lane.snapshot().brief, "");
+            let ctx = core.startup_ctx.read().unwrap().clone();
+            assert!(!ctx.contains("FESCO PAGE TEXT"), "context was: {ctx}");
+        }
+        close_session(&handle).await;
+        assert_eq!(handle.0.lock().await.pending_brief, None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]
@@ -1635,7 +1790,8 @@ mod tests {
         let base = ask_runner(calls.clone());
         let runner_gate = gate.clone();
         let runner: Runner = Arc::new(move |turn, delta, register| {
-            let is_ask = turn.prompt.contains("CURRENT LIST:");
+            // Gate the quick sub-lane only; the deep one runs straight through.
+            let is_ask = turn.prompt.contains("CURRENT LIST:") && turn.model.as_deref() == Some("fast");
             let reply = base(turn, delta, register);
             let gate = runner_gate.clone();
             Box::pin(async move {

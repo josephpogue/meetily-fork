@@ -25,7 +25,16 @@ const DEFAULT_STATUS: AssistantStatus = {
 
 const DEFAULT_VOICE: AssistantVoice = { state: 'off', heard: '' };
 const DEFAULT_NOTE: AssistantNote = { state: 'idle', markdown: '', error: null };
-const DEFAULT_ASKS: AssistantAsks = { state: 'idle', asks: [], forYou: [], updatedAt: null, brief: '' };
+const DEFAULT_ASKS: AssistantAsks = {
+  state: 'idle',
+  asks: [],
+  forYou: [],
+  updatedAt: null,
+  brief: '',
+  checked: false,
+  checking: false,
+  changed: [],
+};
 
 interface AssistantContextType {
   status: AssistantStatus;

@@ -201,6 +201,12 @@ export interface AssistantAsks {
   forYou: AssistantAskItem[];
   updatedAt: number | null;
   brief: string;
+  // True while the shown list came from the deep check.
+  checked: boolean;
+  // True while the shown list is a quick one and the deep check is running.
+  checking: boolean;
+  // Ids of the items the last deep check added or reworded.
+  changed: string[];
 }
 
 export interface AssistantSettings {

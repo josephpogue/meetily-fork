@@ -1,23 +1,35 @@
 // assistant/ask_lane.rs
 //
-// Ask Next: a third claude lineage forked from the same trunk as the answer
-// lanes. Each turn sends what changed since the last one (transcript delta,
-// a brief edit, dismissals) and gets back the whole list of questions
-// Joseph should still ask. At most one turn runs at a time. Requests that
-// land meanwhile coalesce into one follow-up, fired through
-// `AskHooks::rerun`, because only core holds the transcript.
+// Ask Next: claude lineages forked from the same trunk as the answer lanes.
+// Like the answer cards, the list comes in two passes: a quick sub-lane
+// (the fast model, no tools) shows a list first, and a deep sub-lane (the
+// deep model, read-only tools over Joseph's vault) later replaces or
+// corrects it. Each turn sends what changed since that sub-lane's last one
+// (transcript delta, a brief edit, dismissals) and gets back the whole list
+// of questions Joseph should still ask. At most one turn per sub-lane runs
+// at a time. Requests that land meanwhile coalesce into one follow-up,
+// fired through `AskHooks::rerun`, because only core holds the transcript.
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use super::ask_list::{self, AskItem, AskList};
-use super::claude_cli::{ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS};
+use super::ask_list::{self, AskItem, AskList, RawList};
+use super::claude_cli::{
+    ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS, READ_ONLY_TOOLS, WRITE_TOOLS,
+};
 use super::lanes::{run_with_retry, DeltaCb, FrameBatch, FrameFeed, FrameMode, RegisterCb, Runner};
 use super::transcript::TranscriptLog;
 
 pub const ASK_PROMPT: &str = include_str!("prompts/ask.md");
+/// Appended after `ASK_PROMPT` for the deep sub-lane.
+pub const ASK_DEEP_PROMPT: &str = include_str!("prompts/ask_deep.md");
+
+/// The deep sub-lane's system prompt: the shared contract, then its extra role.
+pub fn ask_deep_system_prompt() -> String {
+    format!("{}\n\n{}", ASK_PROMPT, ASK_DEEP_PROMPT)
+}
 
 /// Higher than the fast lane's low: the quality of the questions is the
 /// whole point, and nobody is waiting two seconds on this list.
@@ -32,6 +44,14 @@ pub struct AsksOut {
     pub for_you: Vec<AskItem>,
     pub updated_at: Option<i64>,
     pub brief: String,
+    /// True while the shown list came from the deep sub-lane.
+    pub checked: bool,
+    /// True while the shown list is a quick one and the deep sub-lane is
+    /// still working on a fuller one.
+    pub checking: bool,
+    /// Ids of the items the last deep result added or reworded relative to
+    /// the list it replaced. Empty for a quick result.
+    pub changed: Vec<String>,
 }
 
 pub type AskEmitFn = Arc<dyn Fn(AsksOut) + Send + Sync>;
@@ -39,7 +59,8 @@ pub type AskEmitFn = Arc<dyn Fn(AsksOut) + Send + Sync>;
 #[derive(Clone)]
 pub struct AskHooks {
     pub emit: AskEmitFn,
-    /// Called once when a turn finishes and requests landed while it ran.
+    /// Called once when a turn finishes and a sub-lane has a follow-up
+    /// waiting. Core answers by calling `AskLane::rerun`.
     pub rerun: Arc<dyn Fn() + Send + Sync>,
     pub on_error: Arc<dyn Fn(String) + Send + Sync>,
 }
@@ -57,49 +78,127 @@ impl Default for AskHooks {
 #[derive(Debug, Clone)]
 pub struct AskConfig {
     pub cwd: PathBuf,
+    /// The fast sub-lane's model.
     pub model: String,
+    pub deep_model: String,
+    pub deep_effort: String,
+    /// Extra directories the deep sub-lane may read (Joseph's vault).
+    pub deep_read_dirs: Vec<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Which {
+    Fast,
+    Deep,
+}
+
+impl Which {
+    const ALL: [Which; 2] = [Which::Fast, Which::Deep];
+
+    fn idx(self) -> usize {
+        match self {
+            Which::Fast => 0,
+            Which::Deep => 1,
+        }
+    }
+}
+
+/// Which sub-lane wrote the list on screen.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+enum Shown {
+    #[default]
+    None,
+    Fast,
+    Deep,
+}
+
+/// One claude lineage and everything that is private to it.
+#[derive(Default)]
+struct SubLane {
+    lane_id: Option<String>,
+    /// Transcript cursor; advances only when a turn succeeds.
+    cursor: usize,
+    in_flight: bool,
+    /// A request landed while a turn ran; one forced follow-up is owed.
+    dirty: bool,
+    /// Last frame seq sent; advances only when a turn succeeds.
+    frame_cursor: u64,
+    /// The brief version the model last received. The trunk seed already
+    /// carries the opening brief, so brief_version and this start at 0.
+    brief_sent: u64,
+    /// How many of `AskState::dismissed` the model has been told about.
+    dismissed_sent: usize,
 }
 
 #[derive(Default)]
 struct AskState {
-    lane_id: Option<String>,
     cfg: Option<AskConfig>,
+    subs: [SubLane; 2],
+    /// Set by `open` when no sub-lane could be forked.
     unavailable: bool,
-    /// Transcript cursor; advances only when a turn succeeds.
-    cursor: usize,
-    in_flight: bool,
-    dirty: bool,
     failed: bool,
     list: AskList,
     updated_at: Option<i64>,
     brief: String,
-    /// Bumped on every brief edit; `brief_sent` is the version the model
-    /// last received. The trunk seed already carries the opening brief, so
-    /// both start at 0.
+    /// Bumped on every brief edit.
     brief_version: u64,
-    brief_sent: u64,
-    /// Every question Joseph dismissed this session, for filtering.
+    /// Every question Joseph dismissed this session, for filtering and for
+    /// telling each sub-lane once.
     dismissed: Vec<String>,
-    /// Dismissals the model has not been told about yet.
-    dismissed_unsent: Vec<String>,
     /// Bumped by `close`; a turn that finishes under an older generation is
     /// dropped on the floor.
     generation: u64,
     live_runs: Vec<TurnHandle>,
     /// Zoom window frames, when the assistant can see the window.
     frames: Option<FrameFeed>,
-    /// Last frame seq sent; advances only when a turn succeeds.
-    frame_cursor: u64,
+    /// Transcript point the shown list covers, and who wrote it.
+    shown_point: usize,
+    shown_by: Shown,
+    /// The list the running (or last) deep turn was given as CURRENT LIST.
+    /// Deep runs one turn at a time, so one slot is enough.
+    deep_base: AskList,
+    changed: Vec<String>,
+}
+
+/// Everything one fired turn needs once it comes back.
+struct Job {
+    which: Which,
+    turn: ClaudeTurn,
+    batch: FrameBatch,
+    new_frame_cursor: u64,
+    generation: u64,
+    sent_version: u64,
+    sent_dismissed: usize,
+    new_cursor: usize,
+}
+
+struct Landed {
+    out: AsksOut,
+    /// A sub-lane has a follow-up waiting.
+    rerun: bool,
+    error: Option<String>,
 }
 
 impl AskState {
+    fn sub(&self, which: Which) -> &SubLane {
+        &self.subs[which.idx()]
+    }
+
+    fn sub_mut(&mut self, which: Which) -> &mut SubLane {
+        &mut self.subs[which.idx()]
+    }
+
     fn snapshot(&self) -> AsksOut {
+        // The state follows the quick sub-lane; deep work shows only through
+        // `checking`, unless nothing has been shown yet.
         let state = if self.unavailable {
             "unavailable"
-        } else if self.in_flight {
+        } else if self.sub(Which::Fast).in_flight {
             "thinking"
         } else if self.failed {
             "failed"
+        } else if self.shown_by == Shown::None && self.sub(Which::Deep).in_flight {
+            "thinking"
         } else {
             "idle"
         };
@@ -109,6 +208,246 @@ impl AskState {
             for_you: self.list.for_you.clone(),
             updated_at: self.updated_at,
             brief: self.brief.clone(),
+            checked: self.shown_by == Shown::Deep,
+            checking: self.sub(Which::Deep).in_flight && self.shown_by != Shown::Deep,
+            changed: self.changed.clone(),
+        }
+    }
+}
+
+impl AskState {
+    /// Builds the turn for one sub-lane, or None when it has nothing to do:
+    /// no lane, a turn already running (a follow-up is then owed), or no
+    /// news and not forced. `rerun` fires only a sub-lane that owes a
+    /// follow-up.
+    fn prepare(&mut self, which: Which, log: &TranscriptLog, force: bool, rerun: bool) -> Option<Job> {
+        let cfg = self.cfg.clone()?;
+        let sub = self.sub(which);
+        let lane_id = sub.lane_id.clone()?;
+        if rerun && (!sub.dirty || sub.in_flight) {
+            return None;
+        }
+        if sub.in_flight {
+            self.sub_mut(which).dirty = true;
+            return None;
+        }
+        let (delta, new_cursor) = log.delta_since(sub.cursor);
+        let in_progress = log.open_preview();
+        let brief_changed = self.brief_version != sub.brief_sent;
+        let unsent = &self.dismissed[sub.dismissed_sent.min(self.dismissed.len())..];
+        let has_news = !delta.is_empty() || brief_changed || !unsent.is_empty();
+        if !force && !has_news {
+            return None;
+        }
+        let prompt = ask_prompt(
+            &delta,
+            &in_progress,
+            brief_changed.then(|| self.brief.as_str()),
+            unsent,
+            &self.list,
+        );
+        let sent_dismissed = self.dismissed.len();
+        let sent_version = self.brief_version;
+        let (batch, new_frame_cursor) = match self.frames.clone() {
+            Some(feed) => feed.select(sub.frame_cursor, FrameMode::All),
+            None => (FrameBatch::default(), sub.frame_cursor),
+        };
+        let turn = lane_turn(&cfg, which, lane_id, prompt, false);
+        let generation = self.generation;
+        if which == Which::Deep {
+            self.deep_base = self.list.clone();
+        }
+        let sub = self.sub_mut(which);
+        sub.in_flight = true;
+        sub.dirty = false;
+        Some(Job {
+            which,
+            turn,
+            batch,
+            new_frame_cursor,
+            generation,
+            sent_version,
+            sent_dismissed,
+            new_cursor,
+        })
+    }
+
+    /// Takes in a finished turn. The sub-lane's own cursors advance on any
+    /// readable reply, because its model has seen that transcript; whether
+    /// the list changes is a separate question.
+    fn land(&mut self, job: &Job, parsed: Option<RawList>, error: Option<String>) -> Landed {
+        let which = job.which;
+        let point = job.new_cursor;
+        let sub = self.sub_mut(which);
+        sub.in_flight = false;
+        let error = match parsed {
+            Some(raw) => {
+                sub.cursor = job.new_cursor;
+                sub.frame_cursor = job.new_frame_cursor;
+                sub.brief_sent = job.sent_version;
+                sub.dismissed_sent = job.sent_dismissed;
+                match which {
+                    Which::Fast => {
+                        let applies = point > self.shown_point
+                            || (point == self.shown_point && self.shown_by != Shown::Deep);
+                        if applies {
+                            self.list = ask_list::build(&self.list, raw, &self.dismissed);
+                            self.changed.clear();
+                            self.shown_by = Shown::Fast;
+                            self.shown_point = point;
+                            self.updated_at = Some(chrono::Utc::now().timestamp_millis());
+                            self.failed = false;
+                        } else {
+                            log::debug!(
+                                "assistant ask: quick list at point {} dropped, the checked list covers point {}",
+                                point,
+                                self.shown_point
+                            );
+                        }
+                    }
+                    Which::Deep => {
+                        // A deep list built from less transcript than the
+                        // shown quick list keeps the quick list's newer items.
+                        let raw = if point < self.shown_point {
+                            merge_raw(&self.list, &self.deep_base, raw, &self.dismissed)
+                        } else {
+                            raw
+                        };
+                        let next = ask_list::build(&self.list, raw, &self.dismissed);
+                        self.changed = changed_ids(&self.list, &next);
+                        self.list = next;
+                        self.shown_by = Shown::Deep;
+                        self.shown_point = self.shown_point.max(point);
+                        self.updated_at = Some(chrono::Utc::now().timestamp_millis());
+                        self.failed = false;
+                    }
+                }
+                None
+            }
+            None => {
+                // A deep failure only reports once some result has been shown.
+                if which == Which::Fast || self.shown_by == Shown::None {
+                    self.failed = true;
+                }
+                Some(error.unwrap_or_else(|| "Ask next could not read the model's reply.".to_string()))
+            }
+        };
+        let rerun = self.sub(which).dirty;
+        Landed { out: self.snapshot(), rerun, error }
+    }
+}
+
+/// A deep list that was built from less transcript than the shown quick list:
+/// deep's items in deep's order, then each shown item that deep neither kept
+/// nor was given (it came from transcript deep never heard). Items deep was
+/// given and dropped stay dropped. Dismissed questions are removed before the
+/// cap, so they cannot crowd out a newer item. Capped like any list, deep's
+/// first.
+fn merge_raw(shown: &AskList, base: &AskList, mut raw: RawList, dismissed: &[String]) -> RawList {
+    let gone = |q: &str| dismissed.iter().any(|d| ask_list::same_item(d, q));
+    raw.asks.retain(|(q, _)| !gone(q));
+    raw.for_you.retain(|q| !gone(q));
+    let newer = |items: &[AskItem], base: &[AskItem], have: &dyn Fn(&str) -> bool| -> Vec<String> {
+        items
+            .iter()
+            .filter(|i| !gone(&i.question) && !have(&i.question) && !base.iter().any(|b| ask_list::same_item(&b.question, &i.question)))
+            .map(|i| i.question.clone())
+            .collect()
+    };
+    let ask_extra: Vec<(String, String)> = {
+        let have = |q: &str| raw.asks.iter().any(|(d, _)| ask_list::same_item(d, q));
+        let qs = newer(&shown.asks, &base.asks, &have);
+        shown
+            .asks
+            .iter()
+            .filter(|i| qs.contains(&i.question))
+            .map(|i| (i.question.clone(), i.why.clone()))
+            .collect()
+    };
+    let you_extra = {
+        let have = |q: &str| raw.for_you.iter().any(|d| ask_list::same_item(d, q));
+        newer(&shown.for_you, &base.for_you, &have)
+    };
+    raw.asks.extend(ask_extra);
+    raw.asks.truncate(ask_list::MAX_ASKS);
+    raw.for_you.extend(you_extra);
+    raw.for_you.truncate(ask_list::MAX_FOR_YOU);
+    raw
+}
+
+/// Ids of the items in `next` that are new, or worded differently, relative
+/// to `prev`.
+fn changed_ids(prev: &AskList, next: &AskList) -> Vec<String> {
+    let before = |id: &str| prev.asks.iter().chain(prev.for_you.iter()).find(|p| p.id == id);
+    next.asks
+        .iter()
+        .chain(next.for_you.iter())
+        .filter(|n| before(&n.id).map_or(true, |p| p.question != n.question))
+        .map(|n| n.id.clone())
+        .collect()
+}
+
+/// The claude turn for one sub-lane. The fast one reads nothing; the deep
+/// one may read the vault and never write or reach the network, the same
+/// policy as the deep answer lane.
+fn lane_turn(cfg: &AskConfig, which: Which, lane_id: String, prompt: String, fork: bool) -> ClaudeTurn {
+    let mut turn = ClaudeTurn {
+        prompt,
+        cwd: cfg.cwd.clone(),
+        resume: Some(lane_id),
+        fork,
+        partial: false,
+        safe_mode: true,
+        ..Default::default()
+    };
+    match which {
+        Which::Fast => {
+            turn.model = Some(cfg.model.clone());
+            turn.effort = Some(ASK_EFFORT.to_string());
+            turn.append_system_prompt = Some(ASK_PROMPT.to_string());
+            turn.disallowed_tools = no_tools();
+        }
+        Which::Deep => {
+            turn.model = Some(cfg.deep_model.clone());
+            turn.effort = Some(cfg.deep_effort.clone());
+            turn.append_system_prompt = Some(ask_deep_system_prompt());
+            turn.allowed_tools = READ_ONLY_TOOLS.iter().map(|s| s.to_string()).collect();
+            turn.disallowed_tools = WRITE_TOOLS.iter().map(|s| s.to_string()).collect();
+            turn.add_dirs = cfg.deep_read_dirs.clone();
+        }
+    }
+    turn
+}
+
+/// Held by a spawned turn task until its result lands. If the task dies first
+/// the sub-lane would stay "in flight" for good, so the drop clears it.
+struct InFlightGuard {
+    state: Arc<Mutex<AskState>>,
+    hooks: AskHooks,
+    which: Which,
+    generation: u64,
+    armed: bool,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (out, dirty) = {
+            let mut s = self.state.lock().unwrap_or_else(|e| e.into_inner());
+            if s.generation != self.generation {
+                return;
+            }
+            let sub = s.sub_mut(self.which);
+            sub.in_flight = false;
+            let dirty = sub.dirty;
+            (s.snapshot(), dirty)
+        };
+        log::warn!("assistant ask {:?} turn ended without a result", self.which);
+        (self.hooks.emit)(out);
+        if dirty {
+            (self.hooks.rerun)();
         }
     }
 }
@@ -128,48 +467,55 @@ impl AskLane {
         }
     }
 
-    /// Forks the ask lineage off the seeded trunk. `trunk_id` is None when
+    /// Forks both ask lineages off the seeded trunk. `trunk_id` is None when
     /// the trunk seed failed; the lane then reports "unavailable" for this
-    /// call and every request is a no-op.
+    /// call and every request is a no-op. A deep fork that fails leaves the
+    /// quick sub-lane working alone.
     pub async fn open(&self, trunk_id: Option<String>, cfg: AskConfig, brief: String) {
         {
             let mut s = self.state.lock().unwrap();
             s.brief = brief;
             s.cfg = Some(cfg.clone());
         }
-        let lane_id = match trunk_id {
+        let (fast_id, deep_id) = match trunk_id {
             Some(trunk) => {
-                let turn = ClaudeTurn {
-                    prompt: "Standing by. Reply with exactly the word READY.".to_string(),
-                    cwd: cfg.cwd.clone(),
-                    model: Some(cfg.model.clone()),
-                    effort: Some(ASK_EFFORT.to_string()),
-                    resume: Some(trunk),
-                    fork: true,
-                    append_system_prompt: Some(ASK_PROMPT.to_string()),
-                    disallowed_tools: no_tools(),
-                    partial: false,
-                    safe_mode: true,
-                    ..Default::default()
-                };
-                let outcome = self.run_bare(turn).await;
-                match outcome.error {
-                    Some(err) => {
-                        log::warn!("assistant ask lane fork failed: {}", err);
-                        None
-                    }
-                    None => outcome.session_id,
-                }
+                tokio::join!(
+                    self.fork(&trunk, &cfg, Which::Fast),
+                    self.fork(&trunk, &cfg, Which::Deep)
+                )
             }
-            None => None,
+            None => (None, None),
         };
         let out = {
             let mut s = self.state.lock().unwrap();
-            s.unavailable = lane_id.is_none();
-            s.lane_id = lane_id;
+            s.unavailable = fast_id.is_none() && deep_id.is_none();
+            s.sub_mut(Which::Fast).lane_id = fast_id;
+            s.sub_mut(Which::Deep).lane_id = deep_id;
             s.snapshot()
         };
         (self.hooks.emit)(out);
+    }
+
+    async fn fork(&self, trunk: &str, cfg: &AskConfig, which: Which) -> Option<String> {
+        let mut turn = lane_turn(
+            cfg,
+            which,
+            trunk.to_string(),
+            "Standing by. Reply with exactly the word READY.".to_string(),
+            true,
+        );
+        // The standby turn reads nothing.
+        turn.allowed_tools.clear();
+        turn.add_dirs.clear();
+        turn.disallowed_tools = no_tools();
+        let outcome = self.run_bare(turn).await;
+        match outcome.error {
+            Some(err) => {
+                log::warn!("assistant ask {:?} lane fork failed: {}", which, err);
+                None
+            }
+            None => outcome.session_id,
+        }
     }
 
     async fn run_bare(&self, turn: ClaudeTurn) -> ClaudeOutcome {
@@ -180,73 +526,57 @@ impl AskLane {
         (self.runner)(turn, Box::new(|_| {}), register).await
     }
 
-    /// Runs one ask turn now, or marks a follow-up if one is already
-    /// running. `force` runs even when nothing changed (the Refresh button);
-    /// an automatic request with nothing new is a no-op.
+    /// Runs one ask turn per idle sub-lane now, or marks a follow-up for a
+    /// sub-lane that is already running. `force` runs even when nothing
+    /// changed (the Refresh button); an automatic request with nothing new
+    /// is a no-op for that sub-lane.
     pub fn request(&self, log: &TranscriptLog, force: bool) {
-        let (turn, batch, new_frame_cursor, generation, sent_version, sent_dismissed, new_cursor, out) = {
+        self.fire(log, force, false);
+    }
+
+    /// The follow-up core runs after `AskHooks::rerun`: only the sub-lanes
+    /// that owe one, forced.
+    pub fn rerun(&self, log: &TranscriptLog) {
+        self.fire(log, true, true);
+    }
+
+    fn fire(&self, log: &TranscriptLog, force: bool, rerun: bool) {
+        let (jobs, out) = {
             let mut s = self.state.lock().unwrap();
-            let (Some(lane_id), Some(cfg)) = (s.lane_id.clone(), s.cfg.clone()) else {
-                return;
-            };
-            if s.in_flight {
-                s.dirty = true;
-                return;
-            }
-            let (delta, new_cursor) = log.delta_since(s.cursor);
-            let in_progress = log.open_preview();
-            let brief_changed = s.brief_version != s.brief_sent;
-            let has_news = !delta.is_empty() || brief_changed || !s.dismissed_unsent.is_empty();
-            if !force && !has_news {
+            let jobs: Vec<Job> = Which::ALL
+                .into_iter()
+                .filter_map(|which| s.prepare(which, log, force, rerun))
+                .collect();
+            if jobs.is_empty() {
                 return;
             }
-            let prompt = ask_prompt(
-                &delta,
-                &in_progress,
-                brief_changed.then(|| s.brief.as_str()),
-                &s.dismissed_unsent,
-                &s.list,
-            );
-            s.in_flight = true;
-            s.dirty = false;
-            let turn = ClaudeTurn {
-                prompt,
-                cwd: cfg.cwd,
-                model: Some(cfg.model),
-                effort: Some(ASK_EFFORT.to_string()),
-                resume: Some(lane_id),
-                append_system_prompt: Some(ASK_PROMPT.to_string()),
-                disallowed_tools: no_tools(),
-                partial: false,
-                safe_mode: true,
-                ..Default::default()
-            };
-            let (batch, new_frame_cursor) = match s.frames.clone() {
-                Some(feed) => feed.select(s.frame_cursor, FrameMode::All),
-                None => (FrameBatch::default(), s.frame_cursor),
-            };
-            (
-                turn,
-                batch,
-                new_frame_cursor,
-                s.generation,
-                s.brief_version,
-                s.dismissed_unsent.len(),
-                new_cursor,
-                s.snapshot(),
-            )
+            (jobs, s.snapshot())
         };
         (self.hooks.emit)(out);
+        for job in jobs {
+            self.spawn(job);
+        }
+    }
 
+    fn spawn(&self, job: Job) {
         let runner = self.runner.clone();
         let state = self.state.clone();
         let hooks = self.hooks.clone();
         tokio::spawn(async move {
+            // Clears in_flight if this task panics or is dropped before `land`.
+            let mut guard = InFlightGuard {
+                state: state.clone(),
+                hooks: hooks.clone(),
+                which: job.which,
+                generation: job.generation,
+                armed: true,
+            };
             let register_state = state.clone();
+            let generation = job.generation;
             let outcome = run_with_retry(
                 &runner,
-                turn,
-                batch,
+                job.turn.clone(),
+                job.batch.clone(),
                 move || -> (DeltaCb, RegisterCb) {
                     let register_state = register_state.clone();
                     (
@@ -265,53 +595,33 @@ impl AskLane {
                 Some(_) => None,
             };
 
-            let (out, rerun, error) = {
+            let landed = {
                 let mut s = state.lock().unwrap();
                 if s.generation != generation {
                     return;
                 }
-                s.in_flight = false;
-                let error = match parsed {
-                    Some(raw) => {
-                        let next = ask_list::build(&s.list, raw, &s.dismissed);
-                        s.list = next;
-                        s.cursor = new_cursor;
-                        s.frame_cursor = new_frame_cursor;
-                        s.brief_sent = sent_version;
-                        s.dismissed_unsent.drain(..sent_dismissed);
-                        s.updated_at = Some(chrono::Utc::now().timestamp_millis());
-                        s.failed = false;
-                        None
-                    }
-                    None => {
-                        s.failed = true;
-                        Some(
-                            outcome
-                                .error
-                                .clone()
-                                .unwrap_or_else(|| "Ask next could not read the model's reply.".to_string()),
-                        )
-                    }
-                };
-                (s.snapshot(), std::mem::take(&mut s.dirty), error)
+                guard.armed = false;
+                s.land(&job, parsed, outcome.error.clone())
             };
-            (hooks.emit)(out);
-            if let Some(err) = error {
-                log::warn!("assistant ask turn failed: {}", err);
+            (hooks.emit)(landed.out);
+            if let Some(err) = landed.error {
+                log::warn!("assistant ask {:?} turn failed: {}", job.which, err);
                 (hooks.on_error)(err);
             }
-            if rerun {
+            if landed.rerun {
                 (hooks.rerun)();
             }
         });
     }
 
     /// Hands the lane the frames of the Zoom window, or None when the
-    /// assistant cannot see it. The cursor restarts at 0.
+    /// assistant cannot see it. The cursors restart at 0.
     pub fn set_frames(&self, feed: Option<FrameFeed>) {
         let mut s = self.state.lock().unwrap();
         s.frames = feed;
-        s.frame_cursor = 0;
+        for sub in s.subs.iter_mut() {
+            sub.frame_cursor = 0;
+        }
     }
 
     #[cfg(test)]
@@ -332,8 +642,9 @@ impl AskLane {
         (self.hooks.emit)(out);
     }
 
-    /// Removes the item at once and remembers it so it never comes back.
-    /// False when no item has that id.
+    /// Removes the item at once and remembers it so it never comes back,
+    /// not even from a deep turn that is already running. False when no item
+    /// has that id.
     pub fn dismiss(&self, id: &str) -> bool {
         let out = {
             let mut s = self.state.lock().unwrap();
@@ -344,23 +655,24 @@ impl AskLane {
             } else {
                 return false;
             };
-            s.dismissed.push(removed.question.clone());
-            s.dismissed_unsent.push(removed.question);
+            s.dismissed.push(removed.question);
             s.snapshot()
         };
         (self.hooks.emit)(out);
         true
     }
 
-    /// Kills an in-flight turn and stops all further turns. The last list
+    /// Kills in-flight turns and stops all further turns. The last list
     /// stays visible until the next session opens a fresh lane.
     pub fn close(&self) {
         let (handles, out) = {
             let mut s = self.state.lock().unwrap();
             s.generation += 1;
-            s.in_flight = false;
-            s.dirty = false;
-            s.lane_id = None;
+            for sub in s.subs.iter_mut() {
+                sub.in_flight = false;
+                sub.dirty = false;
+                sub.lane_id = None;
+            }
             (std::mem::take(&mut s.live_runs), s.snapshot())
         };
         for handle in handles {
@@ -519,13 +831,24 @@ mod tests {
         }
     }
 
+    fn test_cfg() -> AskConfig {
+        AskConfig {
+            cwd: std::env::temp_dir(),
+            model: "ask-model".to_string(),
+            deep_model: "deep-model".to_string(),
+            deep_effort: "high".to_string(),
+            deep_read_dirs: vec![PathBuf::from("/vault")],
+        }
+    }
+
     impl AskLane {
+        /// A lane whose deep fork failed: only the quick sub-lane exists.
         fn for_test(runner: Runner, hooks: AskHooks) -> Self {
             let lane = AskLane::new(runner, hooks);
             {
                 let mut s = lane.state.lock().unwrap();
-                s.lane_id = Some("ask-1".to_string());
-                s.cfg = Some(AskConfig { cwd: std::env::temp_dir(), model: "ask-model".to_string() });
+                s.sub_mut(Which::Fast).lane_id = Some("ask-1".to_string());
+                s.cfg = Some(test_cfg());
             }
             lane
         }
@@ -752,7 +1075,7 @@ mod tests {
         let lane = AskLane::new(seq_runner(vec![], calls.clone()), AskHooks::default());
         lane.open(
             None,
-            AskConfig { cwd: std::env::temp_dir(), model: "ask-model".to_string() },
+            test_cfg(),
             "brief".to_string(),
         )
         .await;
@@ -777,7 +1100,7 @@ mod tests {
         let lane = AskLane::new(runner, AskHooks::default());
         lane.open(
             Some("trunk-1".to_string()),
-            AskConfig { cwd: std::env::temp_dir(), model: "ask-model".to_string() },
+            test_cfg(),
             String::new(),
         )
         .await;
@@ -858,5 +1181,629 @@ mod tests {
         lane.request(&sample_log(), true);
         settle().await;
         assert!(calls.lock().unwrap()[2].images.is_empty(), "the frame that broke a turn is not resent");
+    }
+
+    // ---- fast then better: two sub-lanes ----
+
+    const QUICK: &str = "ASK: What storage do you run today? | WHY: storage platform unknown";
+    const CHECKED: &str = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: When does your support contract end? | WHY: renewal date vague";
+
+    /// Replies per model: the fast model gets `fast`, the deep one `deep`.
+    /// Either can be held behind a gate. Calls are recorded in order.
+    fn two_runner(
+        fast: &'static str,
+        deep: &'static str,
+        fast_gate: Option<Arc<Semaphore>>,
+        deep_gate: Option<Arc<Semaphore>>,
+        calls: Calls,
+    ) -> Runner {
+        Arc::new(move |turn, _on_delta, _register| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            calls.lock().unwrap().push(turn);
+            let (text, gate) = if is_deep { (deep, deep_gate.clone()) } else { (fast, fast_gate.clone()) };
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+                ClaudeOutcome { session_id: None, text: text.to_string(), error: None }
+            })
+        })
+    }
+
+    fn model_calls(calls: &Calls, model: &str) -> usize {
+        calls.lock().unwrap().iter().filter(|t| t.model.as_deref() == Some(model)).count()
+    }
+
+    impl AskLane {
+        /// Both sub-lanes forked.
+        fn for_test_two(runner: Runner, hooks: AskHooks) -> Self {
+            let lane = AskLane::for_test(runner, hooks);
+            lane.state.lock().unwrap().sub_mut(Which::Deep).lane_id = Some("ask-deep-1".to_string());
+            lane
+        }
+    }
+
+    #[tokio::test]
+    async fn quick_list_shows_first_then_the_checked_list_replaces_it() {
+        let calls: Calls = Arc::default();
+        let deep_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(QUICK, CHECKED, None, Some(deep_gate.clone()), calls.clone()),
+            AskHooks::default(),
+        );
+        lane.request(&sample_log(), false);
+        settle().await;
+
+        let quick = lane.snapshot();
+        assert_eq!(quick.asks.len(), 1);
+        assert!(!quick.checked);
+        assert!(quick.checking, "the deep sub-lane is still working");
+        assert_eq!(quick.state, "idle", "deep work shows only through checking");
+        assert!(quick.changed.is_empty());
+        let first_id = quick.asks[0].id.clone();
+
+        deep_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.state, "idle");
+        assert!(out.checked);
+        assert!(!out.checking);
+        assert_eq!(out.asks.len(), 2);
+        assert_eq!(out.asks[0].question, "What storage do you run today?");
+        assert_eq!(out.asks[0].id, first_id, "a question worded the same keeps its id");
+        assert_eq!(out.changed, vec![out.asks[1].id.clone()], "only the new question is marked changed");
+        assert_eq!(out.asks[1].question, "When does your support contract end?");
+    }
+
+    #[tokio::test]
+    async fn a_reworded_question_in_the_checked_list_is_marked_changed() {
+        let calls: Calls = Arc::default();
+        let deep_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(
+                QUICK,
+                "ASK: Which storage platform do you run today? | WHY: platform unknown",
+                None,
+                Some(deep_gate.clone()),
+                calls,
+            ),
+            AskHooks::default(),
+        );
+        lane.request(&sample_log(), false);
+        settle().await;
+        let id = lane.snapshot().asks[0].id.clone();
+        deep_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.asks[0].id, id);
+        assert_eq!(out.asks[0].question, "Which storage platform do you run today?");
+        assert_eq!(out.changed, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn quick_result_after_the_checked_one_at_the_same_point_is_dropped() {
+        let calls: Calls = Arc::default();
+        let fast_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(QUICK, CHECKED, Some(fast_gate.clone()), None, calls),
+            AskHooks::default(),
+        );
+        lane.request(&sample_log(), false);
+        settle().await;
+        assert!(lane.snapshot().checked);
+        assert_eq!(lane.snapshot().asks.len(), 2);
+
+        fast_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.state, "idle", "the dropped turn still finished");
+        assert!(out.checked);
+        assert_eq!(out.asks.len(), 2, "the deep list already covers that much transcript");
+    }
+
+    const Q_A: &str = "ASK: What storage do you run today? | WHY: storage platform unknown";
+
+    /// Per-model reply queues (then NONE). The deep model's first turn passes
+    /// the gate; every later one waits for a permit from the test.
+    fn scripted(
+        fast: Vec<&'static str>,
+        deep: Vec<&'static str>,
+        deep_gate: Arc<Semaphore>,
+        calls: Calls,
+    ) -> Runner {
+        let fast = Arc::new(Mutex::new(VecDeque::from(fast)));
+        let deep = Arc::new(Mutex::new(VecDeque::from(deep)));
+        Arc::new(move |turn, _on_delta, _register| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            calls.lock().unwrap().push(turn);
+            let queue = if is_deep { deep.clone() } else { fast.clone() };
+            let text = queue.lock().unwrap().pop_front().unwrap_or("NONE");
+            let gate = is_deep.then(|| deep_gate.clone());
+            Box::pin(async move {
+                if let Some(gate) = gate {
+                    gate.acquire().await.unwrap().forget();
+                }
+                ClaudeOutcome { session_id: None, text: text.to_string(), error: None }
+            })
+        })
+    }
+
+    /// Drives a lane to: shown list from the quick lane at point 2, a deep
+    /// turn built at point 1 (given the list shown then) still running.
+    /// Returns the lane, the gate holding the deep turn and the call log.
+    async fn stale_deep_setup(
+        fast: Vec<&'static str>,
+        deep: Vec<&'static str>,
+    ) -> (AskLane, Arc<Semaphore>, Calls) {
+        let calls: Calls = Arc::default();
+        let gate = Arc::new(Semaphore::new(1));
+        let lane = AskLane::for_test_two(scripted(fast, deep, gate.clone(), calls.clone()), AskHooks::default());
+        let mut log = sample_log();
+        lane.request(&log, false); // both fire at point 1; deep's first turn passes
+        settle().await;
+        lane.request(&log, true); // deep fires at point 1 again, held; quick reply is dropped
+        settle().await;
+        log.ingest(&tu("system", "someone else handles backups", 4.0, 5.0));
+        log.ingest(&tu("mic", "right", 6.0, 7.0));
+        lane.request(&log, false); // quick fires at point 2; deep is busy
+        settle().await;
+        (lane, gate, calls)
+    }
+
+    #[tokio::test]
+    async fn a_stale_checked_list_is_merged_with_the_quick_items_it_never_heard() {
+        let ab = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Who handles backups? | WHY: owner unknown";
+        let a2c = "ASK: Which storage platform do you run today? | WHY: platform unknown\nASK: When does your support contract end? | WHY: renewal date vague";
+        // Deep's first turn sees [A]; the quick lane later adds B at point 2.
+        let (lane, gate, calls) = stale_deep_setup(vec![Q_A, Q_A, ab], vec![Q_A, a2c]).await;
+        let shown = lane.snapshot();
+        assert!(!shown.checked, "the quick list is on screen");
+        assert_eq!(shown.asks.len(), 2);
+        let (id_a, id_b) = (shown.asks[0].id.clone(), shown.asks[1].id.clone());
+        let fast_before = model_calls(&calls, "ask-model");
+
+        gate.add_permits(1); // deep lands, built at point 1
+        settle().await;
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            vec![
+                "Which storage platform do you run today?",
+                "When does your support contract end?",
+                "Who handles backups?"
+            ]
+        );
+        assert!(out.checked);
+        assert_eq!(out.asks[0].id, id_a, "the reworded question keeps its id");
+        assert_eq!(out.asks[2].id, id_b);
+        assert_eq!(out.changed, vec![id_a, out.asks[1].id.clone()]);
+        assert_eq!(model_calls(&calls, "ask-model"), fast_before, "no forced quick rerun");
+    }
+
+    #[tokio::test]
+    async fn a_stale_checked_list_keeps_dropping_what_it_was_given_and_dropped() {
+        let ab = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Who handles backups? | WHY: owner unknown";
+        let (lane, gate, _calls) = stale_deep_setup(vec![ab, ab, ab], vec![ab, Q_A]).await;
+        assert_eq!(lane.snapshot().asks.len(), 2);
+        gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(questions, vec!["What storage do you run today?"], "deep judged B and dropped it");
+        assert!(out.checked);
+    }
+
+    #[tokio::test]
+    async fn a_stale_checked_list_cuts_the_newer_quick_item_at_the_cap() {
+        let an = "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Do you use encryption at rest? | WHY: security unknown";
+        let five = "ASK: What is your total headcount? | WHY: size\nASK: Which cloud provider hosts production? | WHY: hosting\nASK: How often do backups run? | WHY: rpo\nASK: Who approves capital purchases? | WHY: buyer\nASK: When does the lease expire? | WHY: timing";
+        let (lane, gate, _calls) = stale_deep_setup(vec![Q_A, Q_A, an], vec![Q_A, five]).await;
+        gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            vec![
+                "What is your total headcount?",
+                "Which cloud provider hosts production?",
+                "How often do backups run?",
+                "Who approves capital purchases?",
+                "When does the lease expire?"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_checked_list_drops_dismissed_questions_before_the_cap() {
+        let d = "ASK: Which storage platform do you run today? | WHY: platform unknown";
+        let n = "ASK: Do you use encryption at rest? | WHY: security unknown";
+        let five = "ASK: What is your total headcount? | WHY: size\nASK: What storage platform do you run today? | WHY: platform\nASK: Which cloud provider hosts production? | WHY: hosting\nASK: How often do backups run? | WHY: rpo\nASK: Who approves capital purchases? | WHY: buyer";
+        let calls: Calls = Arc::default();
+        let gate = Arc::new(Semaphore::new(1));
+        let lane = AskLane::for_test_two(scripted(vec![d, d, n], vec![d, five], gate.clone(), calls.clone()), AskHooks::default());
+        let mut log = sample_log();
+        lane.request(&log, false); // both fire at point 1; deep's first turn passes
+        settle().await;
+        lane.request(&log, true); // deep fires at point 1 again, held
+        settle().await;
+        let id_d = lane.snapshot().asks[0].id.clone();
+        assert!(lane.dismiss(&id_d));
+        log.ingest(&tu("system", "someone else handles backups", 4.0, 5.0));
+        log.ingest(&tu("mic", "right", 6.0, 7.0));
+        lane.request(&log, false); // quick fires at point 2 and adds N
+        settle().await;
+        gate.add_permits(1); // deep lands, built at point 1
+        settle().await;
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            vec![
+                "What is your total headcount?",
+                "Which cloud provider hosts production?",
+                "How often do backups run?",
+                "Who approves capital purchases?",
+                "Do you use encryption at rest?"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_quick_failure_shows_failed_even_while_the_deep_turn_runs() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let gate = Arc::new(Semaphore::new(0));
+        let g = gate.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            let g = g.clone();
+            Box::pin(async move {
+                if is_deep {
+                    g.acquire().await.unwrap().forget();
+                    ClaudeOutcome { session_id: None, text: QUICK.into(), error: None }
+                } else {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("quick broke".into()) }
+                }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, AskHooks::default());
+        lane.request(&sample_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.state, "failed");
+        assert!(out.checking, "deep is still running");
+    }
+
+    #[tokio::test]
+    async fn a_deep_failure_after_an_empty_quick_result_does_not_show_failed() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let rec = recorded_hooks();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async move {
+                if is_deep {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("deep broke".into()) }
+                } else {
+                    ClaudeOutcome { session_id: None, text: "NONE".into(), error: None }
+                }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, rec.hooks.clone());
+        lane.request(&sample_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(out.asks.is_empty());
+        assert_eq!(out.state, "idle", "the empty quick list was applied, so no failure shows");
+        assert_eq!(rec.errors.lock().unwrap().as_slice(), ["deep broke"]);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_turn_does_not_leave_its_sub_lane_in_flight() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let first_deep = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            if is_deep && first_deep.swap(false, Ordering::SeqCst) {
+                panic!("runner blew up");
+            }
+            Box::pin(async move {
+                ClaudeOutcome { session_id: None, text: QUICK.to_string(), error: None }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(!out.checking, "the dead deep turn no longer counts as running");
+        assert_eq!(out.state, "idle");
+
+        lane.request(&log, true);
+        settle().await;
+        assert_eq!(model_calls(&calls, "deep-model"), 2, "the deep sub-lane fires again");
+        assert!(lane.snapshot().checked);
+    }
+
+    #[tokio::test]
+    async fn a_failed_deep_fork_leaves_the_quick_lane_as_it_was() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            let forking = turn.fork;
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async move {
+                if is_deep && forking {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("no fork".into()) }
+                } else if forking {
+                    ClaudeOutcome { session_id: Some("ask-9".into()), text: "READY".into(), error: None }
+                } else {
+                    ClaudeOutcome { session_id: None, text: GOOD.to_string(), error: None }
+                }
+            })
+        });
+        let lane = AskLane::new(runner, AskHooks::default());
+        lane.open(Some("trunk-1".to_string()), test_cfg(), String::new()).await;
+        assert_eq!(lane.snapshot().state, "idle");
+
+        let log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        assert_eq!(model_calls(&calls, "deep-model"), 1, "only the failed fork ever ran on the deep model");
+        let out = lane.snapshot();
+        assert_eq!(out.asks.len(), 1);
+        assert!(!out.checked && !out.checking);
+        assert_eq!(out.state, "idle");
+
+        lane.request(&log, true);
+        settle().await;
+        assert_eq!(model_calls(&calls, "ask-model"), 3, "fork, turn, forced turn");
+    }
+
+    #[tokio::test]
+    async fn dismissing_while_the_deep_turn_runs_keeps_the_question_out_of_its_result() {
+        let calls: Calls = Arc::default();
+        let deep_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(QUICK, CHECKED, None, Some(deep_gate.clone()), calls),
+            AskHooks::default(),
+        );
+        lane.request(&sample_log(), false);
+        settle().await;
+        let id = lane.snapshot().asks[0].id.clone();
+        assert!(lane.dismiss(&id));
+
+        deep_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(out.checked);
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(questions, vec!["When does your support contract end?"]);
+    }
+
+    #[tokio::test]
+    async fn each_sub_lane_hears_a_brief_edit_and_a_dismissal_once() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test_two(two_runner(QUICK, CHECKED, None, None, calls.clone()), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        let id = lane.snapshot().asks[0].id.clone();
+        lane.set_brief("Learn the storage".to_string());
+        lane.dismiss(&id);
+        lane.request(&log, false);
+        settle().await;
+        lane.request(&log, true);
+        settle().await;
+
+        let calls = calls.lock().unwrap();
+        for model in ["ask-model", "deep-model"] {
+            let turns: Vec<_> = calls.iter().filter(|t| t.model.as_deref() == Some(model)).collect();
+            assert_eq!(turns.len(), 3, "{model}");
+            assert!(turns[1].prompt.contains("Learn the storage"), "{model}");
+            assert!(turns[1].prompt.contains("Joseph dismissed these"), "{model}");
+            assert!(!turns[2].prompt.contains("Learn the storage"), "{model}");
+            assert!(!turns[2].prompt.contains("Joseph dismissed these"), "{model}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_deep_failure_with_a_list_on_screen_only_reports() {
+        let calls: Calls = Arc::default();
+        let recorded = calls.clone();
+        let rec = recorded_hooks();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let is_deep = turn.model.as_deref() == Some("deep-model");
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async move {
+                if is_deep {
+                    ClaudeOutcome { session_id: None, text: String::new(), error: Some("deep broke".into()) }
+                } else {
+                    ClaudeOutcome { session_id: None, text: QUICK.to_string(), error: None }
+                }
+            })
+        });
+        let lane = AskLane::for_test_two(runner, rec.hooks.clone());
+        lane.request(&sample_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.state, "idle", "the quick list stands, nothing shows as failed");
+        assert_eq!(out.asks.len(), 1);
+        assert!(!out.checked && !out.checking);
+        assert_eq!(rec.errors.lock().unwrap().as_slice(), ["deep broke"]);
+    }
+
+    #[tokio::test]
+    async fn close_drops_a_late_deep_result() {
+        let calls: Calls = Arc::default();
+        let deep_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(QUICK, CHECKED, None, Some(deep_gate.clone()), calls),
+            AskHooks::default(),
+        );
+        lane.request(&sample_log(), false);
+        settle().await;
+        lane.close();
+        deep_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(!out.checked);
+        assert_eq!(out.asks.len(), 1, "the quick list stays, the deep one never lands");
+        assert_eq!(out.state, "idle");
+    }
+
+    #[tokio::test]
+    async fn the_deep_sub_lane_reads_the_vault_and_never_writes() {
+        let calls: Calls = Arc::default();
+        // Fork turns answer with a session id.
+        let recorded = calls.clone();
+        let runner: Runner = Arc::new(move |turn, _d, _r| {
+            let forking = turn.fork;
+            recorded.lock().unwrap().push(turn);
+            Box::pin(async move {
+                ClaudeOutcome {
+                    session_id: forking.then(|| "s".to_string()),
+                    text: if forking { "READY".into() } else { QUICK.into() },
+                    error: None,
+                }
+            })
+        });
+        let lane = AskLane::new(runner, AskHooks::default());
+        lane.open(Some("trunk-1".to_string()), test_cfg(), String::new()).await;
+        lane.request(&sample_log(), false);
+        settle().await;
+
+        let calls = calls.lock().unwrap();
+        let deep: Vec<_> = calls.iter().filter(|t| t.model.as_deref() == Some("deep-model")).collect();
+        assert_eq!(deep.len(), 2, "fork and one turn");
+        let (fork, turn) = (deep[0], deep[1]);
+        assert!(fork.fork && fork.allowed_tools.is_empty() && fork.add_dirs.is_empty());
+        assert_eq!(turn.effort.as_deref(), Some("high"));
+        assert_eq!(turn.append_system_prompt.as_deref(), Some(ask_deep_system_prompt().as_str()));
+        assert!(turn.append_system_prompt.as_deref().unwrap().starts_with(ASK_PROMPT));
+        assert_eq!(turn.allowed_tools, vec!["Read", "Grep", "Glob"]);
+        assert!(turn.disallowed_tools.iter().any(|t| t == "Bash") && turn.disallowed_tools.iter().any(|t| t == "Write"));
+        assert_eq!(turn.add_dirs, vec![PathBuf::from("/vault")]);
+        assert_eq!(turn.resume.as_deref(), Some("s"));
+
+        let fast: Vec<_> = calls.iter().filter(|t| t.model.as_deref() == Some("ask-model")).collect();
+        assert_eq!(fast[1].append_system_prompt.as_deref(), Some(ASK_PROMPT));
+        assert!(fast[1].allowed_tools.is_empty() && fast[1].add_dirs.is_empty());
+        assert_eq!(fast[1].effort.as_deref(), Some("medium"));
+    }
+
+    /// Real claude: a quick list first, then the deep sub-lane's checked
+    /// list. Spends real turns, so it needs ASSISTANT_CLAUDE_TEST=1 on top
+    /// of --ignored. Prints every emitted list with its time since request.
+    #[tokio::test]
+    #[ignore]
+    async fn live_quick_list_then_checked_list() {
+        if std::env::var("ASSISTANT_CLAUDE_TEST").ok().as_deref() != Some("1") {
+            eprintln!("skipping live_quick_list_then_checked_list: set ASSISTANT_CLAUDE_TEST=1 to run");
+            return;
+        }
+        let bin = crate::assistant::settings::resolve_claude_binary(&crate::assistant::AssistantSettings::default())
+            .expect("claude binary not found");
+        let runner = crate::assistant::lanes::claude_runner(bin);
+        let cwd = std::env::temp_dir().join(format!("ask-live-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&cwd).unwrap();
+        let brief = "Learn what storage and backup setup the client runs today, for a migration quote.";
+
+        // Seed a trunk the way lanes.rs does.
+        let trunk_id = uuid::Uuid::new_v4().to_string();
+        let seed = runner.clone()(
+            ClaudeTurn {
+                prompt: format!(
+                    "This is the brief for the meeting that is about to start. Read it, hold it, and answer nothing yet. Reply with exactly the word READY.\n\n{brief}"
+                ),
+                cwd: cwd.clone(),
+                model: Some("claude-sonnet-5".into()),
+                effort: Some("low".into()),
+                session_id: Some(trunk_id.clone()),
+                disallowed_tools: no_tools(),
+                partial: false,
+                safe_mode: true,
+                ..Default::default()
+            },
+            Box::new(|_| {}),
+            Box::new(|_| {}),
+        )
+        .await;
+        assert!(seed.error.is_none(), "trunk seed: {:?}", seed.error);
+
+        let emitted: Arc<Mutex<Vec<(std::time::Instant, AsksOut)>>> = Arc::default();
+        let sink = emitted.clone();
+        let hooks = AskHooks {
+            emit: Arc::new(move |out| sink.lock().unwrap().push((std::time::Instant::now(), out))),
+            ..Default::default()
+        };
+        let lane = AskLane::new(runner, hooks);
+        let home = PathBuf::from(std::env::var("HOME").expect("HOME"));
+        lane.open(
+            Some(seed.session_id.unwrap_or(trunk_id)),
+            AskConfig {
+                cwd: cwd.clone(),
+                model: "claude-sonnet-5".into(),
+                deep_model: "claude-opus-5".into(),
+                deep_effort: "medium".into(),
+                deep_read_dirs: vec![home.join("brain")],
+            },
+            brief.to_string(),
+        )
+        .await;
+        assert_eq!(lane.snapshot().state, "idle", "both forks must open");
+
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu(
+            "system",
+            "We have some sort of SAN, I think, for the main storage. Backups, I think someone else handles that.",
+            0.0,
+            8.0,
+        ));
+        log.ingest(&tu("mic", "Okay, got it.", 9.0, 10.0));
+        log.ingest(&tu("system", "Yeah, the migration is planned for next quarter.", 11.0, 14.0));
+
+        let start = std::time::Instant::now();
+        let n_before = emitted.lock().unwrap().len();
+        lane.request(&log, false);
+        let deadline = start + Duration::from_secs(300);
+        while std::time::Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(500)).await;
+            let out = lane.snapshot();
+            if out.checked && out.state == "idle" {
+                break;
+            }
+        }
+        let mut seen_quick = false;
+        for (at, out) in emitted.lock().unwrap().iter().skip(n_before) {
+            let t = at.duration_since(start).as_secs_f64();
+            let shape = format!("state={} checked={} checking={} changed={}", out.state, out.checked, out.checking, out.changed.len());
+            if out.asks.is_empty() && out.for_you.is_empty() {
+                println!("[{t:6.1}s] {shape}  (no list)");
+                continue;
+            }
+            if !out.checked {
+                seen_quick = true;
+            }
+            println!("[{t:6.1}s] {shape}");
+            for a in &out.asks {
+                println!("          ASK: {} | WHY: {}", a.question, a.why);
+            }
+            for y in &out.for_you {
+                println!("          YOU: {}", y.question);
+            }
+        }
+        let _ = std::fs::remove_dir_all(&cwd);
+        let out = lane.snapshot();
+        assert!(seen_quick, "a quick list (checked false) must show first");
+        assert!(out.checked, "the deep list must land");
+        lane.close();
     }
 }
