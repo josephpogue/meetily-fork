@@ -33,7 +33,7 @@ impl Default for AssistantSettings {
             enabled: true,
             claude_path: String::new(),
             fast_model: "claude-sonnet-5".to_string(),
-            fast_effort: "low".to_string(),
+            fast_effort: "medium".to_string(),
             deep_model: "claude-opus-5".to_string(),
             deep_effort: "medium".to_string(),
             trigger_mode: "gated".to_string(),

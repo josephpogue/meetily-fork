@@ -95,6 +95,11 @@ pub struct AssistantCore {
     /// The brief as it stands in an open session. Edits land here and in
     /// both lane sets; `pending_brief` is only for before a session opens.
     brief: String,
+    /// The startup context every lane's turn carries; read by the wrapped
+    /// runner at call time. `startup` keeps the fixed files for re-resolving
+    /// the project page when the brief changes.
+    startup_ctx: super::startup_context::ContextHandle,
+    startup: Option<super::startup_context::Startup>,
     voice: VoiceAsk,
     /// The open You-utterance's text at the moment voice-ask's hotkey was
     /// pressed, if any. Stripped as a prefix from transcript text fed to
@@ -152,6 +157,8 @@ impl Default for AssistantCore {
             ask_lane: AskLane::new(claude_runner(PathBuf::new()), AskHooks::default()),
             ask_hooks: AskHooks::default(),
             brief: String::new(),
+            startup_ctx: super::startup_context::new_handle(),
+            startup: None,
             voice: VoiceAsk::new(|_| {}, |_| {}),
             voice_baseline: String::new(),
             app: None,
@@ -460,6 +467,11 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
         return;
     }
     core.brief = text.clone();
+    if let Some(startup) = &core.startup {
+        let (ctx, slug) = startup.render(&text);
+        super::startup_context::log_built(&ctx, slug.as_deref(), "re-resolved on brief change");
+        super::startup_context::set_context(&core.startup_ctx, &ctx);
+    }
     core.lanes.set_brief(text.clone());
     core.ask_lane.set_brief(text);
     if core.enabled {
@@ -938,7 +950,29 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         start_capture(handle, app.as_ref()).await;
     }
 
-    open_lanes_with(handle, cfg, seed, brief.unwrap_or_default(), claude_runner(bin)).await;
+    // The fixed files are read once here; a later brief change only
+    // re-resolves the project page.
+    let brief = brief.unwrap_or_default();
+    let startup = tokio::task::spawn_blocking(super::startup_context::Startup::load_from_home)
+        .await
+        .ok()
+        .flatten();
+    let ctx_handle = {
+        let mut core = handle.0.lock().await;
+        let ctx = match &startup {
+            Some(s) => {
+                let (ctx, slug) = s.render(&brief);
+                super::startup_context::log_built(&ctx, slug.as_deref(), "built at open");
+                ctx
+            }
+            None => String::new(),
+        };
+        super::startup_context::set_context(&core.startup_ctx, &ctx);
+        core.startup = startup;
+        core.startup_ctx.clone()
+    };
+    let runner = super::startup_context::with_context(claude_runner(bin), ctx_handle);
+    open_lanes_with(handle, cfg, seed, brief, runner).await;
 }
 
 /// The Settings switch "see the Zoom window", applied to a running call.

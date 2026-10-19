@@ -14,6 +14,7 @@ pub mod core;
 pub mod lanes;
 pub mod note;
 pub mod settings;
+pub mod startup_context;
 pub mod transcript;
 pub mod trigger;
 pub mod vision;

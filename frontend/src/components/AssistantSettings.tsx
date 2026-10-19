@@ -15,7 +15,7 @@ const DEFAULT_SETTINGS: AssistantSettingsData = {
   enabled: true,
   claudePath: '',
   fastModel: 'claude-sonnet-5',
-  fastEffort: 'low',
+  fastEffort: 'medium',
   deepModel: 'claude-opus-5',
   deepEffort: 'medium',
   triggerMode: 'gated',
