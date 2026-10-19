@@ -309,7 +309,7 @@ impl AskState {
                         // A deep list built from less transcript than the
                         // shown quick list keeps the quick list's newer items.
                         let raw = if point < self.shown_point {
-                            merge_raw(&self.list, &self.deep_base, raw)
+                            merge_raw(&self.list, &self.deep_base, raw, &self.dismissed)
                         } else {
                             raw
                         };
@@ -340,12 +340,17 @@ impl AskState {
 /// A deep list that was built from less transcript than the shown quick list:
 /// deep's items in deep's order, then each shown item that deep neither kept
 /// nor was given (it came from transcript deep never heard). Items deep was
-/// given and dropped stay dropped. Capped like any list, deep's first.
-fn merge_raw(shown: &AskList, base: &AskList, mut raw: RawList) -> RawList {
+/// given and dropped stay dropped. Dismissed questions are removed before the
+/// cap, so they cannot crowd out a newer item. Capped like any list, deep's
+/// first.
+fn merge_raw(shown: &AskList, base: &AskList, mut raw: RawList, dismissed: &[String]) -> RawList {
+    let gone = |q: &str| dismissed.iter().any(|d| ask_list::same_item(d, q));
+    raw.asks.retain(|(q, _)| !gone(q));
+    raw.for_you.retain(|q| !gone(q));
     let newer = |items: &[AskItem], base: &[AskItem], have: &dyn Fn(&str) -> bool| -> Vec<String> {
         items
             .iter()
-            .filter(|i| !have(&i.question) && !base.iter().any(|b| ask_list::same_item(&b.question, &i.question)))
+            .filter(|i| !gone(&i.question) && !have(&i.question) && !base.iter().any(|b| ask_list::same_item(&b.question, &i.question)))
             .map(|i| i.question.clone())
             .collect()
     };
@@ -1406,6 +1411,41 @@ mod tests {
                 "How often do backups run?",
                 "Who approves capital purchases?",
                 "When does the lease expire?"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_checked_list_drops_dismissed_questions_before_the_cap() {
+        let d = "ASK: Which storage platform do you run today? | WHY: platform unknown";
+        let n = "ASK: Do you use encryption at rest? | WHY: security unknown";
+        let five = "ASK: What is your total headcount? | WHY: size\nASK: What storage platform do you run today? | WHY: platform\nASK: Which cloud provider hosts production? | WHY: hosting\nASK: How often do backups run? | WHY: rpo\nASK: Who approves capital purchases? | WHY: buyer";
+        let calls: Calls = Arc::default();
+        let gate = Arc::new(Semaphore::new(1));
+        let lane = AskLane::for_test_two(scripted(vec![d, d, n], vec![d, five], gate.clone(), calls.clone()), AskHooks::default());
+        let mut log = sample_log();
+        lane.request(&log, false); // both fire at point 1; deep's first turn passes
+        settle().await;
+        lane.request(&log, true); // deep fires at point 1 again, held
+        settle().await;
+        let id_d = lane.snapshot().asks[0].id.clone();
+        assert!(lane.dismiss(&id_d));
+        log.ingest(&tu("system", "someone else handles backups", 4.0, 5.0));
+        log.ingest(&tu("mic", "right", 6.0, 7.0));
+        lane.request(&log, false); // quick fires at point 2 and adds N
+        settle().await;
+        gate.add_permits(1); // deep lands, built at point 1
+        settle().await;
+        let out = lane.snapshot();
+        let questions: Vec<_> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(
+            questions,
+            vec![
+                "What is your total headcount?",
+                "Which cloud provider hosts production?",
+                "How often do backups run?",
+                "Who approves capital purchases?",
+                "Do you use encryption at rest?"
             ]
         );
     }

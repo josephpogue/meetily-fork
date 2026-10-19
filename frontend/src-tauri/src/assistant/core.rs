@@ -126,6 +126,10 @@ pub struct AssistantCore {
     /// and is cleared once used. A closing session puts its brief back here,
     /// because the panel's box still shows it.
     pending_brief: Option<String>,
+    /// Set by a `set_brief` made while no session is open, cleared when an
+    /// open takes the brief. `open_lanes_with` reads it to tell "cleared in
+    /// the gap" (`pending_brief` is None) from "no edit in the gap".
+    brief_edited: bool,
 
     note_state: NoteState,
     note_draft: Option<NoteDraft>,
@@ -173,6 +177,7 @@ impl Default for AssistantCore {
             mode: TriggerMode::Gated,
             listening: true,
             pending_brief: None,
+            brief_edited: false,
             note_state: NoteState::Idle,
             note_draft: None,
             note_markdown: String::new(),
@@ -461,6 +466,7 @@ pub async fn set_brief(handle: &AssistantHandle, text: String) {
         // Keep the panel's copy current before and after a recording too.
         core.ask_lane.set_brief(text.clone());
         core.pending_brief = if text.trim().is_empty() { None } else { Some(text) };
+        core.brief_edited = true;
         return;
     }
     if core.brief == text {
@@ -826,10 +832,14 @@ async fn open_lanes_with(
 
     // A brief set while the lanes were opening went to `pending_brief` (the
     // session was not open yet). It is newer than `brief`: the session uses it.
-    let newer = core
-        .pending_brief
-        .take()
-        .filter(|b| *b != core.brief);
+    // An edit that cleared the brief counts too: it wins over `brief`.
+    let edited = std::mem::take(&mut core.brief_edited);
+    let pending = core.pending_brief.take();
+    let newer = if edited {
+        Some(pending.unwrap_or_default()).filter(|b| *b != core.brief)
+    } else {
+        pending.filter(|b| *b != core.brief)
+    };
     if let Some(newer) = &newer {
         core.brief = newer.clone();
         core.lanes.set_brief(newer.clone());
@@ -958,7 +968,11 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
 
     // Take the brief only now that the session is sure to open: an early
     // return above leaves it pending, so the next attempt still has it.
-    let brief = handle.0.lock().await.pending_brief.take();
+    let brief = {
+        let mut core = handle.0.lock().await;
+        core.brief_edited = false;
+        core.pending_brief.take()
+    };
 
     let cfg = LaneConfig {
         cwd: session_dir,
@@ -1692,6 +1706,38 @@ mod tests {
         open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls)).await;
         close_session(&handle).await;
         assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"));
+    }
+
+    /// A brief cleared while the lanes open wins over the one the open path
+    /// took, and the next session does not inherit the old text.
+    #[tokio::test]
+    async fn a_brief_cleared_while_the_lanes_open_wins() {
+        let home = std::env::temp_dir().join(format!("core-brief-clear-{}", uuid::Uuid::new_v4()));
+        let wiki = home.join("brain/wiki/Wiki");
+        std::fs::create_dir_all(wiki.join("Projects")).unwrap();
+        std::fs::write(wiki.join("index.md"), "[[Projects/fesco]]").unwrap();
+        std::fs::write(wiki.join("Projects/fesco.md"), "FESCO PAGE TEXT").unwrap();
+
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.startup = Some(crate::assistant::startup_context::Startup::load(&home));
+        }
+        set_brief(&handle, String::new()).await;
+        open_lanes_with(&handle, test_lane_cfg(), "seed".into(), "old".into(), ask_runner(calls.clone())).await;
+
+        {
+            let core = handle.0.lock().await;
+            assert!(core.session_open);
+            assert_eq!(core.brief, "");
+            assert_eq!(core.ask_lane.snapshot().brief, "");
+            let ctx = core.startup_ctx.read().unwrap().clone();
+            assert!(!ctx.contains("FESCO PAGE TEXT"), "context was: {ctx}");
+        }
+        close_session(&handle).await;
+        assert_eq!(handle.0.lock().await.pending_brief, None);
+        let _ = std::fs::remove_dir_all(&home);
     }
 
     #[tokio::test]
