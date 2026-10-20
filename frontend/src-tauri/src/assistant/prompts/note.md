@@ -9,6 +9,7 @@ Joseph reads this preview and then decides whether to keep it. Nothing you write
 - If something was left open, it goes in Open questions rather than being quietly resolved.
 - Plain words, short lines. No em dashes.
 
+- The Q&A log may hold a QUESTIONS ANSWERED DURING THE CALL section: questions the call or Joseph's work with the assistant answered. Leave them out of Open questions. A section Answered questions is added automatically after your note, like the header and the Q&A log, so never write one yourself and do not repeat those answers elsewhere unless a decision or action item needs them.
 - The Q&A log may end with a SUGGESTED QUESTIONS STILL OPEN AT THE END section: questions the assistant suggested that nobody asked. List each under Open questions as a follow-up to ask, unless the transcript shows it was answered.
 
 ## Pictures
@@ -46,4 +47,4 @@ Three or four sentences. What the meeting was for and what came of it.
 - What was raised and left unresolved.
 ```
 
-Do not write a header block, a participants list, or a Q&A log. Those are added around your text automatically, and writing your own would duplicate them.
+Do not write a header block, a participants list, an Answered questions section, or a Q&A log. Those are added around your text automatically, and writing your own would duplicate them.

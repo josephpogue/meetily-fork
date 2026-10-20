@@ -9,6 +9,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::{fs, io};
 
+use super::ask_list::{AnswerHow, AnsweredItem};
+
 /// System prompt for `AnswerLanes::draft_note`. Populates `LaneConfig`'s
 /// `note_prompt` field so `lanes.rs` never depends on this file directly.
 pub const NOTE_PROMPT: &str = include_str!("prompts/note.md");
@@ -48,6 +50,37 @@ pub fn parse_note(raw: &str) -> Result<NoteDraft, String> {
         slug: slug.to_string(),
         markdown: markdown.to_string(),
     })
+}
+
+/// The "Answered questions" section, built in code from the assistant's
+/// answered list (oldest first), never by the model. Empty for an empty list.
+pub fn answered_section(items: &[AnsweredItem]) -> String {
+    if items.is_empty() {
+        return String::new();
+    }
+    let lines: Vec<String> = items
+        .iter()
+        .map(|a| {
+            let how = match a.how {
+                AnswerHow::Call => "On the call",
+                AnswerHow::Chat => "Worked out in Ask",
+                AnswerHow::You => "You answered",
+            };
+            format!("- **{}** {} ({})", a.question, a.answer, how)
+        })
+        .collect();
+    format!("## Answered questions\n\n{}", lines.join("\n"))
+}
+
+/// The note body with the answered section appended; unchanged when nothing
+/// was answered.
+pub fn with_answered(markdown: &str, items: &[AnsweredItem]) -> String {
+    let section = answered_section(items);
+    if section.is_empty() {
+        markdown.to_string()
+    } else {
+        format!("{}\n\n{}", markdown.trim_end(), section)
+    }
 }
 
 /// "team-standup" -> "Team standup".
@@ -130,6 +163,27 @@ fn run_git(vault_root: &Path, args: &[&str]) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn answered_section_lists_oldest_first_with_how_labels() {
+        let item = |q: &str, a: &str, how| AnsweredItem { id: q.into(), question: q.into(), answer: a.into(), how, at: 1 };
+        let items = vec![
+            item("Where is the data center?", "In Atlanta.", AnswerHow::Call),
+            item("Who owns backups?", "The ops team.", AnswerHow::Chat),
+            item("Is pricing in scope?", "Yes.", AnswerHow::You),
+        ];
+        assert_eq!(
+            answered_section(&items),
+            "## Answered questions\n\n- **Where is the data center?** In Atlanta. (On the call)\n- **Who owns backups?** The ops team. (Worked out in Ask)\n- **Is pricing in scope?** Yes. (You answered)"
+        );
+        assert_eq!(with_answered("## Summary\n\nx\n", &items[..1]), "## Summary\n\nx\n\n## Answered questions\n\n- **Where is the data center?** In Atlanta. (On the call)");
+    }
+
+    #[test]
+    fn nothing_is_appended_when_nothing_was_answered() {
+        assert_eq!(answered_section(&[]), "");
+        assert_eq!(with_answered("## Summary\n\nx", &[]), "## Summary\n\nx");
+    }
 
     #[test]
     fn parse_note_extracts_slug_and_body() {

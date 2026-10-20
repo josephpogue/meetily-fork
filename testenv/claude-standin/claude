@@ -2,7 +2,8 @@
 # Claude stand-in for the test Mac, as the Zoom stand-in fakes Zoom. It holds no login, makes no network call and
 # reads no credentials. Its only job is to let Meetily's assistant session open (core.rs `open_session` stops when
 # `claude --version` fails), so the Zoom window capture runs. Every answer is canned: assistant output is not tested here
-# (the one exception is Ask next, whose quick-then-checked lists are canned so a walk can see both).
+# (the exceptions are Ask next, whose quick-then-checked lists and answered question are canned so a walk can see them, and the
+# one-line cards for Ask, Explain and Catch up).
 # It answers `claude -p ... --output-format stream-json` with the two lines the app reads (claude_cli.rs `parse_line`):
 # a system/init line carrying the session id and a result line, whose text fits the lane that asked (by its system prompt).
 set -u
@@ -30,14 +31,27 @@ fi
 
 # An Ask next turn names its list in the prompt (ask_lane.rs `ask_prompt`: "CURRENT LIST:"). The quick (fast model) lane
 # answers at once with one question; the deep (opus) lane waits 4 s, then answers with that question and a second one,
-# so the test Mac can see a quick list followed by a checked one.
+# so the test Mac can see a quick list followed by a checked one. Every reply also carries one question for Joseph
+# himself (YOU), so the For-you answer flow can be walked. Once the turn's input mentions "submarine" (the call clip says
+# "The orange submarine visits Tuesday harbor."), the storage question is answered on the call: the reply drops that ASK
+# and carries its DONE line instead, so a walk sees the question move to the answered list. The stand-in keeps no state:
+# the app keeps an answered question off the list however often a later reply lists it again.
 ask_turn=0
 case "$all$input" in *"CURRENT LIST:"*) ask_turn=1 ;; esac
+heard=$(printf '%s' "$all$input" | tr '[:upper:]' '[:lower:]')
 
 if [ "$ask_turn" = 1 ]; then
-  text=$'ASK: What storage do you run today? | WHY: storage platform unknown'
+  text=""
+  case "$heard" in
+    *submarine*) ;;
+    *) text+=$'ASK: What storage do you run today? | WHY: storage platform unknown\n' ;;
+  esac
   case "$model" in
-    *opus*) sleep 4; text+=$'\nASK: When does your support contract end? | WHY: renewal date vague' ;;
+    *opus*) sleep 4; text+=$'ASK: When does your support contract end? | WHY: renewal date vague\n' ;;
+  esac
+  text+=$'YOU: Is pricing in scope for this call?'
+  case "$heard" in
+    *submarine*) text+=$'\nDONE: What storage do you run today? | ANSWER: The orange submarine visits on Tuesday at the harbor. | BY: call' ;;
   esac
 else
 case "$system" in
@@ -47,6 +61,10 @@ case "$system" in
        # A question Joseph asks directly (typed or spoken) says so in its prompt (commands.rs `assistant_ask`):
        # answer with a one-line card (card.rs parse: LEAD and a bullet), so the Ask box shows a reply.
        *"Do not reply SKIP."*) text=$'LEAD: Canned answer from the test Mac Claude stand-in.\n- Assistant answers are not tested in the test Mac.' ;;
+       # Explain and Catch up (lanes.rs `explain`, `catchup`) get a one-line card the same way, so the panel shows all three
+       # of Joseph's own kinds.
+       *"EXPLAIN this, in plain language"*) text=$'LEAD: Canned explanation from the test Mac Claude stand-in.' ;;
+       *"CATCH ME UP on this stretch"*) text=$'LEAD: Canned catch-up from the test Mac Claude stand-in.' ;;
        *) text="SKIP" ;;    # card.rs parse: other answer turns render nothing; trunk and forks only need a session id
      esac ;;
 esac

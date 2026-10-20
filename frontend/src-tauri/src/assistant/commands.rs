@@ -112,6 +112,18 @@ pub async fn assistant_dismiss_ask(handle: State<'_, AssistantHandle>, id: Strin
     Ok(())
 }
 
+/// Joseph typed the answer to a For-you question: the item moves to the
+/// answered list. The panel appends the answer to the brief itself.
+#[tauri::command]
+pub async fn assistant_answer_ask(
+    handle: State<'_, AssistantHandle>,
+    id: String,
+    answer: String,
+) -> Result<(), String> {
+    core::answer_ask(handle.inner(), id, answer).await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn assistant_screen_recording_allowed() -> Result<bool, String> {
     Ok(super::vision::permission::screen_recording_allowed())
