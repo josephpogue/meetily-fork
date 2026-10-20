@@ -42,7 +42,7 @@ export function BriefBar({ open, onToggleOpen, onEdit }: BriefBarProps) {
       </p>
       <div className="flex shrink-0 items-center gap-1.5">
         {dirty ? <span className="text-xs font-medium text-amber-600">Unsaved</span> : null}
-        {text ? (
+        {text || open ? (
           <Button type="button" variant="outline" size="sm" className="h-7 bg-white px-2.5 text-xs" onClick={onToggleOpen}>
             {open ? 'Back to questions' : 'Read all'}
           </Button>

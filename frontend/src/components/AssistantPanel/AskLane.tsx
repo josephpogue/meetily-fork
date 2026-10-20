@@ -137,7 +137,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
                 <div
                   className={cn(
                     'min-w-0 flex-1 rounded transition-colors duration-1000',
-                    isChanged(item.id) && 'bg-blue-50'
+                    isChanged(item.id) && 'bg-violet-50'
                   )}
                 >
                   <p className="break-words text-sm font-medium leading-snug text-gray-900">
@@ -288,7 +288,7 @@ function ForYouItem({
         <p
           className={cn(
             'min-w-0 flex-1 break-words rounded text-sm text-gray-900 transition-colors duration-1000',
-            changed && 'bg-blue-50'
+            changed && 'bg-violet-50'
           )}
         >
           {item.question}
