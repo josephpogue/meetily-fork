@@ -195,10 +195,28 @@ export interface AssistantAskItem {
   why: string;
 }
 
+// A question that left the open list because it was answered. Nothing is
+// ever removed from the answered list during a session.
+export interface AssistantAnsweredItem {
+  // The open item's id when it was on the list, so React keeps its place.
+  id: string;
+  // The wording Joseph saw on the open list (or asked on the call).
+  question: string;
+  // The answer, in a sentence or two.
+  answer: string;
+  // 'call': answered on the call. 'chat': worked out by Joseph and the
+  // assistant in Ask. 'you': Joseph typed the answer to a For-you question.
+  how: 'call' | 'chat' | 'you';
+  // When it was answered, epoch milliseconds.
+  at: number;
+}
+
 export interface AssistantAsks {
   state: 'idle' | 'thinking' | 'failed' | 'unavailable';
   asks: AssistantAskItem[];
   forYou: AssistantAskItem[];
+  // Every question answered this session, newest first.
+  answered: AssistantAnsweredItem[];
   updatedAt: number | null;
   brief: string;
   // True while the shown list came from the deep check.

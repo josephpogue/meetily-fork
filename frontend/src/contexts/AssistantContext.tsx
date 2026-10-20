@@ -29,6 +29,7 @@ const DEFAULT_ASKS: AssistantAsks = {
   state: 'idle',
   asks: [],
   forYou: [],
+  answered: [],
   updatedAt: null,
   brief: '',
   checked: false,
@@ -44,6 +45,8 @@ interface AssistantContextType {
   asks: AssistantAsks;
   refreshAsks: () => Promise<void>;
   dismissAsk: (id: string) => Promise<void>;
+  /** Joseph's answer to a For-you question; the backend moves it to the answered list. */
+  answerAsk: (id: string, answer: string) => Promise<void>;
   ask: (text: string) => Promise<void>;
   explain: () => Promise<void>;
   catchup: () => Promise<void>;
@@ -295,6 +298,14 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const answerAsk = useCallback(async (id: string, answer: string) => {
+    try {
+      await assistantService.answerAsk(id, answer);
+    } catch (error) {
+      console.error('[AssistantContext] assistant_answer_ask failed:', error);
+    }
+  }, []);
+
   const value: AssistantContextType = {
     status,
     cards,
@@ -303,6 +314,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     asks,
     refreshAsks,
     dismissAsk,
+    answerAsk,
     ask,
     explain,
     catchup,
