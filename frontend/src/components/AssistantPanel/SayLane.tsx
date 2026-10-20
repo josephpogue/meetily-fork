@@ -77,14 +77,14 @@ export function SayLane() {
             <div className="px-1 py-6 text-center">
               <p className="text-sm text-gray-600">No cards yet.</p>
               <p className="mt-1 text-xs text-gray-500">
-                Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode, Option-Q refresh Ask next
+                Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode, Option-Q refresh questions
               </p>
             </div>
           )}
 
           {pinned && <AssistantCard card={pinned} pinned />}
 
-          {pinned && (
+          {pinned && (cards.length > 1 || filter !== 'all') && (
             <div className="-mb-0.5 mt-1.5 flex items-center gap-2 text-xs font-semibold text-gray-500">
               Earlier
               <span className="h-px flex-1 bg-gray-200" aria-hidden="true" />
@@ -95,7 +95,7 @@ export function SayLane() {
             <AssistantCard key={card.id} card={card} />
           ))}
 
-          {cards.length > 0 && earlier.length === 0 && (
+          {filter !== 'all' && cards.length > 0 && earlier.length === 0 && (
             <p className="px-1 py-2 text-xs text-gray-500">Nothing here yet.</p>
           )}
         </div>

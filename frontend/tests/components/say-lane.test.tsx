@@ -112,10 +112,12 @@ describe('SayLane', () => {
   test('empty states: no cards hint, warming skeleton, empty filter line', async () => {
     await mount();
     expect(text()).toContain('No cards yet.');
-    expect(text()).toContain('Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode, Option-Q refresh Ask next');
+    expect(text()).toContain('Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode, Option-Q refresh questions');
     await act(async () => { statusListener!({ enabled: true, claudeOk: true, sessionOpen: true, lanesReady: false, listening: true, mode: 'gated' }); });
     expect(text()).toContain('Lanes warming up...');
     await emit(card('a1', 'answer', 1000));
+    expect(text()).not.toContain('Earlier');
+    expect(text()).not.toContain('Nothing here yet.');
     await filter('Mine');
     expect(text()).toContain('Nothing here yet.');
     expect(countOf('Earlier')).toBe(1);

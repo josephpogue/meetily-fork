@@ -84,7 +84,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
 
   let emptyMessage: string | null = null;
   if (asks.state === 'unavailable') {
-    emptyMessage = 'Ask next unavailable for this call.';
+    emptyMessage = 'Questions unavailable for this call.';
   } else if (!hasItems && asks.updatedAt === null) {
     emptyMessage = 'Listening. Questions appear after the first exchange.';
   } else if (!hasItems) {
@@ -236,7 +236,7 @@ function LaneHeader({
         onClick={onRefresh}
         disabled={refreshOff}
         title="Refresh (Option-Q)"
-        aria-label="Refresh Ask next"
+        aria-label="Refresh questions"
       >
         {thinking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
       </Button>
