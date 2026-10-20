@@ -23,9 +23,9 @@ import { AskLane } from './AskLane';
 import { ScreenRecordingLine } from './ScreenRecordingLine';
 import {
   PANEL_KEY_STEP,
-  PANEL_MIN_WIDTH,
   clampPanelWidth,
   maxPanelWidth,
+  minPanelWidth,
   readStoredPanelWidth,
   writeStoredPanelWidth,
   PANEL_DEFAULT_WIDTH,
@@ -77,6 +77,8 @@ export function AssistantPanel() {
   const [rowWidth, setRowWidth] = useState(10_000);
   const [dragging, setDragging] = useState(false);
   const dragStart = useRef<{ x: number; width: number } | null>(null);
+  // The width after the last pointermove of the current drag; null until the pointer moves.
+  const dragLatest = useRef<number | null>(null);
 
   useEffect(() => {
     setStoredWidth(readStoredPanelWidth());
@@ -115,18 +117,21 @@ export function AssistantPanel() {
     if (e.button !== 0) return;
     e.currentTarget.setPointerCapture(e.pointerId);
     dragStart.current = { x: e.clientX, width };
+    dragLatest.current = null;
     setDragging(true);
   };
   const onHandlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
     const start = dragStart.current;
     if (!start) return;
-    commitWidth(start.width + (start.x - e.clientX));
+    dragLatest.current = commitWidth(start.width + (start.x - e.clientX));
   };
   const endDrag = () => {
     if (!dragStart.current) return;
     dragStart.current = null;
     setDragging(false);
-    writeStoredPanelWidth(width);
+    // A click with no movement leaves the stored choice alone.
+    if (dragLatest.current !== null) writeStoredPanelWidth(dragLatest.current);
+    dragLatest.current = null;
   };
   const onHandleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
     if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
@@ -256,7 +261,7 @@ export function AssistantPanel() {
         aria-orientation="vertical"
         aria-label="Resize assistant panel"
         aria-valuenow={width}
-        aria-valuemin={PANEL_MIN_WIDTH}
+        aria-valuemin={minPanelWidth(rowWidth)}
         aria-valuemax={maxPanelWidth(rowWidth)}
         tabIndex={0}
         onPointerDown={onHandlePointerDown}
@@ -318,7 +323,15 @@ export function AssistantPanel() {
 
       {/* Body: empty states or the two lanes */}
       <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
-        {!status.enabled ? (
+        {briefOpen && (!status.enabled || !status.claudeOk) ? (
+          // The brief stays usable while the assistant is off or Claude is
+          // missing; it takes the place of the empty-state message.
+          <BriefFull
+            editing={briefEditing}
+            onEdit={() => setBriefEditing(true)}
+            onSaved={() => setBriefEditing(false)}
+          />
+        ) : !status.enabled ? (
           <EmptyState
             icon={<Sparkles className="h-5 w-5 text-gray-400" />}
             message="Assistant is off."
