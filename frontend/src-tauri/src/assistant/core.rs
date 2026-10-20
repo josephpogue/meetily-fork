@@ -248,7 +248,10 @@ impl AssistantCore {
 
     fn reset_ask_lane(&mut self) {
         let brief = self.ask_lane.snapshot().brief;
-        self.ask_lane.close();
+        // Silent: the old list was already announced when the session
+        // closed, and a second emit here would reach the history collector
+        // after the new recording reset it.
+        self.ask_lane.discard();
         self.ask_lane = AskLane::new(claude_runner(PathBuf::new()), self.ask_hooks.clone());
         if !brief.is_empty() {
             self.ask_lane.set_brief(brief);
@@ -2141,6 +2144,53 @@ mod tests {
         assert_eq!(items[0].call_time, 4.0);
         assert_eq!(items[1].call_time, 8.0);
         assert_eq!(history.lock().unwrap().opened_ms(), 1_000, "fallback start stays the recording start");
+    }
+
+    #[tokio::test]
+    async fn the_last_meetings_ask_items_never_reach_the_next_meetings_history() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        {
+            // The same wiring the app has: every Ask snapshot is recorded.
+            let sink = history.clone();
+            handle.0.lock().await.ask_hooks.emit =
+                Arc::new(move |out| super::super::history::record_asks(&sink, &out));
+        }
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        history.lock().unwrap().reset(1_000); // meeting 1: recording-started
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        assert!(!history.lock().unwrap().is_empty(), "meeting 1 collected its Ask items");
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1);
+        close_session(&handle).await; // meeting 1: recording-stopped
+
+        // Meeting 2: recording-started resets the collector, then the session
+        // opens (whatever it emits while resetting the lane must not land).
+        history.lock().unwrap().reset(50_000);
+        let root = std::env::temp_dir().join(format!("meetily-leak2-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&root, b"x").unwrap();
+        open_session_in(&handle, Some(true), &root).await;
+        let _ = std::fs::remove_file(&root);
+        super::super::history::record_card(
+            &history,
+            &CardOut {
+                id: "m2".into(),
+                kind: super::super::lanes::CardKind::Answer,
+                question: "Only question".into(),
+                lead: "lead".into(),
+                bullets: vec![],
+                source: String::new(),
+                phase: "checked".into(),
+                changed_lines: vec![],
+                ts: 60_000,
+            },
+        );
+        let items = history.lock().unwrap().finalize(50_000);
+        let seen: Vec<_> = items.iter().map(|i| i.question.clone()).collect();
+        assert_eq!(items.len(), 1, "only meeting 2's own item is saved, got {:?}", seen);
     }
 
     #[tokio::test]

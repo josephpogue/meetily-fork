@@ -763,6 +763,18 @@ impl AskLane {
     /// Kills in-flight turns and stops all further turns. The last list
     /// stays visible until the next session opens a fresh lane.
     pub fn close(&self) {
+        let out = self.stop_turns();
+        (self.hooks.emit)(out);
+    }
+
+    /// `close` without the snapshot emit, for a lane that is being replaced:
+    /// its list must not be announced again, because the history collector
+    /// records every emit and the replacement belongs to a newer meeting.
+    pub fn discard(&self) {
+        self.stop_turns();
+    }
+
+    fn stop_turns(&self) -> AsksOut {
         let (handles, out) = {
             let mut s = self.state.lock().unwrap();
             s.generation += 1;
@@ -778,7 +790,7 @@ impl AskLane {
                 handle.kill().await;
             });
         }
-        (self.hooks.emit)(out);
+        out
     }
 
     pub fn snapshot(&self) -> AsksOut {
