@@ -359,7 +359,7 @@ impl AskState {
                     Which::Deep => {
                         // A deep list built from less transcript than the
                         // shown quick list keeps the quick list's newer items.
-                        let raw = if point < self.shown_point {
+                        let raw = if point < self.shown_point && !ask_list::done_only(&raw) {
                             merge_raw(&self.list, &self.deep_base, raw, &self.dismissed, &self.answered)
                         } else {
                             raw
@@ -739,7 +739,7 @@ impl AskLane {
             s.answered.push(AnsweredItem {
                 id: removed.id,
                 question: removed.question,
-                answer: answer.to_string(),
+                answer: ask_list::collapse(answer),
                 how: AnswerHow::You,
                 at: chrono::Utc::now().timestamp_millis(),
             });
@@ -1969,6 +1969,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_done_only_reply_keeps_the_open_list_and_its_ids() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: What storage do you run today? | WHY: platform\nASK: Who handles backups? | WHY: owner\nASK: Where is the data center? | WHY: site\nYOU: Is pricing in scope?",
+            "DONE: What storage do you run today? | ANSWER: x | BY: call",
+            "NONE",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        let first = lane.snapshot();
+        let ids: Vec<String> = first.asks.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+
+        lane.request(&log, true);
+        settle().await;
+        let second = lane.snapshot();
+        let open: Vec<(&str, &str)> = second.asks.iter().map(|a| (a.id.as_str(), a.question.as_str())).collect();
+        assert_eq!(open, vec![(ids[1].as_str(), "Who handles backups?"), (ids[2].as_str(), "Where is the data center?")]);
+        assert_eq!(second.for_you.len(), 1, "the For-you item stays too");
+        assert_eq!(second.for_you[0].id, first.for_you[0].id);
+        assert_eq!(second.answered.len(), 1);
+        assert_eq!(second.answered[0].id, ids[0]);
+        assert_eq!(second.answered[0].answer, "x");
+
+        // A reply of exactly NONE still empties the list.
+        lane.request(&log, true);
+        settle().await;
+        let third = lane.snapshot();
+        assert!(third.asks.is_empty() && third.for_you.is_empty());
+        assert_eq!(third.answered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_an_ask_line_still_replaces_the_open_list() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: What storage do you run today? | WHY: platform\nASK: Who handles backups? | WHY: owner",
+            "ASK: Where is the data center? | WHY: site\nDONE: What storage do you run today? | ANSWER: x | BY: call",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        lane.request(&log, true);
+        settle().await;
+        let out = lane.snapshot();
+        let open: Vec<&str> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(open, vec!["Where is the data center?"]);
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_answer_is_stored_on_one_line() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![GOOD];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        lane.request(&sample_log(), true);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(lane.answer(&out.for_you[0].id, "Sam\n  Lee\n"));
+        assert_eq!(lane.snapshot().answered[0].answer, "Sam Lee");
+    }
+
+    #[tokio::test]
     async fn answered_is_newest_first_and_never_shrinks() {
         let calls: Calls = Arc::default();
         let replies: Vec<&'static str> = vec![
@@ -2132,6 +2197,7 @@ mod tests {
             asks: vec![("Who handles the backups?".into(), String::new()), ("When does support end?".into(), String::new())],
             for_you: vec![],
             done: vec![(STORAGE.into(), "NetApp.".into(), AnswerHow::Call)],
+            ..Default::default()
         };
         let merged = merge_raw(&shown, &AskList::default(), raw, &[], &answered);
         let qs: Vec<_> = merged.asks.iter().map(|a| a.0.as_str()).collect();

@@ -66,6 +66,8 @@ pub struct RawList {
     pub for_you: Vec<String>,
     /// `DONE:` lines: question, answer, and how it was answered.
     pub done: Vec<(String, String, AnswerHow)>,
+    /// The reply said NONE: nothing is left to ask, whatever DONE lines came with it.
+    pub none: bool,
 }
 
 /// `ASK: <question> | WHY: <reason>`, `YOU: <question>` and
@@ -104,6 +106,7 @@ pub fn parse(raw: &str) -> Option<RawList> {
     if out.asks.is_empty() && out.for_you.is_empty() && out.done.is_empty() && !saw_none {
         return None;
     }
+    out.none = saw_none;
     Some(out)
 }
 
@@ -118,21 +121,42 @@ fn split_why(body: &str) -> (String, String) {
     }
 }
 
-/// `<question> | ANSWER: <answer> | BY: call|chat`. None when the question or
-/// the answer is empty. A missing or unknown BY means the call.
+/// `<question> | ANSWER: <answer> | BY: call|chat`. The markers are matched
+/// without regard to case. The answer marker is the last one that follows a
+/// `|`, so a question may hold `|` itself; BY counts only as the final
+/// segment. None when the question or the answer is empty, or there is no
+/// answer marker. A missing or unknown BY means the call.
 fn split_done(body: &str) -> Option<(String, String, AnswerHow)> {
-    let (question, rest) = body.split_once('|')?;
-    let rest = rest.trim().strip_prefix("ANSWER:")?;
-    let (answer, by) = match rest.rfind("| BY:") {
-        Some(pos) => (&rest[..pos], rest[pos + "| BY:".len()..].trim()),
-        None => (rest, ""),
+    const MARK: &str = "answer:";
+    let lower = body.to_ascii_lowercase();
+    let mut end = lower.len();
+    let pos = loop {
+        let pos = lower[..end].rfind(MARK)?;
+        if lower[..pos].trim_end().ends_with('|') {
+            break pos;
+        }
+        end = pos;
+    };
+    let question = body[..pos].trim_end().trim_end_matches('|');
+    let rest = &body[pos + MARK.len()..];
+    let (answer, by) = match rest.rfind('|') {
+        Some(bar) if rest[bar + 1..].trim_start().to_ascii_lowercase().starts_with("by:") => {
+            (&rest[..bar], rest[bar + 1..].trim_start()[3..].trim())
+        }
+        _ => (rest, ""),
     };
     let how = if by.eq_ignore_ascii_case("chat") { AnswerHow::Chat } else { AnswerHow::Call };
     let (question, answer) = (question.trim(), answer.trim());
     if question.is_empty() || answer.is_empty() {
         return None;
     }
-    Some((question.to_string(), answer.to_string(), how))
+    Some((question.to_string(), collapse(answer), how))
+}
+
+/// Runs of whitespace (newlines included) become one space, so an answer is
+/// always one line in the note and in the next prompt.
+pub fn collapse(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 pub fn same_item(a: &str, b: &str) -> bool {
@@ -180,6 +204,11 @@ pub fn without_answered(list: &AskList, answered: &[AnsweredItem]) -> AskList {
     }
 }
 
+/// True for a reply with DONE lines and no ASK, YOU or NONE line.
+pub fn done_only(raw: &RawList) -> bool {
+    raw.asks.is_empty() && raw.for_you.is_empty() && !raw.done.is_empty() && !raw.none
+}
+
 /// Turns a fresh reply into the list the panel shows. DONE lines move onto
 /// `answered` first; then dismissed and answered questions (and rewordings of
 /// them) are dropped, and each surviving item takes the id of the previous
@@ -191,6 +220,12 @@ pub fn build(
     dismissed: &[String],
     now: i64,
 ) -> AskList {
+    // A reply of DONE lines alone says nothing about the open list: the
+    // questions that stay open are the ones already shown.
+    if done_only(&raw) {
+        raw.asks = prev.asks.iter().map(|i| (i.question.clone(), i.why.clone())).collect();
+        raw.for_you = prev.for_you.iter().map(|i| i.question.clone()).collect();
+    }
     absorb_done(prev, answered, std::mem::take(&mut raw.done), now);
     let keep = |q: &str| {
         !dismissed.iter().any(|d| same_item(d, q)) && !answered.iter().any(|a| same_item(&a.question, q))
@@ -290,7 +325,7 @@ mod tests {
 
     #[test]
     fn parse_none_is_an_empty_list() {
-        assert_eq!(parse("NONE"), Some(RawList::default()));
+        assert_eq!(parse("NONE"), Some(RawList { none: true, ..Default::default() }));
     }
 
     #[test]
@@ -314,6 +349,39 @@ mod tests {
     }
 
     #[test]
+    fn split_done_reads_a_case_insensitive_marker_with_no_by() {
+        let parsed = parse("DONE: What storage? | Answer: NetApp").unwrap();
+        assert_eq!(parsed.done, vec![("What storage?".to_string(), "NetApp".to_string(), AnswerHow::Call)]);
+        let parsed = parse("DONE: What storage? | answer: NetApp | by: Chat").unwrap();
+        assert_eq!(parsed.done, vec![("What storage?".to_string(), "NetApp".to_string(), AnswerHow::Chat)]);
+    }
+
+    #[test]
+    fn split_done_splits_on_the_last_answer_marker_and_a_final_by() {
+        let parsed = parse("DONE: NetApp | Pure or Dell? | ANSWER: Pure | BY: chat").unwrap();
+        assert_eq!(
+            parsed.done,
+            vec![("NetApp | Pure or Dell?".to_string(), "Pure".to_string(), AnswerHow::Chat)]
+        );
+        // BY inside the answer, not the final segment, stays in the answer.
+        let parsed = parse("DONE: Q? | ANSWER: ask them | BY: phone | then call").unwrap();
+        assert_eq!(parsed.done[0].1, "ask them | BY: phone | then call");
+    }
+
+    #[test]
+    fn split_done_needs_an_answer_marker() {
+        let parsed = parse("DONE: What storage? | NetApp");
+        assert!(parsed.is_none(), "no marker, no answered item");
+        assert!(parse("DONE: What storage? | ANSWER:  ").is_none());
+    }
+
+    #[test]
+    fn split_done_collapses_whitespace_in_the_answer() {
+        let parsed = parse("DONE: Q? | ANSWER: one   two\tthree | BY: call").unwrap();
+        assert_eq!(parsed.done[0].1, "one two three");
+    }
+
+    #[test]
     fn same_item_matches_rewording_but_not_a_new_topic() {
         assert!(same_item("What are your management fees?", "What are your monthly management fees?"));
         assert!(same_item("How do you screen tenants?", "how do you screen tenants?"));
@@ -333,6 +401,7 @@ mod tests {
             ],
             for_you: vec!["Is pricing in scope?".to_string()],
             done: vec![],
+            ..Default::default()
         };
         let next = build(&prev, &mut Vec::new(), raw, &[], 0);
         assert_eq!(next.asks[0].id, "a1");
@@ -353,6 +422,7 @@ mod tests {
             ],
             for_you: vec![],
             done: vec![],
+            ..Default::default()
         };
         let next = build(&prev, &mut Vec::new(), raw, &[], 0);
         assert_eq!(next.asks[0].id, "a1");
@@ -368,6 +438,7 @@ mod tests {
             ],
             for_you: vec![],
             done: vec![],
+            ..Default::default()
         };
         let next = build(&AskList::default(), &mut Vec::new(), raw, &["How do you screen tenants?".to_string()], 0);
         assert_eq!(next.asks.len(), 1);

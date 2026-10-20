@@ -6,4 +6,4 @@ You may read Joseph's vault under ~/brain with Read, Grep and Glob, to learn wha
 
 Never write, edit or run anything. You only read.
 
-Keep the output contract exactly as above: the same ASK / YOU / DONE lines, or NONE, and nothing around them. A question you drop from CURRENT LIST because the call answered it still gets its DONE line, unless it is already under ANSWERED SO FAR.
+Keep the output contract exactly as above: the same ASK / YOU / DONE lines, or NONE, and nothing around them. Your reply always repeats every question that stays open, with the DONE lines after them. A question you drop from CURRENT LIST because the call answered it still gets its DONE line, unless it is already under ANSWERED SO FAR.

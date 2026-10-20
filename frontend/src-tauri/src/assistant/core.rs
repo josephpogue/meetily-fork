@@ -225,6 +225,19 @@ impl AssistantCore {
         self.last_error = err;
     }
 
+    /// A fresh Ask lane, keeping only the brief it showed, and its empty
+    /// snapshot sent to the panel. Called wherever the session transcript is
+    /// cleared, so a meeting never inherits the last one's questions.
+    fn reset_ask_lane(&mut self) {
+        let brief = self.ask_lane.snapshot().brief;
+        self.ask_lane.close();
+        self.ask_lane = AskLane::new(claude_runner(PathBuf::new()), self.ask_hooks.clone());
+        if !brief.is_empty() {
+            self.ask_lane.set_brief(brief);
+        }
+        (self.ask_hooks.emit)(self.ask_lane.snapshot());
+    }
+
     fn emit_status(&self) {
         let Some(app) = &self.app else { return };
         if let Err(e) = app.emit("assistant-status", &self.status_snapshot()) {
@@ -300,18 +313,33 @@ fn resolve_deep_read_dirs(raw: &str) -> Vec<PathBuf> {
 /// Builds the shared card emitter once, at `install` time. A settled answer
 /// or ask card also appends to `qa_log` so the end-of-meeting note has a
 /// record of what was asked and answered; a drafting card, explain, or
-/// catch-up does not.
+/// catch-up does not. `forward` then passes the card on (to the panel).
 fn make_card_emit(
-    app: AppHandle<Wry>,
+    handle: AssistantHandle,
     qa_log: Arc<StdMutex<Vec<String>>>,
     chat_log: ChatLog,
+    forward: super::lanes::EmitFn,
 ) -> super::lanes::EmitFn {
     Arc::new(move |card: CardOut| {
         record_card(&card, &qa_log, &chat_log);
-        if let Err(e) = app.emit("assistant-card", &card) {
-            log::warn!("assistant: failed to emit assistant-card: {}", e);
+        if is_settled_ask(&card) {
+            // A question worked out in Ask may have answered one on the
+            // list: do not wait for the next utterance. Spawned, because the
+            // card can be emitted while the core lock is held.
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let core = handle.0.lock().await;
+                if core.session_open && core.enabled {
+                    core.ask_lane.request(&core.transcript, false);
+                }
+            });
         }
+        forward(card);
     })
+}
+
+fn is_settled_ask(card: &CardOut) -> bool {
+    matches!(card.kind, CardKind::Ask) && (card.phase == "checked" || card.phase == "corrected")
 }
 
 /// What a settled card leaves behind. An answer or an Ask card goes to the
@@ -964,6 +992,9 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.note_markdown.clear();
         core.note_error = None;
         core.session_transcript.clear();
+        // The previous meeting's answered and open questions go with its
+        // transcript, however far this attempt gets.
+        core.reset_ask_lane();
         core.session_open = false;
         core.lanes_ready = false;
         // A new recording starts with no frames and no capture task.
@@ -1190,7 +1221,13 @@ async fn wire(app: AppHandle<Wry>) {
         let core = handle.0.lock().await;
         (core.qa_log.clone(), core.chat_log.clone())
     };
-    let card_emit = make_card_emit(app.clone(), qa_log, chat_log);
+    let forward_app = app.clone();
+    let forward: super::lanes::EmitFn = Arc::new(move |card: CardOut| {
+        if let Err(e) = forward_app.emit("assistant-card", &card) {
+            log::warn!("assistant: failed to emit assistant-card: {}", e);
+        }
+    });
+    let card_emit = make_card_emit(handle.clone(), qa_log, chat_log, forward);
 
     {
         let mut core = handle.0.lock().await;
@@ -1926,6 +1963,41 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_settled_ask_card_requests_an_ask_turn_without_a_new_utterance() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        let emit = {
+            let mut core = handle.0.lock().await;
+            core.listening = false;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            let emit = make_card_emit(handle.clone(), qa, chats, Arc::new(|_| {}));
+            core.card_emit = emit.clone();
+            emit
+        };
+        assert_eq!(ask_turns(&calls).len(), 0);
+
+        emit(card(CardKind::Ask, "drafting"));
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 0, "a drafting card requests nothing");
+        emit(card(CardKind::Answer, "checked"));
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 0, "only Ask cards count");
+
+        emit(card(CardKind::Ask, "checked"));
+        settle().await;
+        let turns = ask_turns(&calls);
+        assert_eq!(turns.len(), 1, "a settled Ask card requests a turn, listening off");
+        assert!(turns[0].contains("Who owns backups at FESCO?"), "the turn carries the chat exchange: {}", turns[0]);
+        assert!(turns[0].contains("The ops team."));
+
+        close_session(&handle).await;
+        emit(card(CardKind::Ask, "corrected"));
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 1, "no session open, no turn");
+    }
+
+    #[tokio::test]
     async fn answer_ask_moves_the_item_leaves_the_brief_and_requests_a_refresh() {
         let handle = AssistantHandle::new();
         let calls = Arc::new(StdMutex::new(Vec::new()));
@@ -2012,6 +2084,41 @@ mod tests {
             .map(|t| t.prompt.clone())
             .expect("a note turn ran");
         assert!(note_prompt.contains("QUESTIONS ANSWERED DURING THE CALL:\n- What are your fees? Answer: Ten percent of rent."));
+    }
+
+    #[tokio::test]
+    async fn the_answered_list_does_not_leak_into_a_meeting_whose_session_fails_to_open() {
+        for (label, force_enabled, as_file) in [("disabled", Some(false), false), ("session dir fails", Some(true), true)] {
+            let handle = AssistantHandle::new();
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+            refresh_asks(&handle).await;
+            settle().await;
+            refresh_asks(&handle).await;
+            settle().await;
+            assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1, "{}: meeting 1 answered one", label);
+            close_session(&handle).await;
+
+            // Meeting 2: the open stops early.
+            let root = std::env::temp_dir().join(format!("meetily-leak-test-{}", uuid::Uuid::new_v4()));
+            if as_file {
+                std::fs::write(&root, b"x").unwrap();
+            }
+            open_session_in(&handle, force_enabled, &root).await;
+            let _ = std::fs::remove_file(&root);
+
+            {
+                let core = handle.0.lock().await;
+                assert!(!core.session_open, "{}", label);
+                let snap = core.ask_lane.snapshot();
+                assert!(snap.answered.is_empty(), "{}: answered leaked into meeting 2", label);
+                assert!(snap.asks.is_empty(), "{}", label);
+                assert!(core.ask_lane.answered_items().is_empty(), "{}", label);
+            }
+            assert!(draft_note(&handle).await.is_ok());
+            let core = handle.0.lock().await;
+            assert!(!core.note_markdown.contains("Answered questions"), "{}: note was: {}", label, core.note_markdown);
+        }
     }
 
     #[tokio::test]

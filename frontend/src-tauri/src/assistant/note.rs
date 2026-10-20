@@ -66,7 +66,7 @@ pub fn answered_section(items: &[AnsweredItem]) -> String {
                 AnswerHow::Chat => "Worked out in Ask",
                 AnswerHow::You => "You answered",
             };
-            format!("- **{}** {} ({})", a.question, a.answer, how)
+            format!("- **{}** {} ({})", super::ask_list::collapse(&a.question), super::ask_list::collapse(&a.answer), how)
         })
         .collect();
     format!("## Answered questions\n\n{}", lines.join("\n"))
@@ -250,6 +250,23 @@ mod tests {
 
         assert!(paths[0].ends_with("_sources/meetings/2026-09-01-team-standup.md"));
         assert!(paths[1].ends_with("_sources/meetings/2026-09-01-team-standup_transcript.md"));
+    }
+
+    #[test]
+    fn each_answered_item_is_one_line_in_the_note() {
+        let items = vec![AnsweredItem {
+            id: "a".to_string(),
+            question: "What storage?".to_string(),
+            answer: "NetApp,\n  about 40 TB.\n\n- Pure too".to_string(),
+            how: AnswerHow::Call,
+            at: 1,
+        }];
+        let section = answered_section(&items);
+        assert_eq!(
+            section,
+            "## Answered questions\n\n- **What storage?** NetApp, about 40 TB. - Pure too (On the call)"
+        );
+        assert_eq!(section.lines().count(), 3);
     }
 
     #[test]

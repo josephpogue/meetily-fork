@@ -49,6 +49,6 @@ ASK: <question for Joseph to ask> | WHY: <a few words>
 YOU: <question for Joseph himself>
 DONE: <the question> | ANSWER: <the answer, one or two short sentences> | BY: call
 
-At most five ASK lines and two YOU lines, most important first. DONE lines have no limit, and go last. BY is `call` when the call answered it and `chat` when JOSEPH ASKED THE ASSISTANT PRIVATELY did. A list of DONE lines alone is a valid reply. If there is no ASK, YOU or DONE line to write right now, reply with exactly:
+At most five ASK lines and two YOU lines, most important first. DONE lines have no limit, and go last. BY is `call` when the call answered it and `chat` when JOSEPH ASKED THE ASSISTANT PRIVATELY did. A turn that only answers questions still repeats every question that stays open: write the ASK and YOU lines for them, then the DONE lines. (A list of DONE lines alone is read as "the open list is unchanged".) If there is no ASK, YOU or DONE line to write right now, reply with exactly:
 
 NONE
