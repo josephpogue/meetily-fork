@@ -1,7 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState, type CSSProperties, type ReactNode } from 'react';
-import { FileText, Sparkles } from 'lucide-react';
+import { FileText, MessageSquareText, Sparkles } from 'lucide-react';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 const STORAGE_KEY = 'meetily.meetingDetails.transcriptPaneRatio';
 const DEFAULT_RATIO = 0.3;
@@ -11,7 +11,11 @@ const MAX_RATIO = 0.5;
 const TABS = [
   { value: 'transcript' as const, label: 'Transcript', icon: FileText },
   { value: 'summary' as const, label: 'Summary', icon: Sparkles },
+  { value: 'assistant' as const, label: 'Assistant', icon: MessageSquareText },
 ];
+
+// From md up the transcript is always on the left, so the right pane only switches these two.
+const DESKTOP_TABS = TABS.filter((tab) => tab.value !== 'transcript');
 
 function readStoredRatio(): number {
   if (typeof window === 'undefined') return DEFAULT_RATIO;
@@ -32,11 +36,12 @@ function writeStoredRatio(value: number): void {
   }
 }
 
-export type MeetingDetailsTab = 'transcript' | 'summary';
+export type MeetingDetailsTab = 'transcript' | 'summary' | 'assistant';
 
 interface MeetingDetailsSplitViewProps {
   transcript: ReactNode;
   summary: ReactNode;
+  assistant: ReactNode;
   activeTab: MeetingDetailsTab;
   onTabChange: (tab: MeetingDetailsTab) => void;
 }
@@ -44,6 +49,7 @@ interface MeetingDetailsSplitViewProps {
 export function MeetingDetailsSplitView({
   transcript,
   summary,
+  assistant,
   activeTab,
   onTabChange,
 }: MeetingDetailsSplitViewProps) {
@@ -100,36 +106,39 @@ export function MeetingDetailsSplitView({
     writeStoredRatio(next);
   }, [ratio]);
 
+  // The transcript has no tab, so it stays a region; Summary and Assistant are real tab panels from Tabs.
   const transcriptPanelProps = isDesktop
-    ? { role: 'region' as const, 'aria-label': 'Transcript', tabIndex: -1 }
+    ? { role: 'region' as const, 'aria-label': 'Transcript', 'aria-labelledby': undefined, tabIndex: -1 }
     : {};
-  const summaryPanelProps = isDesktop
-    ? { role: 'region' as const, 'aria-label': 'Summary', tabIndex: -1 }
-    : {};
+
+  // On desktop the transcript has no tab of its own: 'transcript' shows the summary on the right.
+  const tabValue = isDesktop && activeTab === 'transcript' ? 'summary' : activeTab;
+  const tabs = isDesktop ? DESKTOP_TABS : TABS;
+  const tabStrip = (
+    <TabsList className="relative h-auto w-full justify-center rounded-none border-b border-gray-200 bg-transparent p-0">
+      {tabs.map((tab) => {
+        const Icon = tab.icon;
+        return (
+          <TabsTrigger
+            key={tab.value}
+            value={tab.value}
+            className={`relative z-10 flex items-center gap-2 rounded-none border-0 bg-transparent text-gray-600 data-[state=active]:bg-transparent data-[state=active]:text-blue-600 data-[state=active]:shadow-none hover:text-gray-900 focus-visible:ring-2 focus-visible:ring-blue-500 ${isDesktop ? 'px-5 py-3' : 'px-6 py-4'}`}
+          >
+            <Icon className="h-4 w-4" />
+            {tab.label}
+          </TabsTrigger>
+        );
+      })}
+    </TabsList>
+  );
 
   return (
     <Tabs
-      value={activeTab}
+      value={tabValue}
       onValueChange={(value) => onTabChange(value as MeetingDetailsTab)}
       className="flex flex-1 min-h-0 min-w-0 flex-col overflow-hidden"
     >
-      <div className="shrink-0 bg-white px-2 md:hidden">
-        <TabsList className="relative h-auto w-full justify-center rounded-none border-b border-gray-200 bg-transparent p-0">
-          {TABS.map((tab) => {
-            const Icon = tab.icon;
-            return (
-              <TabsTrigger
-                key={tab.value}
-                value={tab.value}
-                className="relative z-10 flex items-center gap-2 rounded-none border-0 bg-transparent px-6 py-4 text-gray-600 data-[state=active]:bg-transparent data-[state=active]:text-blue-600 data-[state=active]:shadow-none hover:text-gray-900"
-              >
-                <Icon className="h-4 w-4" />
-                {tab.label}
-              </TabsTrigger>
-            );
-          })}
-        </TabsList>
-      </div>
+      {!isDesktop && <div className="shrink-0 bg-white px-2">{tabStrip}</div>}
       <div
         ref={containerRef}
         className="flex flex-1 min-h-0 min-w-0 flex-col md:flex-row"
@@ -161,14 +170,23 @@ export function MeetingDetailsSplitView({
         >
           <div className="h-full w-px bg-gray-200 transition-[width,background-color] duration-150 ease-out group-hover:w-1 group-hover:bg-blue-400 group-active:w-1 group-active:bg-blue-500" />
         </div>
-        <TabsContent
-          value="summary"
-          forceMount
-          className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden md:data-[state=inactive]:flex"
-          {...summaryPanelProps}
-        >
-          {summary}
-        </TabsContent>
+        <div className="contents md:flex md:min-h-0 md:min-w-0 md:flex-1 md:flex-col md:overflow-hidden">
+          {isDesktop && <div className="shrink-0 bg-white px-2">{tabStrip}</div>}
+          <TabsContent
+            value="summary"
+            forceMount
+            className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"
+          >
+            {summary}
+          </TabsContent>
+          <TabsContent
+            value="assistant"
+            forceMount
+            className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"
+          >
+            {assistant}
+          </TabsContent>
+        </div>
       </div>
     </Tabs>
   );

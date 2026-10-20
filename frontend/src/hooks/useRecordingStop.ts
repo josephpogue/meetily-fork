@@ -1,6 +1,7 @@
 import { useState, useEffect, useCallback, useRef } from 'react';
 import { useRouter } from 'next/navigation';
 import { listen } from '@tauri-apps/api/event';
+import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { useTranscripts } from '@/contexts/TranscriptContext';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -296,6 +297,14 @@ export function useRecordingStop(
           if (!meetingId) {
             console.error('No meeting_id in response:', responseData);
             throw new Error('No meeting ID received from save operation');
+          }
+
+          // Keep what the assistant showed during the call with the meeting.
+          // A failure here never blocks the meeting save or the navigation.
+          try {
+            await invoke('api_save_meeting_assistant', { meetingId });
+          } catch (error) {
+            console.warn('Failed to save the assistant history for the meeting:', error);
           }
 
           let shouldDetectSummaryLanguage = false;

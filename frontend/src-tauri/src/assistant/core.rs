@@ -112,6 +112,9 @@ pub struct AssistantCore {
     /// for an answer or a direct ask, appends to `qa_log` for the note.
     card_emit: super::lanes::EmitFn,
     qa_log: Arc<StdMutex<Vec<String>>>,
+    /// What the assistant showed this session, kept for the meeting save.
+    /// Reset when a session opens.
+    history: super::history::HistoryHandle,
     /// Ask cards Joseph had with the assistant this session, for the ask
     /// lane's sub-lanes to hear once. Shared with every session's ask lane.
     chat_log: ChatLog,
@@ -154,6 +157,14 @@ pub struct AssistantCore {
 
 impl Default for AssistantCore {
     fn default() -> Self {
+        Self::with_history(super::history::new_handle())
+    }
+}
+
+impl AssistantCore {
+    /// A core that collects into `history`, the same handle the app manages
+    /// as its own state so the meeting-save commands never take the core lock.
+    pub fn with_history(history: super::history::HistoryHandle) -> Self {
         Self {
             settings: AssistantSettings::default(),
             transcript: TranscriptLog::default(),
@@ -171,6 +182,7 @@ impl Default for AssistantCore {
             app: None,
             card_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
+            history,
             chat_log: Arc::new(StdMutex::new(Vec::new())),
             enabled: true,
             session_open: false,
@@ -228,9 +240,18 @@ impl AssistantCore {
     /// A fresh Ask lane, keeping only the brief it showed, and its empty
     /// snapshot sent to the panel. Called wherever the session transcript is
     /// cleared, so a meeting never inherits the last one's questions.
+
+    #[cfg(test)]
+    fn history_handle_for_test(&self) -> super::history::HistoryHandle {
+        self.history.clone()
+    }
+
     fn reset_ask_lane(&mut self) {
         let brief = self.ask_lane.snapshot().brief;
-        self.ask_lane.close();
+        // Silent: the old list was already announced when the session
+        // closed, and a second emit here would reach the history collector
+        // after the new recording reset it.
+        self.ask_lane.discard();
         self.ask_lane = AskLane::new(claude_runner(PathBuf::new()), self.ask_hooks.clone());
         if !brief.is_empty() {
             self.ask_lane.set_brief(brief);
@@ -318,10 +339,12 @@ fn make_card_emit(
     handle: AssistantHandle,
     qa_log: Arc<StdMutex<Vec<String>>>,
     chat_log: ChatLog,
+    history: super::history::HistoryHandle,
     forward: super::lanes::EmitFn,
 ) -> super::lanes::EmitFn {
     Arc::new(move |card: CardOut| {
         record_card(&card, &qa_log, &chat_log);
+        super::history::record_card(&history, &card);
         if is_settled_ask(&card) {
             // A question worked out in Ask may have answered one on the
             // list: do not wait for the next utterance. Spawned, because the
@@ -388,11 +411,12 @@ fn make_voice_publish(app: AppHandle<Wry>) -> Arc<dyn Fn(VoiceState) + Send + Sy
 /// Ask lane hooks: every list change goes out as `assistant-asks`; a
 /// coalesced follow-up and a failure both need core, so they hop back in
 /// through a spawned task.
-fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle) -> AskHooks {
+fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle, history: super::history::HistoryHandle) -> AskHooks {
     let rerun_handle = handle.clone();
     let error_handle = handle;
     AskHooks {
         emit: Arc::new(move |out: AsksOut| {
+            super::history::record_asks(&history, &out);
             if let Err(e) = app.emit("assistant-asks", &out) {
                 log::warn!("assistant: failed to emit assistant-asks: {}", e);
             }
@@ -1217,9 +1241,9 @@ pub fn install(app: AppHandle<Wry>) {
 
 async fn wire(app: AppHandle<Wry>) {
     let handle = app.state::<AssistantHandle>().inner().clone();
-    let (qa_log, chat_log) = {
+    let (qa_log, chat_log, history) = {
         let core = handle.0.lock().await;
-        (core.qa_log.clone(), core.chat_log.clone())
+        (core.qa_log.clone(), core.chat_log.clone(), core.history.clone())
     };
     let forward_app = app.clone();
     let forward: super::lanes::EmitFn = Arc::new(move |card: CardOut| {
@@ -1227,13 +1251,13 @@ async fn wire(app: AppHandle<Wry>) {
             log::warn!("assistant: failed to emit assistant-card: {}", e);
         }
     });
-    let card_emit = make_card_emit(handle.clone(), qa_log, chat_log, forward);
+    let card_emit = make_card_emit(handle.clone(), qa_log, chat_log, history.clone(), forward);
 
     {
         let mut core = handle.0.lock().await;
         core.app = Some(app.clone());
         core.card_emit = card_emit;
-        core.ask_hooks = make_ask_hooks(app.clone(), handle.clone());
+        core.ask_hooks = make_ask_hooks(app.clone(), handle.clone(), history.clone());
         core.ask_lane = AskLane::new(claude_runner(PathBuf::new()), core.ask_hooks.clone());
 
         let fire_handle = handle.clone();
@@ -1294,8 +1318,12 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
     }
     {
         let handle = handle.clone();
+        let history = app.state::<super::history::HistoryHandle>().inner().clone();
         app.listen("recording-started", move |_event| {
             log::info!("assistant: recording-started event received");
+            // A new recording starts a new history, and its start time is now.
+            // Only here: a mid-call off/on reopens the session without this.
+            history.lock().unwrap().reset(chrono::Utc::now().timestamp_millis());
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 open_session(&handle, None).await;
@@ -1971,7 +1999,7 @@ mod tests {
             let mut core = handle.0.lock().await;
             core.listening = false;
             let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
-            let emit = make_card_emit(handle.clone(), qa, chats, Arc::new(|_| {}));
+            let emit = make_card_emit(handle.clone(), qa, chats, core.history.clone(), Arc::new(|_| {}));
             core.card_emit = emit.clone();
             emit
         };
@@ -2084,6 +2112,85 @@ mod tests {
             .map(|t| t.prompt.clone())
             .expect("a note turn ran");
         assert!(note_prompt.contains("QUESTIONS ANSWERED DURING THE CALL:\n- What are your fees? Answer: Ten percent of rent."));
+    }
+
+    #[tokio::test]
+    async fn a_mid_call_off_and_on_keeps_everything_shown_earlier_in_the_call() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        history.lock().unwrap().reset(1_000); // recording-started
+        let root = std::env::temp_dir().join(format!("meetily-reopen-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let card = |id: &str, ts: i64| CardOut {
+            id: id.into(),
+            kind: super::super::lanes::CardKind::Answer,
+            question: "Q?".into(),
+            lead: "lead".into(),
+            bullets: vec![],
+            source: String::new(),
+            phase: "checked".into(),
+            changed_lines: vec![],
+            ts,
+        };
+        open_session_in(&handle, Some(true), &root).await;
+        super::super::history::record_card(&history, &card("c1", 5_000));
+        // Turned off, then on again, in the same call.
+        open_session_in(&handle, Some(false), &root).await;
+        open_session_in(&handle, Some(true), &root).await;
+        super::super::history::record_card(&history, &card("c2", 9_000));
+        let _ = std::fs::remove_dir_all(&root);
+        let items = history.lock().unwrap().finalize(1_000);
+        assert_eq!(items.len(), 2, "both cards survive the reopen");
+        assert_eq!(items[0].call_time, 4.0);
+        assert_eq!(items[1].call_time, 8.0);
+        assert_eq!(history.lock().unwrap().opened_ms(), 1_000, "fallback start stays the recording start");
+    }
+
+    #[tokio::test]
+    async fn the_last_meetings_ask_items_never_reach_the_next_meetings_history() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        {
+            // The same wiring the app has: every Ask snapshot is recorded.
+            let sink = history.clone();
+            handle.0.lock().await.ask_hooks.emit =
+                Arc::new(move |out| super::super::history::record_asks(&sink, &out));
+        }
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        history.lock().unwrap().reset(1_000); // meeting 1: recording-started
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        assert!(!history.lock().unwrap().is_empty(), "meeting 1 collected its Ask items");
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1);
+        close_session(&handle).await; // meeting 1: recording-stopped
+
+        // Meeting 2: recording-started resets the collector, then the session
+        // opens (whatever it emits while resetting the lane must not land).
+        history.lock().unwrap().reset(50_000);
+        let root = std::env::temp_dir().join(format!("meetily-leak2-test-{}", uuid::Uuid::new_v4()));
+        std::fs::write(&root, b"x").unwrap();
+        open_session_in(&handle, Some(true), &root).await;
+        let _ = std::fs::remove_file(&root);
+        super::super::history::record_card(
+            &history,
+            &CardOut {
+                id: "m2".into(),
+                kind: super::super::lanes::CardKind::Answer,
+                question: "Only question".into(),
+                lead: "lead".into(),
+                bullets: vec![],
+                source: String::new(),
+                phase: "checked".into(),
+                changed_lines: vec![],
+                ts: 60_000,
+            },
+        );
+        let items = history.lock().unwrap().finalize(50_000);
+        let seen: Vec<_> = items.iter().map(|i| i.question.clone()).collect();
+        assert_eq!(items.len(), 1, "only meeting 2's own item is saved, got {:?}", seen);
     }
 
     #[tokio::test]

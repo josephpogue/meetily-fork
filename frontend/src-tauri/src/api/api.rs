@@ -740,6 +740,42 @@ pub async fn api_delete_api_key<R: Runtime>(
     }
 }
 
+/// Saves the just-ended session's assistant items for a meeting (replacing
+/// any saved before) and writes `assistant.json` into its folder. Returns
+/// how many items were saved; 0 saves nothing.
+#[tauri::command]
+pub async fn api_save_meeting_assistant(
+    state: tauri::State<'_, AppState>,
+    history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
+    meeting_id: String,
+) -> Result<u32, String> {
+    crate::assistant::history::save_for_meeting(state.db_manager.pool(), &history, &meeting_id).await
+}
+
+/// The meeting's saved assistant items in position order; empty when none.
+#[tauri::command]
+pub async fn api_get_meeting_assistant(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::database::repositories::assistant_items::AssistantItem>, String> {
+    crate::database::repositories::assistant_items::AssistantItemsRepository::list_for_meeting(
+        state.db_manager.pool(),
+        &meeting_id,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Deletes the meeting's saved assistant items and its `assistant.json`.
+/// Returns the rows deleted.
+#[tauri::command]
+pub async fn api_delete_meeting_assistant(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<u32, String> {
+    crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &meeting_id).await
+}
+
 #[tauri::command]
 pub async fn api_delete_meeting<R: Runtime>(
     _app: AppHandle<R>,
@@ -755,9 +791,15 @@ pub async fn api_delete_meeting<R: Runtime>(
 
     let pool = state.db_manager.pool();
 
+    // The folder is only known while the meeting row exists.
+    let folder = crate::assistant::history::folder_path_of(pool, &meeting_id).await;
+
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
         Ok(true) => {
             log_info!("Successfully deleted meeting {}", meeting_id);
+            if let Some(folder) = folder {
+                crate::assistant::history::remove_folder_file(std::path::Path::new(&folder));
+            }
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Meeting deleted successfully"

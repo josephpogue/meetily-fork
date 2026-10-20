@@ -448,6 +448,9 @@ pub fn get_language_preference_internal() -> Option<String> {
 pub fn run() {
     log::set_max_level(log::LevelFilter::Info);
 
+    // The assistant's history collector is its own managed state, so the
+    // meeting-save commands never wait on the assistant core's lock.
+    let assistant_history = assistant::history::new_handle();
     let mut builder = tauri::Builder::default();
 
     // Test Macs only (cargo feature `testenv`): embedded WebDriver for the user-mock agent.
@@ -527,7 +530,8 @@ pub fn run() {
         )) as NotificationManagerState<tauri::Wry>)
         .manage(audio::init_system_audio_state())
         .manage(summary::summary_engine::ModelManagerState(Arc::new(tokio::sync::Mutex::new(None))))
-        .manage(assistant::AssistantHandle::new())
+        .manage(assistant_history.clone())
+        .manage(assistant::AssistantHandle::with_history(assistant_history))
         .setup(|_app| {
             #[cfg(target_os = "windows")]
             match _app.path().resolve(
@@ -821,6 +825,9 @@ pub fn run() {
             api::api_save_transcript_config,
             api::api_get_transcript_api_key,
             api::api_delete_meeting,
+            api::api_save_meeting_assistant,
+            api::api_get_meeting_assistant,
+            api::api_delete_meeting_assistant,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
             api::api_get_meeting_transcripts,

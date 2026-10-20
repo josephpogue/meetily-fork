@@ -35,6 +35,9 @@ Decisions Joseph has made for this version. Every feature follows them.
 - Gaps are the assistant's own judgment from the context it has. There is no preset question list or checklist.
 - Once a question Joseph asks or the assistant suggests is answered, either on the call or by Joseph and the assistant working it out, the assistant moves it off the open list and keeps it with its answer. Nothing is deleted, and Joseph does not tick questions off.
 - The assistant panel keeps what to say and what to ask apart: a Say lane and an Ask lane, one label, icon and colour per kind of content, and nothing in the panel cut short. The panel width is Joseph's to drag, and it is remembered.
+- What the assistant showed during a call is saved with the meeting automatically when the meeting is saved, with no prompt at the end. Saving it is the one write that needs no Save press, because it stays inside the app's own meeting storage and the recording folder, never the vault.
+- The saved assistant items show in an Assistant tab beside the transcript, each with its call time. A copy is kept as `assistant.json` in the meeting's recording folder, and Joseph can delete a meeting's saved items.
+- Only the PNC Jim 10/20/2026 meeting is backfilled with assistant history. Every other earlier meeting stays as it is.
 - New code lives in its own modules, and edits to upstream files stay small and are listed in `docs/FORK_CHANGES.md`.
 - Upstream releases arrive only by merging into the fork. Meetily's in-app updater stays off, because it would install plain Meetily over the fork.
 - Every assistant Claude session starts with a small fixed context and nothing else (`--safe-mode` on): the vault page index, the routing registry, Joseph's profile, and the meeting rule (live call, read only, answer briefly, never start helpers or agents, never write anything). When the brief names a project or client, that project's vault page comes with it.
