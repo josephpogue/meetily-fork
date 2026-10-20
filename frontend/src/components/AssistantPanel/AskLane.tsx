@@ -274,11 +274,16 @@ function ForYouItem({
 }) {
   const [value, setValue] = useState('');
 
+  const submit = () => {
+    if (!value.trim()) return;
+    onAnswer(value);
+    setValue('');
+  };
+
   const handleKeyDown = (e: KeyboardEvent<HTMLInputElement>) => {
     if (e.key === 'Enter' && value.trim()) {
       e.preventDefault();
-      onAnswer(value);
-      setValue('');
+      submit();
     }
   };
 
@@ -295,15 +300,29 @@ function ForYouItem({
         </p>
         <DismissButton question={item.question} disabled={disabled} onClick={onDismiss} />
       </div>
-      <Input
-        aria-label={`Answer: ${item.question}`}
-        disabled={disabled}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onKeyDown={handleKeyDown}
-        placeholder="Answer, then Enter"
-        className="h-7 bg-white text-xs"
-      />
+      <div className="flex items-center gap-1.5">
+        <Input
+          aria-label={`Answer: ${item.question}`}
+          disabled={disabled}
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={handleKeyDown}
+          placeholder="Answer, then Enter"
+          className="h-7 min-w-0 flex-1 bg-white text-xs"
+        />
+        <Button
+          type="button"
+          variant="outline"
+          size="icon"
+          aria-label={`Save answer: ${item.question}`}
+          title="Save answer"
+          disabled={disabled || !value.trim()}
+          onClick={submit}
+          className="h-7 w-7 shrink-0"
+        >
+          <Check className="h-3.5 w-3.5" aria-hidden="true" />
+        </Button>
+      </div>
     </li>
   );
 }

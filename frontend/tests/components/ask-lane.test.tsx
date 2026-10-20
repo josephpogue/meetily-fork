@@ -91,6 +91,18 @@ describe('AskLane', () => {
     expect(input().props.value).toBe('');
   });
 
+  test('the Save answer button sends a For-you answer without Enter', async () => {
+    await emit(payloadA);
+    const save = () => renderer.root.find((n) => n.type === 'button' && n.props['aria-label'] === `Save answer: ${y1.question}`);
+    expect(save().props.disabled).toBe(true);
+    await act(async () => { input().props.onChange({ target: { value: 'Sam Lee' } }); });
+    expect(save().props.disabled).toBe(false);
+    await act(async () => { save().props.onClick(); });
+    expect(answerAsk).toHaveBeenCalledWith('y1', 'Sam Lee');
+    expect(dismissAsk).not.toHaveBeenCalled();
+    expect(input().props.value).toBe('');
+  });
+
   test('the next refresh moves g1 to answered and tags only the new g3', async () => {
     await emit(payloadA);
     await emit(payloadB);
