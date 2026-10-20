@@ -40,7 +40,7 @@ export interface VirtualizedTranscriptViewProps {
 const VIRTUALIZATION_THRESHOLD = 10;
 
 // Helper function to format seconds as recording-relative time [MM:SS]
-function formatRecordingTime(seconds: number | undefined): string {
+export function formatRecordingTime(seconds: number | undefined): string {
     if (seconds === undefined) return '[--:--]';
 
     const totalSeconds = Math.floor(seconds);

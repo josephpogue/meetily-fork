@@ -8,6 +8,7 @@ import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'sonner';
 import { TranscriptPanel } from '@/components/MeetingDetails/TranscriptPanel';
 import { SummaryPanel } from '@/components/MeetingDetails/SummaryPanel';
+import { AssistantHistoryPanel } from '@/components/MeetingDetails/AssistantHistoryPanel';
 import { MeetingDetailsSplitView, type MeetingDetailsTab } from '@/components/MeetingDetails/MeetingDetailsSplitView';
 import { ModelConfig } from '@/components/ModelSettingsModal';
 
@@ -251,6 +252,7 @@ export default function PageContent({
               onOpenModelSettings={handleRegisterModalOpen}
             />
           }
+          assistant={<AssistantHistoryPanel meetingId={meeting.id} />}
         />
       </div>
     </motion.div>

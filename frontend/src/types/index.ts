@@ -247,3 +247,24 @@ export interface AssistantClaudeProbe {
   version: string;
   error: string | null;
 }
+
+/** One saved assistant item of a past meeting (api_get_meeting_assistant). */
+export type MeetingAssistantKind = 'answer' | 'ask' | 'explain' | 'catchup' | 'question' | 'for_you';
+
+export interface MeetingAssistantItem {
+  id: string;
+  kind: MeetingAssistantKind;
+  /** Seconds from recording start, the same scale as transcript audio_start_time. */
+  callTime: number;
+  shownAt: string;
+  question: string;
+  lead: string;
+  bullets: string[];
+  why: string;
+  source: string;
+  phase: string;
+  changedLines: string[];
+  answer: string;
+  answeredHow: 'call' | 'chat' | 'you' | '';
+  answeredCallTime: number | null;
+}
