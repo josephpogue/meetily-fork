@@ -40,3 +40,26 @@ export function reconcileBrief({ draft, saved }: BriefState, next: string): Brie
   if (!suffix || (base && !suffix.startsWith('\n'))) return { draft, saved: next };
   return { draft: draft.trimEnd() + (base ? '' : '\n') + suffix, saved: next };
 }
+
+/** The stamp on the Open sub-header: "Checked 12s ago" after a deep check, else "Updated 12s ago". */
+export function formatOpenStamp(updatedAt: number | null, now: number, checked: boolean): string {
+  const ago = formatUpdatedAgo(updatedAt, now);
+  if (!ago) return '';
+  const rest = ago.slice('updated '.length);
+  return `${checked ? 'Checked' : 'Updated'} ${rest}`;
+}
+
+/** Ids on the new open list that were not on the one before. Empty without a previous list. */
+export function newAskIds(previous: string[] | null, next: string[]): string[] {
+  if (previous === null) return [];
+  const seen = new Set(previous);
+  return next.filter((id) => !seen.has(id));
+}
+
+/** The line under an answered question: how it got answered, and when. */
+export function answeredHowLine(how: 'call' | 'chat' | 'you', at: number): string {
+  const time = new Date(at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  if (how === 'call') return `On the call at ${time}`;
+  if (how === 'chat') return `Worked out with you in Ask at ${time}`;
+  return `You answered at ${time}`;
+}

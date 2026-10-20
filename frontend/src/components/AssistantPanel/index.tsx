@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle,
@@ -12,14 +12,24 @@ import {
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
-import { ScrollArea } from '@/components/ui/scroll-area';
 import { useAssistant } from '@/contexts/AssistantContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
-import { AssistantCard } from './AssistantCard';
 import { AskBox } from './AskBox';
 import { NoteBar } from './NoteBar';
-import { BriefBox } from './BriefBox';
-import { AskNext } from './AskNext';
+import { BriefBar } from './BriefBar';
+import { BriefFull } from './BriefFull';
+import { SayLane } from './SayLane';
+import { AskLane } from './AskLane';
+import { ScreenRecordingLine } from './ScreenRecordingLine';
+import {
+  PANEL_KEY_STEP,
+  clampPanelWidth,
+  maxPanelWidth,
+  minPanelWidth,
+  readStoredPanelWidth,
+  writeStoredPanelWidth,
+  PANEL_DEFAULT_WIDTH,
+} from '@/lib/panel-width';
 
 const MODE_ORDER = ['manual', 'gated', 'continuous'] as const;
 const MODE_LABELS: Record<(typeof MODE_ORDER)[number], string> = {
@@ -54,6 +64,95 @@ export function AssistantPanel() {
   const { isRecording } = useRecordingState();
 
   const [collapsed, setCollapsed] = useState(false);
+
+  // The full brief takes the Ask lane's column; the Say lane never moves.
+  const [briefOpen, setBriefOpen] = useState(false);
+  const [briefEditing, setBriefEditing] = useState(false);
+
+  // Width: Joseph's stored choice, clamped to the row that holds the
+  // transcript and this panel. A window resize re-clamps the shown width but
+  // never rewrites the stored choice.
+  const panelRef = useRef<HTMLDivElement>(null);
+  const [storedWidth, setStoredWidth] = useState<number | null>(null);
+  const [rowWidth, setRowWidth] = useState(10_000);
+  const [dragging, setDragging] = useState(false);
+  const dragStart = useRef<{ x: number; width: number } | null>(null);
+  // The width after the last pointermove of the current drag; null until the pointer moves.
+  const dragLatest = useRef<number | null>(null);
+
+  useEffect(() => {
+    setStoredWidth(readStoredPanelWidth());
+  }, []);
+
+  // Re-observed when the panel leaves or returns from the collapsed rail.
+  useEffect(() => {
+    const row = panelRef.current?.parentElement;
+    if (!row) return;
+    const measure = () => setRowWidth(row.clientWidth);
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(row);
+    return () => observer.disconnect();
+  }, [collapsed]);
+
+  const width = clampPanelWidth(storedWidth, rowWidth);
+
+  // The recording controls float over the page; app/page.tsx keeps them
+  // clear of this panel by reading its current width from this variable.
+  useEffect(() => {
+    const root = document.documentElement;
+    root.style.setProperty('--assistant-panel-width', `${collapsed ? 40 : width}px`);
+    return () => {
+      root.style.removeProperty('--assistant-panel-width');
+    };
+  }, [collapsed, width]);
+
+  const commitWidth = useCallback((next: number) => {
+    const clamped = clampPanelWidth(next, rowWidth);
+    setStoredWidth(clamped);
+    return clamped;
+  }, [rowWidth]);
+
+  const onHandlePointerDown = (e: React.PointerEvent<HTMLDivElement>) => {
+    if (e.button !== 0) return;
+    e.currentTarget.setPointerCapture(e.pointerId);
+    dragStart.current = { x: e.clientX, width };
+    dragLatest.current = null;
+    setDragging(true);
+  };
+  const onHandlePointerMove = (e: React.PointerEvent<HTMLDivElement>) => {
+    const start = dragStart.current;
+    if (!start) return;
+    dragLatest.current = commitWidth(start.width + (start.x - e.clientX));
+  };
+  const endDrag = () => {
+    if (!dragStart.current) return;
+    dragStart.current = null;
+    setDragging(false);
+    // A click with no movement leaves the stored choice alone.
+    if (dragLatest.current !== null) writeStoredPanelWidth(dragLatest.current);
+    dragLatest.current = null;
+  };
+  const onHandleKeyDown = (e: React.KeyboardEvent<HTMLDivElement>) => {
+    if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+    e.preventDefault();
+    const delta = e.key === 'ArrowLeft' ? PANEL_KEY_STEP : -PANEL_KEY_STEP;
+    writeStoredPanelWidth(commitWidth(width + delta));
+  };
+  const resetWidth = () => {
+    setStoredWidth(PANEL_DEFAULT_WIDTH);
+    writeStoredPanelWidth(PANEL_DEFAULT_WIDTH);
+  };
+
+  // No text selection while the handle is dragged.
+  useEffect(() => {
+    if (!dragging) return;
+    const previous = document.body.style.userSelect;
+    document.body.style.userSelect = 'none';
+    return () => {
+      document.body.style.userSelect = previous;
+    };
+  }, [dragging]);
 
   // Tracks whether a recording has actually run this panel's lifetime, so the
   // end-of-meeting note bar can appear after that recording stops even when
@@ -119,7 +218,7 @@ export function AssistantPanel() {
 
   if (collapsed) {
     return (
-      <div className="flex w-10 flex-col items-center gap-3 border-l border-gray-200 bg-white py-3">
+      <div ref={panelRef} className="flex w-10 flex-col items-center gap-3 border-l border-gray-200 bg-white py-3">
         <Button
           variant="ghost"
           size="icon"
@@ -141,10 +240,49 @@ export function AssistantPanel() {
     setMode(next);
   };
 
+  const openBrief = (editing: boolean) => {
+    setBriefOpen(true);
+    setBriefEditing(editing);
+  };
+  const toggleBrief = () => {
+    setBriefOpen(!briefOpen);
+    setBriefEditing(false);
+  };
+
   return (
-    <div className="flex w-[380px] shrink-0 flex-col border-l border-gray-200 bg-white">
+    <div
+      ref={panelRef}
+      style={{ width }}
+      className="relative flex shrink-0 flex-col border-l border-gray-200 bg-white"
+    >
+      {/* Drag handle on the left edge */}
+      <div
+        role="separator"
+        aria-orientation="vertical"
+        aria-label="Resize assistant panel"
+        aria-valuenow={width}
+        aria-valuemin={minPanelWidth(rowWidth)}
+        aria-valuemax={maxPanelWidth(rowWidth)}
+        tabIndex={0}
+        onPointerDown={onHandlePointerDown}
+        onPointerMove={onHandlePointerMove}
+        onPointerUp={endDrag}
+        onPointerCancel={endDrag}
+        onKeyDown={onHandleKeyDown}
+        onDoubleClick={resetWidth}
+        className={`group absolute inset-y-0 -left-1 z-10 w-2 cursor-col-resize touch-none outline-none ${
+          dragging ? 'is-dragging' : ''
+        }`}
+      >
+        <span
+          className={`absolute inset-y-0 left-[3px] w-0.5 transition-colors group-hover:bg-blue-400 group-focus-visible:bg-blue-500 ${
+            dragging ? 'bg-blue-500' : 'bg-transparent'
+          }`}
+        />
+      </div>
+
       {/* Header */}
-      <div className="flex items-center justify-between gap-2 border-b border-gray-200 p-3">
+      <div className="flex shrink-0 items-center justify-between gap-2 border-b border-gray-200 px-3.5 py-2.5">
         <div className="flex items-center gap-2">
           <button
             type="button"
@@ -156,6 +294,7 @@ export function AssistantPanel() {
               className={cnDot(status.enabled && status.listening)}
             />
           </button>
+          <span className="text-sm font-semibold text-gray-900">Assistant</span>
           <button
             type="button"
             onClick={cycleMode}
@@ -166,22 +305,33 @@ export function AssistantPanel() {
           </button>
         </div>
         <div className="flex items-center gap-2">
-          <Switch checked={status.enabled} onCheckedChange={setEnabled} />
+          <Switch checked={status.enabled} onCheckedChange={setEnabled} aria-label="Assistant on or off" />
           <Button variant="ghost" size="icon" onClick={() => setCollapsed(true)} title="Collapse">
             <ChevronsRight className="h-4 w-4" />
           </Button>
         </div>
       </div>
 
-      {/* Meeting brief, editable before and during the call */}
-      <BriefBox />
+      <ScreenRecordingLine enabled={status.enabled} isRecording={isRecording} />
 
-      {/* Questions for Joseph to ask, while a session is open */}
-      <AskNext disabled={actionsDisabled} />
+      {/* Meeting brief preview, editable before and during the call */}
+      <BriefBar
+        open={briefOpen}
+        onToggleOpen={toggleBrief}
+        onEdit={() => openBrief(true)}
+      />
 
-      {/* Body: empty states or card stack */}
-      <div className="flex flex-1 flex-col overflow-hidden">
-        {!status.enabled ? (
+      {/* Body: empty states or the two lanes */}
+      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+        {briefOpen && (!status.enabled || !status.claudeOk) ? (
+          // The brief stays usable while the assistant is off or Claude is
+          // missing; it takes the place of the empty-state message.
+          <BriefFull
+            editing={briefEditing}
+            onEdit={() => setBriefEditing(true)}
+            onSaved={() => setBriefEditing(false)}
+          />
+        ) : !status.enabled ? (
           <EmptyState
             icon={<Sparkles className="h-5 w-5 text-gray-400" />}
             message="Assistant is off."
@@ -197,26 +347,23 @@ export function AssistantPanel() {
               </Button>
             }
           />
-        ) : status.sessionOpen && !status.lanesReady ? (
-          <div className="flex flex-1 flex-col gap-2 p-3">
-            <div className="h-16 animate-pulse rounded-lg bg-gray-100" />
-            <div className="h-16 animate-pulse rounded-lg bg-gray-100" />
-            <p className="text-center text-xs text-gray-400">Lanes warming up...</p>
-          </div>
-        ) : cards.length === 0 ? (
-          <EmptyState
-            icon={<Sparkles className="h-5 w-5 text-gray-400" />}
-            message="No cards yet."
-            hint="Option-A voice ask, Option-E explain, Option-C catch up, Option-M cycle mode, Option-Q refresh Ask next"
-          />
         ) : (
-          <ScrollArea className="flex-1">
-            <div className="flex flex-col gap-2 p-3">
-              {cards.map((card) => (
-                <AssistantCard key={card.id} card={card} />
-              ))}
+          <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
+            <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+              <SayLane />
             </div>
-          </ScrollArea>
+            <div className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-gray-200">
+              {briefOpen ? (
+                <BriefFull
+                  editing={briefEditing}
+                  onEdit={() => setBriefEditing(true)}
+                  onSaved={() => setBriefEditing(false)}
+                />
+              ) : (
+                <AskLane disabled={actionsDisabled} />
+              )}
+            </div>
+          </div>
         )}
       </div>
 
@@ -228,30 +375,35 @@ export function AssistantPanel() {
         </div>
       )}
 
-      <div className="flex gap-2 border-t border-gray-200 p-3">
-        <Button
-          variant="outline"
-          size="sm"
-          className="flex-1"
-          onClick={explain}
-          disabled={actionsDisabled}
-        >
-          <MessageCircleQuestion className="h-4 w-4" />
-          Explain
-        </Button>
-        <Button
-          variant="outline"
-          size="sm"
-          className="flex-1"
-          onClick={catchup}
-          disabled={actionsDisabled}
-        >
-          <History className="h-4 w-4" />
-          Catch up
-        </Button>
+      <div className="shrink-0 border-t border-gray-200 bg-white">
+        <div className="flex gap-2 px-3 pt-3">
+          <Button
+            variant="outline"
+            size="sm"
+            className="flex-1"
+            onClick={explain}
+            disabled={actionsDisabled}
+            aria-keyshortcuts="Alt+E"
+          >
+            <MessageCircleQuestion className="h-4 w-4" />
+            Explain
+            <kbd className="rounded border border-gray-200 bg-gray-50 px-1.5 font-sans text-[11px] text-gray-500" aria-hidden="true">⌥E</kbd>
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            className="flex-1"
+            onClick={catchup}
+            disabled={actionsDisabled}
+            aria-keyshortcuts="Alt+C"
+          >
+            <History className="h-4 w-4" />
+            Catch up
+            <kbd className="rounded border border-gray-200 bg-gray-50 px-1.5 font-sans text-[11px] text-gray-500" aria-hidden="true">⌥C</kbd>
+          </Button>
+        </div>
+        <AskBox disabled={actionsDisabled} />
       </div>
-
-      <AskBox disabled={actionsDisabled} />
     </div>
   );
 }

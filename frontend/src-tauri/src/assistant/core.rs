@@ -19,7 +19,7 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::audio::TranscriptUpdate;
 
-use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut};
+use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut, ChatExchange, ChatLog};
 use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, FrameFeed, LaneConfig, Runner};
 use super::note::{self, NoteDraft, NOTE_PROMPT};
 use super::settings::{self, AssistantSettings};
@@ -112,6 +112,9 @@ pub struct AssistantCore {
     /// for an answer or a direct ask, appends to `qa_log` for the note.
     card_emit: super::lanes::EmitFn,
     qa_log: Arc<StdMutex<Vec<String>>>,
+    /// Ask cards Joseph had with the assistant this session, for the ask
+    /// lane's sub-lanes to hear once. Shared with every session's ask lane.
+    chat_log: ChatLog,
 
     enabled: bool,
     session_open: bool,
@@ -168,6 +171,7 @@ impl Default for AssistantCore {
             app: None,
             card_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
+            chat_log: Arc::new(StdMutex::new(Vec::new())),
             enabled: true,
             session_open: false,
             lanes_ready: false,
@@ -219,6 +223,19 @@ impl AssistantCore {
             self.last_error_seq += 1;
         }
         self.last_error = err;
+    }
+
+    /// A fresh Ask lane, keeping only the brief it showed, and its empty
+    /// snapshot sent to the panel. Called wherever the session transcript is
+    /// cleared, so a meeting never inherits the last one's questions.
+    fn reset_ask_lane(&mut self) {
+        let brief = self.ask_lane.snapshot().brief;
+        self.ask_lane.close();
+        self.ask_lane = AskLane::new(claude_runner(PathBuf::new()), self.ask_hooks.clone());
+        if !brief.is_empty() {
+            self.ask_lane.set_brief(brief);
+        }
+        (self.ask_hooks.emit)(self.ask_lane.snapshot());
     }
 
     fn emit_status(&self) {
@@ -296,21 +313,57 @@ fn resolve_deep_read_dirs(raw: &str) -> Vec<PathBuf> {
 /// Builds the shared card emitter once, at `install` time. A settled answer
 /// or ask card also appends to `qa_log` so the end-of-meeting note has a
 /// record of what was asked and answered; a drafting card, explain, or
-/// catch-up does not.
-fn make_card_emit(app: AppHandle<Wry>, qa_log: Arc<StdMutex<Vec<String>>>) -> super::lanes::EmitFn {
+/// catch-up does not. `forward` then passes the card on (to the panel).
+fn make_card_emit(
+    handle: AssistantHandle,
+    qa_log: Arc<StdMutex<Vec<String>>>,
+    chat_log: ChatLog,
+    forward: super::lanes::EmitFn,
+) -> super::lanes::EmitFn {
     Arc::new(move |card: CardOut| {
-        if matches!(card.kind, CardKind::Answer | CardKind::Ask)
-            && (card.phase == "checked" || card.phase == "corrected")
-        {
-            qa_log
-                .lock()
-                .unwrap()
-                .push(format!("Q: {}\nA: {}", card.question, card.lead));
+        record_card(&card, &qa_log, &chat_log);
+        if is_settled_ask(&card) {
+            // A question worked out in Ask may have answered one on the
+            // list: do not wait for the next utterance. Spawned, because the
+            // card can be emitted while the core lock is held.
+            let handle = handle.clone();
+            tauri::async_runtime::spawn(async move {
+                let core = handle.0.lock().await;
+                if core.session_open && core.enabled {
+                    core.ask_lane.request(&core.transcript, false);
+                }
+            });
         }
-        if let Err(e) = app.emit("assistant-card", &card) {
-            log::warn!("assistant: failed to emit assistant-card: {}", e);
-        }
+        forward(card);
     })
+}
+
+fn is_settled_ask(card: &CardOut) -> bool {
+    matches!(card.kind, CardKind::Ask) && (card.phase == "checked" || card.phase == "corrected")
+}
+
+/// What a settled card leaves behind. An answer or an Ask card goes to the
+/// note's Q&A log; an Ask card (Joseph's own question) also goes to the chat
+/// log, so Ask next can hear it and mark a list question answered.
+fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<String>>, chat_log: &StdMutex<Vec<ChatExchange>>) {
+    let settled = card.phase == "checked" || card.phase == "corrected";
+    if !settled {
+        return;
+    }
+    if matches!(card.kind, CardKind::Answer | CardKind::Ask) {
+        qa_log
+            .lock()
+            .unwrap()
+            .push(format!("Q: {}\nA: {}", card.question, card.lead));
+    }
+    if matches!(card.kind, CardKind::Ask) {
+        let mut answer = card.lead.clone();
+        for bullet in &card.bullets {
+            answer.push_str("\n- ");
+            answer.push_str(bullet);
+        }
+        chat_log.lock().unwrap().push(ChatExchange { question: card.question.clone(), answer });
+    }
 }
 
 fn make_voice_publish(app: AppHandle<Wry>) -> Arc<dyn Fn(VoiceState) + Send + Sync> {
@@ -537,6 +590,20 @@ pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
     }
 }
 
+/// Joseph typed the answer to a list question. The item moves to the
+/// answered list; the brief is the frontend's to update. False for an
+/// unknown id or an empty answer.
+pub async fn answer_ask(handle: &AssistantHandle, id: String, answer: String) -> bool {
+    let core = handle.0.lock().await;
+    if !core.ask_lane.answer(&id, &answer) {
+        return false;
+    }
+    if core.session_open && core.enabled {
+        core.ask_lane.request(&core.transcript, false);
+    }
+    true
+}
+
 /// Surfaces "the session is not open" as a visible error rather than a
 /// silent no-op. The panel renders `lastError`, so a button press that gets
 /// dropped needs to reach it the same way a lane failure does -- otherwise
@@ -648,16 +715,24 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
         let transcript_text = core.transcript.all();
         let qa_log_text = core.qa_log.lock().unwrap().join("\n\n");
         let open_asks = core.ask_lane.open_asks();
-        let draft_input = if open_asks.is_empty() {
-            qa_log_text
-        } else {
+        let mut draft_input = qa_log_text;
+        let answered = core.ask_lane.answered_items();
+        if !answered.is_empty() {
+            let list = answered
+                .iter()
+                .map(|a| format!("- {} Answer: {}", a.question, a.answer))
+                .collect::<Vec<_>>()
+                .join("\n");
+            draft_input = format!("{}\n\nQUESTIONS ANSWERED DURING THE CALL:\n{}", draft_input, list);
+        }
+        if !open_asks.is_empty() {
             let list = open_asks
                 .iter()
                 .map(|q| format!("- {}", q))
                 .collect::<Vec<_>>()
                 .join("\n");
-            format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", qa_log_text, list)
-        };
+            draft_input = format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", draft_input, list);
+        }
         core.session_transcript = transcript_text.clone();
         (transcript_text, draft_input)
     };
@@ -670,7 +745,10 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
     let mut core = handle.0.lock().await;
     match result {
         Ok(raw) => match note::parse_note(&raw) {
-            Ok(draft) => {
+            Ok(mut draft) => {
+                // Built in code, not by the model: the answered list as it
+                // stood, in the preview and in the saved file alike.
+                draft.markdown = note::with_answered(&draft.markdown, &core.ask_lane.answered_items());
                 core.note_markdown = draft.markdown.clone();
                 core.note_draft = Some(draft);
                 core.note_state = NoteState::Ready;
@@ -818,6 +896,7 @@ async fn open_lanes_with(
     // failure leaves the answer lanes alone; it reports "unavailable".
     let hooks = core.ask_hooks.clone();
     core.ask_lane = AskLane::new(runner, hooks);
+    core.ask_lane.set_chat_log(core.chat_log.clone());
     core.ask_lane.set_frames(feed);
     core.brief = brief.clone();
     let trunk = core.lanes.trunk_id();
@@ -907,11 +986,15 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.transcript = TranscriptLog::default();
         core.trigger.reset();
         core.qa_log.lock().unwrap().clear();
+        core.chat_log.lock().unwrap().clear();
         core.note_state = NoteState::Idle;
         core.note_draft = None;
         core.note_markdown.clear();
         core.note_error = None;
         core.session_transcript.clear();
+        // The previous meeting's answered and open questions go with its
+        // transcript, however far this attempt gets.
+        core.reset_ask_lane();
         core.session_open = false;
         core.lanes_ready = false;
         // A new recording starts with no frames and no capture task.
@@ -1134,8 +1217,17 @@ pub fn install(app: AppHandle<Wry>) {
 
 async fn wire(app: AppHandle<Wry>) {
     let handle = app.state::<AssistantHandle>().inner().clone();
-    let qa_log = { handle.0.lock().await.qa_log.clone() };
-    let card_emit = make_card_emit(app.clone(), qa_log);
+    let (qa_log, chat_log) = {
+        let core = handle.0.lock().await;
+        (core.qa_log.clone(), core.chat_log.clone())
+    };
+    let forward_app = app.clone();
+    let forward: super::lanes::EmitFn = Arc::new(move |card: CardOut| {
+        if let Err(e) = forward_app.emit("assistant-card", &card) {
+            log::warn!("assistant: failed to emit assistant-card: {}", e);
+        }
+    });
+    let card_emit = make_card_emit(handle.clone(), qa_log, chat_log, forward);
 
     {
         let mut core = handle.0.lock().await;
@@ -1828,4 +1920,218 @@ mod tests {
         assert_eq!(handle.0.lock().await.ask_lane.snapshot().state, "idle");
     }
 
+
+    // ---- answered questions kept ----
+
+    fn card(kind: CardKind, phase: &str) -> CardOut {
+        CardOut {
+            id: "c1".to_string(),
+            kind,
+            question: "Who owns backups at FESCO?".to_string(),
+            lead: "The ops team.".to_string(),
+            bullets: vec!["Per the vault note".to_string(), "Second line".to_string()],
+            source: "deep".to_string(),
+            phase: phase.to_string(),
+            changed_lines: Vec::new(),
+            ts: 1,
+        }
+    }
+
+    #[test]
+    fn a_settled_ask_card_reaches_the_note_log_and_the_chat_log() {
+        let (qa, chats) = (StdMutex::new(Vec::new()), StdMutex::new(Vec::new()));
+        record_card(&card(CardKind::Ask, "drafting"), &qa, &chats);
+        assert!(qa.lock().unwrap().is_empty() && chats.lock().unwrap().is_empty(), "drafting is not heard");
+
+        record_card(&card(CardKind::Ask, "checked"), &qa, &chats);
+        record_card(&card(CardKind::Ask, "corrected"), &qa, &chats);
+        assert_eq!(qa.lock().unwrap().len(), 2);
+        let chats = chats.lock().unwrap();
+        assert_eq!(chats.len(), 2);
+        assert_eq!(chats[0].question, "Who owns backups at FESCO?");
+        assert_eq!(chats[0].answer, "The ops team.\n- Per the vault note\n- Second line");
+    }
+
+    #[test]
+    fn answer_cards_explain_and_catch_up_are_not_chat() {
+        let (qa, chats) = (StdMutex::new(Vec::new()), StdMutex::new(Vec::new()));
+        record_card(&card(CardKind::Answer, "checked"), &qa, &chats);
+        record_card(&card(CardKind::Explain, "checked"), &qa, &chats);
+        record_card(&card(CardKind::Catchup, "checked"), &qa, &chats);
+        assert_eq!(qa.lock().unwrap().len(), 1, "only the answer card is in the Q&A log");
+        assert!(chats.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_settled_ask_card_requests_an_ask_turn_without_a_new_utterance() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        let emit = {
+            let mut core = handle.0.lock().await;
+            core.listening = false;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            let emit = make_card_emit(handle.clone(), qa, chats, Arc::new(|_| {}));
+            core.card_emit = emit.clone();
+            emit
+        };
+        assert_eq!(ask_turns(&calls).len(), 0);
+
+        emit(card(CardKind::Ask, "drafting"));
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 0, "a drafting card requests nothing");
+        emit(card(CardKind::Answer, "checked"));
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 0, "only Ask cards count");
+
+        emit(card(CardKind::Ask, "checked"));
+        settle().await;
+        let turns = ask_turns(&calls);
+        assert_eq!(turns.len(), 1, "a settled Ask card requests a turn, listening off");
+        assert!(turns[0].contains("Who owns backups at FESCO?"), "the turn carries the chat exchange: {}", turns[0]);
+        assert!(turns[0].contains("The ops team."));
+
+        close_session(&handle).await;
+        emit(card(CardKind::Ask, "corrected"));
+        settle().await;
+        assert_eq!(ask_turns(&calls).len(), 1, "no session open, no turn");
+    }
+
+    #[tokio::test]
+    async fn answer_ask_moves_the_item_leaves_the_brief_and_requests_a_refresh() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "my goal".to_string(), ask_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+
+        assert!(!answer_ask(&handle, "no-such-id".to_string(), "x".to_string()).await);
+        assert!(!answer_ask(&handle, id.clone(), "  ".to_string()).await);
+        assert_eq!(ask_turns(&calls).len(), 1, "a refused answer requests nothing");
+
+        assert!(answer_ask(&handle, id.clone(), "  Ten percent.  ".to_string()).await);
+        settle().await;
+        let snap = handle.0.lock().await.ask_lane.snapshot();
+        assert!(snap.asks.is_empty());
+        assert_eq!(snap.answered.len(), 1);
+        assert_eq!(snap.answered[0].id, id);
+        assert_eq!(snap.answered[0].answer, "Ten percent.");
+        assert_eq!(snap.answered[0].how, crate::assistant::ask_list::AnswerHow::You);
+        assert_eq!(snap.brief, "my goal", "the frontend owns the brief line");
+        let turns = ask_turns(&calls);
+        assert_eq!(turns.len(), 2, "a refresh was requested");
+        assert!(turns[1].contains("ANSWERED SO FAR (never ask these again):"));
+        assert!(turns[1].contains("What are your fees? Answer: Ten percent."));
+    }
+
+    /// Ask turns say ASK on the first refresh and DONE after; the note turn
+    /// (its prompt starts with TRANSCRIPT:) returns a two-section note.
+    fn note_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
+        let ask_turns_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        Arc::new(move |turn, _on_delta, _register| {
+            let is_ask_turn = turn.append_system_prompt.as_deref().is_some_and(|p| p.starts_with(ASK_PROMPT))
+                && !turn.prompt.starts_with("Standing by");
+            let is_note = turn.prompt.starts_with("TRANSCRIPT:");
+            calls.lock().unwrap().push(turn);
+            let text = if is_note {
+                "=== SLUG ===\nfesco-kickoff\n=== NOTE ===\n## Summary\n\nThey talked fees.\n\n## Open questions\n\n- Who owns backups?"
+            } else if is_ask_turn {
+                // The first refresh runs a quick and a deep turn.
+                if ask_turns_seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst) < 2 {
+                    "ASK: What are your fees? | WHY: budget"
+                } else {
+                    "DONE: What are your fees? | ANSWER: Ten percent of rent. | BY: call"
+                }
+            } else {
+                "READY"
+            };
+            Box::pin(async move {
+                ClaudeOutcome {
+                    session_id: Some(uuid::Uuid::new_v4().to_string()),
+                    text: text.to_string(),
+                    error: None,
+                }
+            })
+        })
+    }
+
+    #[tokio::test]
+    async fn the_drafted_note_gets_the_answered_section_built_in_code() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1);
+
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+
+        let core = handle.0.lock().await;
+        assert!(core.note_markdown.ends_with(
+            "## Answered questions\n\n- **What are your fees?** Ten percent of rent. (On the call)"
+        ), "note was: {}", core.note_markdown);
+        assert!(core.note_markdown.starts_with("## Summary"));
+        assert_eq!(core.note_draft.as_ref().unwrap().markdown, core.note_markdown, "the saved file gets it too");
+        let note_prompt = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|t| t.prompt.starts_with("TRANSCRIPT:"))
+            .map(|t| t.prompt.clone())
+            .expect("a note turn ran");
+        assert!(note_prompt.contains("QUESTIONS ANSWERED DURING THE CALL:\n- What are your fees? Answer: Ten percent of rent."));
+    }
+
+    #[tokio::test]
+    async fn the_answered_list_does_not_leak_into_a_meeting_whose_session_fails_to_open() {
+        for (label, force_enabled, as_file) in [("disabled", Some(false), false), ("session dir fails", Some(true), true)] {
+            let handle = AssistantHandle::new();
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+            refresh_asks(&handle).await;
+            settle().await;
+            refresh_asks(&handle).await;
+            settle().await;
+            assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1, "{}: meeting 1 answered one", label);
+            close_session(&handle).await;
+
+            // Meeting 2: the open stops early.
+            let root = std::env::temp_dir().join(format!("meetily-leak-test-{}", uuid::Uuid::new_v4()));
+            if as_file {
+                std::fs::write(&root, b"x").unwrap();
+            }
+            open_session_in(&handle, force_enabled, &root).await;
+            let _ = std::fs::remove_file(&root);
+
+            {
+                let core = handle.0.lock().await;
+                assert!(!core.session_open, "{}", label);
+                let snap = core.ask_lane.snapshot();
+                assert!(snap.answered.is_empty(), "{}: answered leaked into meeting 2", label);
+                assert!(snap.asks.is_empty(), "{}", label);
+                assert!(core.ask_lane.answered_items().is_empty(), "{}", label);
+            }
+            assert!(draft_note(&handle).await.is_ok());
+            let core = handle.0.lock().await;
+            assert!(!core.note_markdown.contains("Answered questions"), "{}: note was: {}", label, core.note_markdown);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_note_with_nothing_answered_gets_no_answered_section() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let core = handle.0.lock().await;
+        assert!(!core.note_markdown.contains("Answered questions"));
+        assert!(core.note_markdown.ends_with("- Who owns backups?"));
+    }
 }

@@ -46,9 +46,9 @@ export function AskBox({ disabled }: AskBoxProps) {
   };
 
   return (
-    <div className="border-t border-gray-200 p-3">
+    <div className="p-3">
       {isListening && (
-        <p className="mb-2 line-clamp-2 text-xs italic text-gray-500">
+        <p className="mb-2 text-xs italic text-gray-500">
           {voice.heard || 'Listening...'}
         </p>
       )}
@@ -58,12 +58,13 @@ export function AskBox({ disabled }: AskBoxProps) {
           onChange={(e) => setValue(e.target.value)}
           onKeyDown={handleKeyDown}
           placeholder="Ask a question"
-          className="flex-1"
+          className="h-10 flex-1 rounded-lg"
         />
         <Button
           type="button"
           variant={isListening ? 'red' : 'outline'}
           size="icon"
+          className="h-10 w-10 shrink-0"
           onClick={handleMicClick}
           disabled={disabled || isSubmitting}
           title={isListening ? 'Stop and submit' : 'Voice ask'}
@@ -75,6 +76,7 @@ export function AskBox({ disabled }: AskBoxProps) {
           type="button"
           variant="outline"
           size="icon"
+          className="h-10 w-10 shrink-0"
           onClick={submit}
           disabled={disabled || !value.trim()}
           title="Send"

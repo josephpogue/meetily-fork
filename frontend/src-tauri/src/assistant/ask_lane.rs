@@ -5,8 +5,10 @@
 // (the fast model, no tools) shows a list first, and a deep sub-lane (the
 // deep model, read-only tools over Joseph's vault) later replaces or
 // corrects it. Each turn sends what changed since that sub-lane's last one
-// (transcript delta, a brief edit, dismissals) and gets back the whole list
-// of questions Joseph should still ask. At most one turn per sub-lane runs
+// (transcript delta, a brief edit, dismissals, newly answered questions, a
+// private Ask exchange) and gets back the whole list of questions Joseph
+// should still ask, plus a DONE line for each question that was answered.
+// An answered question is kept with its answer, never deleted. At most one turn per sub-lane runs
 // at a time. Requests that land meanwhile coalesce into one follow-up,
 // fired through `AskHooks::rerun`, because only core holds the transcript.
 
@@ -15,7 +17,7 @@ use std::sync::{Arc, Mutex};
 
 use serde::Serialize;
 
-use super::ask_list::{self, AskItem, AskList, RawList};
+use super::ask_list::{self, AnswerHow, AnsweredItem, AskItem, AskList, RawList};
 use super::claude_cli::{
     ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS, READ_ONLY_TOOLS, WRITE_TOOLS,
 };
@@ -42,6 +44,8 @@ pub struct AsksOut {
     pub state: String,
     pub asks: Vec<AskItem>,
     pub for_you: Vec<AskItem>,
+    /// Every question answered this session, newest first. Never shrinks.
+    pub answered: Vec<AnsweredItem>,
     pub updated_at: Option<i64>,
     pub brief: String,
     /// True while the shown list came from the deep sub-lane.
@@ -53,6 +57,18 @@ pub struct AsksOut {
     /// the list it replaced. Empty for a quick result.
     pub changed: Vec<String>,
 }
+
+/// One private exchange Joseph had with the assistant in Ask (an Ask card),
+/// for the Ask next sub-lanes to hear once: the answer may settle a question.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ChatExchange {
+    pub question: String,
+    /// The card's lead and bullets, as text.
+    pub answer: String,
+}
+
+/// Shared with core, whose card hook appends to it; each session's lane reads it.
+pub type ChatLog = Arc<Mutex<Vec<ChatExchange>>>;
 
 pub type AskEmitFn = Arc<dyn Fn(AsksOut) + Send + Sync>;
 
@@ -128,6 +144,10 @@ struct SubLane {
     brief_sent: u64,
     /// How many of `AskState::dismissed` the model has been told about.
     dismissed_sent: usize,
+    /// How many of `AskState::answered` (oldest first) the model has been told about.
+    answered_sent: usize,
+    /// How many of the chat log's exchanges the model has heard.
+    chats_sent: usize,
 }
 
 #[derive(Default)]
@@ -145,6 +165,11 @@ struct AskState {
     /// Every question Joseph dismissed this session, for filtering and for
     /// telling each sub-lane once.
     dismissed: Vec<String>,
+    /// Every question answered this session, oldest first (the snapshot shows
+    /// newest first). Only a new session, which makes a new lane, resets it.
+    answered: Vec<AnsweredItem>,
+    /// Private Ask exchanges; the card hook in core appends.
+    chats: ChatLog,
     /// Bumped by `close`; a turn that finishes under an older generation is
     /// dropped on the floor.
     generation: u64,
@@ -169,6 +194,8 @@ struct Job {
     generation: u64,
     sent_version: u64,
     sent_dismissed: usize,
+    sent_answered: usize,
+    sent_chats: usize,
     new_cursor: usize,
 }
 
@@ -206,6 +233,7 @@ impl AskState {
             state: state.to_string(),
             asks: self.list.asks.clone(),
             for_you: self.list.for_you.clone(),
+            answered: self.answered.iter().rev().cloned().collect(),
             updated_at: self.updated_at,
             brief: self.brief.clone(),
             checked: self.shown_by == Shown::Deep,
@@ -235,7 +263,16 @@ impl AskState {
         let in_progress = log.open_preview();
         let brief_changed = self.brief_version != sub.brief_sent;
         let unsent = &self.dismissed[sub.dismissed_sent.min(self.dismissed.len())..];
-        let has_news = !delta.is_empty() || brief_changed || !unsent.is_empty();
+        let unsent_answered = &self.answered[sub.answered_sent.min(self.answered.len())..];
+        let (unsent_chats, chats_len) = {
+            let chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
+            (chats[sub.chats_sent.min(chats.len())..].to_vec(), chats.len())
+        };
+        let has_news = !delta.is_empty()
+            || brief_changed
+            || !unsent.is_empty()
+            || !unsent_answered.is_empty()
+            || !unsent_chats.is_empty();
         if !force && !has_news {
             return None;
         }
@@ -243,10 +280,11 @@ impl AskState {
             &delta,
             &in_progress,
             brief_changed.then(|| self.brief.as_str()),
-            unsent,
+            &Unsent { dismissed: unsent, answered: unsent_answered, chats: &unsent_chats },
             &self.list,
         );
         let sent_dismissed = self.dismissed.len();
+        let sent_answered = self.answered.len();
         let sent_version = self.brief_version;
         let (batch, new_frame_cursor) = match self.frames.clone() {
             Some(feed) => feed.select(sub.frame_cursor, FrameMode::All),
@@ -268,6 +306,8 @@ impl AskState {
             generation,
             sent_version,
             sent_dismissed,
+            sent_answered,
+            sent_chats: chats_len,
             new_cursor,
         })
     }
@@ -286,18 +326,29 @@ impl AskState {
                 sub.frame_cursor = job.new_frame_cursor;
                 sub.brief_sent = job.sent_version;
                 sub.dismissed_sent = job.sent_dismissed;
+                sub.answered_sent = job.sent_answered;
+                sub.chats_sent = job.sent_chats;
+                let now = chrono::Utc::now().timestamp_millis();
                 match which {
                     Which::Fast => {
                         let applies = point > self.shown_point
                             || (point == self.shown_point && self.shown_by != Shown::Deep);
                         if applies {
-                            self.list = ask_list::build(&self.list, raw, &self.dismissed);
+                            self.list = ask_list::build(&self.list, &mut self.answered, raw, &self.dismissed, now);
                             self.changed.clear();
                             self.shown_by = Shown::Fast;
                             self.shown_point = point;
-                            self.updated_at = Some(chrono::Utc::now().timestamp_millis());
+                            self.updated_at = Some(now);
                             self.failed = false;
                         } else {
+                            // The quick list is stale, but its model has seen
+                            // this transcript and will not say DONE again, so
+                            // what it marked answered is kept.
+                            let before = self.answered.len();
+                            ask_list::absorb_done(&self.list, &mut self.answered, raw.done, now);
+                            if self.answered.len() != before {
+                                self.list = ask_list::without_answered(&self.list, &self.answered);
+                            }
                             log::debug!(
                                 "assistant ask: quick list at point {} dropped, the checked list covers point {}",
                                 point,
@@ -308,17 +359,17 @@ impl AskState {
                     Which::Deep => {
                         // A deep list built from less transcript than the
                         // shown quick list keeps the quick list's newer items.
-                        let raw = if point < self.shown_point {
-                            merge_raw(&self.list, &self.deep_base, raw, &self.dismissed)
+                        let raw = if point < self.shown_point && !ask_list::done_only(&raw) {
+                            merge_raw(&self.list, &self.deep_base, raw, &self.dismissed, &self.answered)
                         } else {
                             raw
                         };
-                        let next = ask_list::build(&self.list, raw, &self.dismissed);
+                        let next = ask_list::build(&self.list, &mut self.answered, raw, &self.dismissed, now);
                         self.changed = changed_ids(&self.list, &next);
                         self.list = next;
                         self.shown_by = Shown::Deep;
                         self.shown_point = self.shown_point.max(point);
-                        self.updated_at = Some(chrono::Utc::now().timestamp_millis());
+                        self.updated_at = Some(now);
                         self.failed = false;
                     }
                 }
@@ -342,9 +393,15 @@ impl AskState {
 /// nor was given (it came from transcript deep never heard). Items deep was
 /// given and dropped stay dropped. Dismissed questions are removed before the
 /// cap, so they cannot crowd out a newer item. Capped like any list, deep's
-/// first.
-fn merge_raw(shown: &AskList, base: &AskList, mut raw: RawList, dismissed: &[String]) -> RawList {
-    let gone = |q: &str| dismissed.iter().any(|d| ask_list::same_item(d, q));
+/// first. A question that is answered (already, or by a DONE in `raw`) never
+/// comes back as open, and is removed before the cap too.
+fn merge_raw(shown: &AskList, base: &AskList, mut raw: RawList, dismissed: &[String], answered: &[AnsweredItem]) -> RawList {
+    let done_now: Vec<String> = raw.done.iter().map(|d| d.0.clone()).collect();
+    let gone = |q: &str| {
+        dismissed.iter().any(|d| ask_list::same_item(d, q))
+            || answered.iter().any(|a| ask_list::same_item(&a.question, q))
+            || done_now.iter().any(|d| ask_list::same_item(d, q))
+    };
     raw.asks.retain(|(q, _)| !gone(q));
     raw.for_you.retain(|q| !gone(q));
     let newer = |items: &[AskItem], base: &[AskItem], have: &dyn Fn(&str) -> bool| -> Vec<String> {
@@ -662,6 +719,47 @@ impl AskLane {
         true
     }
 
+    /// Joseph typed the answer to a list question: the item with that id moves
+    /// to the answered list ("you"). False when no item has that id or the
+    /// answer is empty. The brief is not touched.
+    pub fn answer(&self, id: &str, answer: &str) -> bool {
+        let answer = answer.trim();
+        if answer.is_empty() {
+            return false;
+        }
+        let out = {
+            let mut s = self.state.lock().unwrap();
+            let removed = if let Some(pos) = s.list.asks.iter().position(|i| i.id == id) {
+                s.list.asks.remove(pos)
+            } else if let Some(pos) = s.list.for_you.iter().position(|i| i.id == id) {
+                s.list.for_you.remove(pos)
+            } else {
+                return false;
+            };
+            s.answered.push(AnsweredItem {
+                id: removed.id,
+                question: removed.question,
+                answer: ask_list::collapse(answer),
+                how: AnswerHow::You,
+                at: chrono::Utc::now().timestamp_millis(),
+            });
+            s.snapshot()
+        };
+        (self.hooks.emit)(out);
+        true
+    }
+
+    /// Where core's card hook records Ask exchanges for this session's lane.
+    pub fn set_chat_log(&self, log: ChatLog) {
+        self.state.lock().unwrap().chats = log;
+    }
+
+    /// Every answered question, oldest first, for the end-of-meeting note.
+    /// Stays readable after `close`.
+    pub fn answered_items(&self) -> Vec<AnsweredItem> {
+        self.state.lock().unwrap().answered.clone()
+    }
+
     /// Kills in-flight turns and stops all further turns. The last list
     /// stays visible until the next session opens a fresh lane.
     pub fn close(&self) {
@@ -704,11 +802,18 @@ fn no_tools() -> Vec<String> {
     NO_TOOLS.iter().map(|s| s.to_string()).collect()
 }
 
+/// What a sub-lane has not been told yet, besides the transcript and brief.
+struct Unsent<'a> {
+    dismissed: &'a [String],
+    answered: &'a [AnsweredItem],
+    chats: &'a [ChatExchange],
+}
+
 fn ask_prompt(
     delta: &str,
     in_progress: &str,
     brief: Option<&str>,
-    dismissed: &[String],
+    unsent: &Unsent,
     current: &AskList,
 ) -> String {
     let mut out = String::new();
@@ -731,18 +836,32 @@ fn ask_prompt(
         out.push_str(in_progress);
         out.push_str("\n\n");
     }
-    if !dismissed.is_empty() {
+    if !unsent.dismissed.is_empty() {
         out.push_str("Joseph dismissed these. Never suggest them again:\n");
-        for q in dismissed {
+        for q in unsent.dismissed {
             out.push_str("- ");
             out.push_str(q);
             out.push('\n');
         }
         out.push('\n');
     }
+    if !unsent.answered.is_empty() {
+        out.push_str("ANSWERED SO FAR (never ask these again):\n");
+        for a in unsent.answered {
+            out.push_str(&format!("- {} Answer: {}\n", a.question, a.answer));
+        }
+        out.push('\n');
+    }
+    if !unsent.chats.is_empty() {
+        out.push_str("JOSEPH ASKED THE ASSISTANT PRIVATELY:\n");
+        for c in unsent.chats {
+            out.push_str(&format!("Q: {}\nA: {}\n", c.question, c.answer));
+        }
+        out.push_str("If that exchange answers a question on CURRENT LIST, mark it DONE with BY: chat.\n\n");
+    }
     out.push_str("CURRENT LIST:\n");
     out.push_str(&ask_list::render(current));
-    out.push_str("\n\nReply with the full updated list in the ASK / YOU format, or NONE.");
+    out.push_str("\n\nReply with the full updated list in the ASK / YOU format, plus a DONE line for each question answered since your last turn, or NONE.");
     out
 }
 
@@ -1805,5 +1924,309 @@ mod tests {
         assert!(seen_quick, "a quick list (checked false) must show first");
         assert!(out.checked, "the deep list must land");
         lane.close();
+    }
+
+    // ---- answered questions kept ----
+
+    const STORAGE: &str = "What storage do you run today?";
+    const DONE_STORAGE: &str = "DONE: What storage do you run today? | ANSWER: NetApp, about 40 TB. | BY: call";
+
+    #[tokio::test]
+    async fn a_question_the_call_answered_moves_to_answered_and_stays_off_the_list() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: What storage do you run today? | WHY: storage platform unknown",
+            DONE_STORAGE,
+            "ASK: What storage do you run today? | WHY: storage platform unknown\nASK: Who handles backups? | WHY: owner unknown",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        let log = sample_log();
+
+        lane.request(&log, true);
+        settle().await;
+        let first = lane.snapshot();
+        assert_eq!(first.asks[0].question, STORAGE);
+        assert!(first.answered.is_empty());
+        let id = first.asks[0].id.clone();
+
+        lane.request(&log, true);
+        settle().await;
+        let second = lane.snapshot();
+        assert!(second.asks.is_empty(), "the answered question left the open list");
+        assert_eq!(second.answered.len(), 1);
+        assert_eq!(second.answered[0].id, id);
+        assert_eq!(second.answered[0].question, STORAGE);
+        assert_eq!(second.answered[0].answer, "NetApp, about 40 TB.");
+        assert_eq!(second.answered[0].how, AnswerHow::Call);
+        assert!(second.answered[0].at > 0);
+
+        lane.request(&log, true);
+        settle().await;
+        let third = lane.snapshot();
+        assert_eq!(third.asks.len(), 1, "an answered question never comes back as ASK");
+        assert_eq!(third.asks[0].question, "Who handles backups?");
+        assert_eq!(third.answered, second.answered);
+    }
+
+    #[tokio::test]
+    async fn a_done_only_reply_keeps_the_open_list_and_its_ids() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: What storage do you run today? | WHY: platform\nASK: Who handles backups? | WHY: owner\nASK: Where is the data center? | WHY: site\nYOU: Is pricing in scope?",
+            "DONE: What storage do you run today? | ANSWER: x | BY: call",
+            "NONE",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        let first = lane.snapshot();
+        let ids: Vec<String> = first.asks.iter().map(|a| a.id.clone()).collect();
+        assert_eq!(ids.len(), 3);
+
+        lane.request(&log, true);
+        settle().await;
+        let second = lane.snapshot();
+        let open: Vec<(&str, &str)> = second.asks.iter().map(|a| (a.id.as_str(), a.question.as_str())).collect();
+        assert_eq!(open, vec![(ids[1].as_str(), "Who handles backups?"), (ids[2].as_str(), "Where is the data center?")]);
+        assert_eq!(second.for_you.len(), 1, "the For-you item stays too");
+        assert_eq!(second.for_you[0].id, first.for_you[0].id);
+        assert_eq!(second.answered.len(), 1);
+        assert_eq!(second.answered[0].id, ids[0]);
+        assert_eq!(second.answered[0].answer, "x");
+
+        // A reply of exactly NONE still empties the list.
+        lane.request(&log, true);
+        settle().await;
+        let third = lane.snapshot();
+        assert!(third.asks.is_empty() && third.for_you.is_empty());
+        assert_eq!(third.answered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_reply_with_an_ask_line_still_replaces_the_open_list() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: What storage do you run today? | WHY: platform\nASK: Who handles backups? | WHY: owner",
+            "ASK: Where is the data center? | WHY: site\nDONE: What storage do you run today? | ANSWER: x | BY: call",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        lane.request(&log, true);
+        settle().await;
+        let out = lane.snapshot();
+        let open: Vec<&str> = out.asks.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(open, vec!["Where is the data center?"]);
+    }
+
+    #[tokio::test]
+    async fn a_multi_line_answer_is_stored_on_one_line() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![GOOD];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        lane.request(&sample_log(), true);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(lane.answer(&out.for_you[0].id, "Sam\n  Lee\n"));
+        assert_eq!(lane.snapshot().answered[0].answer, "Sam Lee");
+    }
+
+    #[tokio::test]
+    async fn answered_is_newest_first_and_never_shrinks() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: Who handles backups? | WHY: owner unknown\nDONE: Where is the data center? | ANSWER: In Atlanta. | BY: call",
+            "ASK: Who handles backups? | WHY: owner unknown\nDONE: When does the support contract end? | ANSWER: In March. | BY: chat",
+            "NONE",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        lane.request(&log, true);
+        settle().await;
+        let out = lane.snapshot();
+        let order: Vec<_> = out.answered.iter().map(|a| a.question.as_str()).collect();
+        assert_eq!(order, vec!["When does the support contract end?", "Where is the data center?"]);
+        assert_eq!(out.answered[0].how, AnswerHow::Chat);
+
+        // A refresh that says NONE, a brief edit, a dismissal and a close remove nothing.
+        lane.request(&log, true);
+        settle().await;
+        lane.set_brief("A new goal".to_string());
+        assert!(lane.snapshot().asks.is_empty(), "NONE emptied the open list");
+        assert_eq!(lane.snapshot().answered.len(), 2);
+        lane.close();
+        let after = lane.snapshot();
+        assert_eq!(after.answered, out.answered, "answered stays readable after close");
+        assert_eq!(lane.answered_items().len(), 2);
+        assert_eq!(lane.answered_items()[0].question, "Where is the data center?", "the note list is oldest first");
+    }
+
+    #[tokio::test]
+    async fn dismissing_an_open_item_does_not_touch_answered() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![
+            "ASK: Who handles backups? | WHY: owner unknown\nASK: What storage do you run today? | WHY: platform unknown",
+            "ASK: Who handles backups? | WHY: owner unknown\nDONE: What storage do you run today? | ANSWER: NetApp, about 40 TB. | BY: call",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls), AskHooks::default());
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        lane.request(&log, true);
+        settle().await;
+        let id = lane.snapshot().asks[0].id.clone();
+        assert!(lane.dismiss(&id));
+        assert_eq!(lane.snapshot().answered.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn answer_moves_a_for_you_item_to_answered_as_you() {
+        let calls: Calls = Arc::default();
+        let replies: Vec<&'static str> = vec![GOOD, GOOD];
+        let lane = AskLane::for_test(seq_runner(replies, calls.clone()), AskHooks::default());
+        let log = sample_log();
+        lane.set_brief("My goal".to_string());
+        lane.request(&log, true);
+        settle().await;
+        let out = lane.snapshot();
+        let (you_id, ask_id) = (out.for_you[0].id.clone(), out.asks[0].id.clone());
+
+        assert!(!lane.answer("no-such-id", "x"));
+        assert!(!lane.answer(&you_id, "   "), "an empty answer is refused");
+        assert_eq!(lane.snapshot().for_you.len(), 1);
+
+        assert!(lane.answer(&you_id, "  Yes, pricing is in scope.  "));
+        let after = lane.snapshot();
+        assert!(after.for_you.is_empty());
+        assert_eq!(after.brief, "My goal", "the lane does not touch the brief");
+        assert_eq!(after.answered.len(), 1);
+        assert_eq!(after.answered[0].id, you_id);
+        assert_eq!(after.answered[0].question, "Is pricing in scope?");
+        assert_eq!(after.answered[0].answer, "Yes, pricing is in scope.");
+        assert_eq!(after.answered[0].how, AnswerHow::You);
+
+        // An ASK item can be answered the same way.
+        assert!(lane.answer(&ask_id, "Credit check and references."));
+        assert_eq!(lane.snapshot().answered[0].id, ask_id);
+
+        // The next reply lists both again: neither returns.
+        lane.request(&log, true);
+        settle().await;
+        let again = lane.snapshot();
+        assert!(again.asks.is_empty() && again.for_you.is_empty());
+        assert_eq!(again.answered.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn answered_questions_are_sent_to_each_sub_lane_once() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test_two(
+            two_runner(DONE_STORAGE, DONE_STORAGE, None, None, calls.clone()),
+            AskHooks::default(),
+        );
+        let log = sample_log();
+        lane.request(&log, true);
+        settle().await;
+        assert_eq!(lane.snapshot().answered.len(), 1, "both sub-lanes said DONE, the first answer stays");
+        lane.request(&log, true);
+        settle().await;
+        lane.request(&log, true);
+        settle().await;
+
+        let calls = calls.lock().unwrap();
+        for model in ["ask-model", "deep-model"] {
+            let prompts: Vec<_> =
+                calls.iter().filter(|t| t.model.as_deref() == Some(model)).map(|t| t.prompt.clone()).collect();
+            assert!(!prompts[0].contains("ANSWERED SO FAR"));
+            assert!(prompts[1].contains("ANSWERED SO FAR (never ask these again):"));
+            assert!(prompts[1].contains("What storage do you run today? Answer: NetApp, about 40 TB."));
+            assert!(!prompts[2].contains("ANSWERED SO FAR"), "{} is told once", model);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_ask_card_exchange_is_heard_once_by_each_sub_lane() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test_two(two_runner("NONE", "NONE", None, None, calls.clone()), AskHooks::default());
+        let chats: ChatLog = Arc::default();
+        lane.set_chat_log(chats.clone());
+        let log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        assert_eq!(calls.lock().unwrap().len(), 2);
+
+        chats.lock().unwrap().push(ChatExchange {
+            question: "Who owns backups at FESCO?".to_string(),
+            answer: "The ops team.\n- Per the vault note".to_string(),
+        });
+        lane.request(&log, false); // the exchange alone counts as news
+        settle().await;
+        lane.request(&log, false);
+        settle().await;
+
+        let calls = calls.lock().unwrap();
+        assert_eq!(calls.len(), 4, "one turn per sub-lane for the exchange, none after");
+        for t in &calls[2..] {
+            assert!(t.prompt.contains("JOSEPH ASKED THE ASSISTANT PRIVATELY:"));
+            assert!(t.prompt.contains("Q: Who owns backups at FESCO?"));
+            assert!(t.prompt.contains("A: The ops team.\n- Per the vault note"));
+            assert!(t.prompt.contains("BY: chat"));
+        }
+        assert!(!calls[0].prompt.contains("JOSEPH ASKED"));
+    }
+
+    #[test]
+    fn merge_raw_never_brings_an_answered_question_back() {
+        let item = |id: &str, q: &str| AskItem { id: id.into(), question: q.into(), why: String::new() };
+        let shown = AskList {
+            asks: vec![item("n1", "Who handles backups?"), item("n2", STORAGE)],
+            for_you: vec![],
+        };
+        let answered = vec![AnsweredItem {
+            id: "n1".into(),
+            question: "Who handles backups?".into(),
+            answer: "Ops.".into(),
+            how: AnswerHow::Call,
+            at: 1,
+        }];
+        let raw = RawList {
+            asks: vec![("Who handles the backups?".into(), String::new()), ("When does support end?".into(), String::new())],
+            for_you: vec![],
+            done: vec![(STORAGE.into(), "NetApp.".into(), AnswerHow::Call)],
+            ..Default::default()
+        };
+        let merged = merge_raw(&shown, &AskList::default(), raw, &[], &answered);
+        let qs: Vec<_> = merged.asks.iter().map(|a| a.0.as_str()).collect();
+        assert_eq!(qs, vec!["When does support end?"], "answered and DONE questions are out, extras included");
+        assert_eq!(merged.done.len(), 1, "the DONE line itself survives for build");
+    }
+
+    #[tokio::test]
+    async fn a_stale_quick_list_still_records_what_it_marked_answered() {
+        let calls: Calls = Arc::default();
+        let fast_gate = Arc::new(Semaphore::new(0));
+        let fast = "ASK: Who handles backups? | WHY: owner unknown\nDONE: What storage do you run today? | ANSWER: NetApp. | BY: call";
+        let deep = "ASK: What storage do you run today? | WHY: platform unknown\nASK: Who handles backups? | WHY: owner unknown";
+        let lane = AskLane::for_test_two(
+            two_runner(fast, deep, Some(fast_gate.clone()), None, calls),
+            AskHooks::default(),
+        );
+        lane.request(&sample_log(), false);
+        settle().await;
+        let checked = lane.snapshot();
+        assert!(checked.checked);
+        assert_eq!(checked.asks.len(), 2);
+
+        fast_gate.add_permits(1); // the quick turn lands after the checked list covers its point
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.answered.len(), 1);
+        assert_eq!(out.answered[0].question, STORAGE);
+        assert_eq!(out.asks.len(), 1, "the checked list lost the answered question");
+        assert_eq!(out.asks[0].question, "Who handles backups?");
     }
 }

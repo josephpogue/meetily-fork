@@ -90,6 +90,11 @@ export class AssistantService {
     return invoke('assistant_dismiss_ask', { id });
   }
 
+  /** Joseph answered a For-you question: it moves to the answered list with his answer. */
+  async answerAsk(id: string, answer: string): Promise<void> {
+    return invoke('assistant_answer_ask', { id, answer });
+  }
+
   async getSettings(): Promise<AssistantSettings> {
     return invoke<AssistantSettings>('assistant_get_settings');
   }
