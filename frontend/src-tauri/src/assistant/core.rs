@@ -229,14 +229,14 @@ impl AssistantCore {
         self.last_error = err;
     }
 
-    /// A fresh Ask lane, keeping only the brief it showed, and its empty
-    /// snapshot sent to the panel. Called wherever the session transcript is
-    /// cleared, so a meeting never inherits the last one's questions.
     /// The collector the meeting save reads.
     pub fn history_handle(&self) -> super::history::HistoryHandle {
         self.history.clone()
     }
 
+    /// A fresh Ask lane, keeping only the brief it showed, and its empty
+    /// snapshot sent to the panel. Called wherever the session transcript is
+    /// cleared, so a meeting never inherits the last one's questions.
     fn reset_ask_lane(&mut self) {
         let brief = self.ask_lane.snapshot().brief;
         self.ask_lane.close();
