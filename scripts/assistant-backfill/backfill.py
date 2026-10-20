@@ -364,6 +364,9 @@ def load_turns(path):
 
 
 TRIGGER_TAIL = "\n\nAnswer in the card format, or reply SKIP."
+DIRECT_NOTE = "This question was asked by Joseph directly. Do not reply SKIP."  # core.rs / commands.rs
+CATCHUP_FIRST = "Catch-up, the meeting so far"  # lanes.rs catchup(): the first press
+CATCHUP_LATER = "Catch-up, last 5 minutes"  # lanes.rs catchup(): every press after the first
 
 
 def classify_session(turns):
@@ -382,14 +385,18 @@ def prompt_card_request(prompt):
     if prompt.startswith("EXPLAIN this, in plain language"):
         return "explain", "Explain the last 15 seconds"
     if prompt.startswith("CATCH ME UP on this stretch"):
-        return "catchup", "Catch-up"
+        return "catchup", CATCHUP_FIRST
     i = prompt.rfind("TRIGGER: ")
     if i < 0:
         return None
     body = prompt[i + len("TRIGGER: "):]
     if body.endswith(TRIGGER_TAIL):
         body = body[: -len(TRIGGER_TAIL)]
-    return "answer", body.strip()
+    body = body.strip()
+    if body.endswith(DIRECT_NOTE):
+        # A typed or voice Ask (answer_with_note): the note is prompt-only, the card shows the question.
+        return "ask", body[: -len(DIRECT_NOTE)].strip()
+    return "answer", body
 
 
 def session_model(path):
@@ -510,11 +517,16 @@ def build_cards(fast_turns, deep_turns):
         return best[1] if best and best[0] <= 30000 else None
 
     keys_done = set()
+    catchups = 0
     for ft in fast_turns:
         req = prompt_card_request(ft["prompt"])
         if not req:
             continue
         kind, question = req
+        if kind == "catchup":
+            # lanes.rs: the first press covers the meeting so far, later ones the last 5 minutes.
+            question = CATCHUP_FIRST if catchups == 0 else CATCHUP_LATER
+            catchups += 1
         key = (kind, normalize_question(question))
         fast_ms = parse_ts(ft["prompt_ts"])
         dt = pick_deep(key, fast_ms)
@@ -573,24 +585,56 @@ def _carry_id(prev, question, used, new_id):
     return i
 
 
-def build_asks(ask_turns):
+SAME_POINT_MS = 250  # prompts sent this close together read the same transcript point
+
+
+def tell_ask_lanes(sessions):
+    """Split the ask sessions into (fast_turns, deep_turns).
+
+    The deep ask lane has read-only file tools and a stronger model (ask_lane.rs
+    lane_turn), so a session with tool_use blocks is deep and one without is fast.
+    With two sessions and no tool use in either, the slower replier is deep.
+    """
+    fast, deep = [], []
+    scored = [(tool_use_count(s["path"]), s) for s in sessions]
+    if len(scored) == 2 and scored[0][0] == scored[1][0]:
+        lat = [_ask_latency(s["turns"]) for _n, s in scored]
+        deep_i = 0 if lat[0] > lat[1] else 1
+        scored[deep_i] = (1, scored[deep_i][1])
+    for n, s in scored:
+        (deep if n else fast).extend(s["turns"])
+    return fast, deep
+
+
+def _ask_latency(turns):
+    lat = sorted(parse_ts(t["reply_ts"]) - parse_ts(t["prompt_ts"])
+                 for t in turns if t["reply"] is not None and "CURRENT LIST:" in t["prompt"])
+    return lat[len(lat) // 2] if lat else 0
+
+
+def build_asks(fast_turns, deep_turns=()):
     """Ask next items, replayed the way the live app builds and saves them.
 
-    Every ask reply of both lanes, in time order, becomes the shown list
-    (ask_list.rs `build`): DONE lines are absorbed first, answered questions and
-    rewordings of them are dropped, and each surviving item takes the id of the
-    previous list's item it matches by `same_item`. The saved-items collector then
-    keeps one item per id, merges ids whose normalized text is the same, and keeps
-    the latest wording and the first-seen time.
+    Replies are taken in the order they landed (ask_lane.rs `land`). A deep (checked)
+    reply always becomes the shown list. A quick reply becomes the shown list only
+    when it was sent after the shown list's transcript point, or at the same point
+    and the shown list was not a checked one; otherwise it is stale and only its DONE
+    lines count (absorb_done). The point of a turn is the time its prompt was sent
+    (prompts within SAME_POINT_MS read the same transcript). Then DONE lines are
+    absorbed, answered questions and rewordings of them are dropped, and each
+    surviving item takes the id of the previous list's item it matches by
+    `same_item`. The saved-items collector keeps one item per id, merges ids whose
+    normalized text is the same, and keeps the latest wording and the first-seen time.
     """
     replies = []
-    for t in ask_turns:
-        if t["reply"] is None:
-            continue
-        raw = parse_ask_list(t["reply"])
-        if raw is None:  # unparseable: the app keeps the previous list
-            continue
-        replies.append((parse_ts(t["reply_ts"]), raw))
+    for lane, turns in (("fast", fast_turns), ("deep", deep_turns)):
+        for t in turns:
+            if t["reply"] is None:
+                continue
+            raw = parse_ask_list(t["reply"])
+            if raw is None:  # unparseable: the app keeps the previous list
+                continue
+            replies.append((parse_ts(t["reply_ts"]), parse_ts(t["prompt_ts"]), lane, raw))
     replies.sort(key=lambda r: r[0])  # stable: ties keep file order
 
     counter = [0]
@@ -616,9 +660,20 @@ def build_asks(ask_turns):
             e["why"] = why
         return e
 
-    for ms, raw in replies:
+    shown_point, shown_deep = None, False
+    for ms, point, lane, raw in replies:
         asks, for_you, done = list(raw["asks"]), list(raw["for_you"]), raw["done"]
-        if not asks and not for_you and done and not raw["none"]:
+        stale = False
+        if lane == "fast":
+            newer = shown_point is None or point > shown_point + SAME_POINT_MS
+            same = shown_point is not None and abs(point - shown_point) <= SAME_POINT_MS
+            stale = not (newer or (same and not shown_deep))
+            if not stale:
+                shown_point, shown_deep = point, False
+        else:
+            shown_point = point if shown_point is None else max(shown_point, point)
+            shown_deep = True
+        if stale or (not asks and not for_you and done and not raw["none"]):
             # DONE lines alone say nothing about the open list: it stays as shown.
             asks = [(i["question"], i["why"]) for i in prev["asks"]]
             for_you = [i["question"] for i in prev["for_you"]]
@@ -639,6 +694,11 @@ def build_asks(ask_turns):
         def keep(q):
             return not any(same_item(a["question"], q) for a in answered)
 
+        if stale:
+            # without_answered: the shown list stays, minus what the DONE lines answered.
+            prev = {"asks": [i for i in prev["asks"] if keep(i["question"])],
+                    "for_you": [i for i in prev["for_you"] if keep(i["question"])]}
+            continue
         used = set()
         new_asks, new_you = [], []
         for question, why in asks:
@@ -707,8 +767,11 @@ def to_items(cards, asks, start_ms):
     return items
 
 
-def build_items(sessions_dir, folder):
-    """Everything from disk to contract items. Returns (items, start_ms, notes dict)."""
+def build_items(sessions_dir, folder, strict_start=False):
+    """Everything from disk to contract items. Returns (items, start_ms, notes dict).
+
+    strict_start refuses, instead of falling back to the session-open time, when
+    the folder's metadata.json cannot be read (used by --apply)."""
     sessions = load_sessions(sessions_dir)
     answer = [s for s in sessions if s["role"] == "answer"]
     ask = [s for s in sessions if s["role"] == "ask"]
@@ -716,8 +779,12 @@ def build_items(sessions_dir, folder):
     all_stamps = [x for s in sessions for x in s["stamps"]]
     opened = min(all_stamps) if all_stamps else 0
     start_ms, from_meta = read_recording_start(folder, opened)
+    if strict_start and not from_meta:
+        raise BackfillError(
+            "no readable metadata.json with created_at in %s: the recording start cannot be taken from it" % folder
+        )
     cards = build_cards(fast["turns"], deep["turns"])
-    asks = build_asks([t for s in ask for t in s["turns"]])
+    asks = build_asks(*tell_ask_lanes(ask))
     items = to_items(cards, asks, start_ms)
     notes = {
         "fast": os.path.basename(fast["path"]), "deep": os.path.basename(deep["path"]),
@@ -773,7 +840,8 @@ def folder_payload(meeting_id, start_ms, items):
     }
 
 
-def write_atomic(path, text):
+def write_temp(path, text):
+    """Write text to a temp file beside path and return the temp name (not yet in place)."""
     folder = os.path.dirname(os.path.abspath(path))
     fd, tmp = tempfile.mkstemp(prefix=".assistant.json.", suffix=".tmp", dir=folder)
     try:
@@ -781,11 +849,37 @@ def write_atomic(path, text):
             fh.write(text)
             fh.flush()
             os.fsync(fh.fileno())
-        os.replace(tmp, path)
     except BaseException:
         if os.path.exists(tmp):
             os.unlink(tmp)
         raise
+    return tmp
+
+
+def same_folder(a, b):
+    return os.path.realpath(os.path.expanduser(a)) == os.path.realpath(os.path.expanduser(b))
+
+
+def check_folder(db_path, meeting_id, folder):
+    """Refuse unless folder is the meeting's own meetings.folder_path in the database."""
+    if not os.path.isfile(db_path):
+        raise BackfillError("database not found: %s" % db_path)
+    conn = sqlite3.connect("file:%s?mode=ro" % db_path, uri=True)
+    try:
+        try:
+            row = conn.execute("SELECT folder_path FROM meetings WHERE id = ?", (meeting_id,)).fetchone()
+        except sqlite3.Error as e:
+            raise BackfillError("cannot read the meeting's folder_path from %s: %s" % (db_path, e))
+    finally:
+        conn.close()
+    if row is None:
+        raise BackfillError("meeting %s is not in the meetings table" % meeting_id)
+    if not row[0]:
+        raise BackfillError("meeting %s has no folder_path in the database" % meeting_id)
+    if not same_folder(folder, row[0]):
+        raise BackfillError(
+            "--folder %s is not meeting %s's folder; the database says %s" % (folder, meeting_id, row[0])
+        )
 
 
 def apply_items(db_path, folder, meeting_id, items, start_ms, replace=False):
@@ -795,6 +889,7 @@ def apply_items(db_path, folder, meeting_id, items, start_ms, replace=False):
         raise BackfillError("folder not found: %s" % folder)
     if not items:
         raise BackfillError("nothing to save: the sessions held no assistant items")
+    check_folder(db_path, meeting_id, folder)
     conn = sqlite3.connect(db_path)
     try:
         has_table = conn.execute(
@@ -827,11 +922,25 @@ def apply_items(db_path, folder, meeting_id, items, start_ms, replace=False):
                   json.dumps(i["changedLines"], ensure_ascii=False), i["answer"], i["answeredHow"],
                   i["answeredCallTime"]) for i in items],
             )
-            write_atomic(os.path.join(folder, "assistant.json"), payload)
-            conn.execute("COMMIT")
+            target = os.path.join(folder, "assistant.json")
+            tmp = write_temp(target, payload)
+            try:
+                conn.execute("COMMIT")
+            except BaseException:
+                os.unlink(tmp)  # the old assistant.json stays as it was
+                raise
         except BaseException:
-            conn.execute("ROLLBACK")
+            if conn.in_transaction:
+                conn.execute("ROLLBACK")
             raise
+        try:
+            os.replace(tmp, target)
+        except OSError as e:
+            os.unlink(tmp)
+            raise BackfillError(
+                "the rows are saved but assistant.json could not be put in place (%s); "
+                "run again with --replace to retry" % e
+            )
     finally:
         conn.close()
     return len(items)
@@ -841,17 +950,26 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--sessions", default=DEFAULT_SESSIONS, help="dir holding the session .jsonl files")
     ap.add_argument("--meeting-id", default=DEFAULT_MEETING)
-    ap.add_argument("--folder", default=DEFAULT_FOLDER,
-                    help="meeting folder: metadata.json is read from it, assistant.json written to it on --apply")
+    ap.add_argument("--folder", default=None,
+                    help="meeting folder: metadata.json is read from it, assistant.json written to it on --apply. "
+                         "Required with --apply and must be the meeting's folder_path in the database. "
+                         "The dry run defaults to the Jim recording folder")
     ap.add_argument("--db", help="meetily sqlite database (required with --apply)")
     ap.add_argument("--apply", action="store_true", help="write the rows and the folder file (default is a dry run)")
     ap.add_argument("--replace", action="store_true", help="with --apply: replace items the meeting already has")
     args = ap.parse_args(argv)
     try:
-        items, start_ms, notes = build_items(args.sessions, args.folder)
+        if args.apply:
+            if not args.db:
+                raise BackfillError("--apply needs --db <path>")
+            if not args.folder:
+                raise BackfillError("--apply needs --folder <the meeting's recording folder>")
+            check_folder(args.db, args.meeting_id, args.folder)
+        folder = args.folder or DEFAULT_FOLDER
+        items, start_ms, notes = build_items(args.sessions, folder, strict_start=args.apply)
         if not notes["start_from_metadata"]:
             print("warning: no readable metadata.json in %s; recording start taken as the time the "
-                  "assistant session opened" % args.folder, file=sys.stderr)
+                  "assistant session opened" % folder, file=sys.stderr)
         if not args.apply:
             print("DRY RUN, nothing written.")
             print("recording start: %s (%s)" % (fmt_rfc3339(start_ms),
@@ -862,8 +980,6 @@ def main(argv=None):
             print()
             print(dry_run_table(items))
             return 0
-        if not args.db:
-            raise BackfillError("--apply needs --db <path>")
         n = apply_items(args.db, args.folder, args.meeting_id, items, start_ms, args.replace)
         print("saved %d items for %s; wrote %s" % (n, args.meeting_id, os.path.join(args.folder, "assistant.json")))
         return 0

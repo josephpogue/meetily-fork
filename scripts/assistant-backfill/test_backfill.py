@@ -45,7 +45,7 @@ def brief_rows(prefix):
 class Fixture:
     """A sessions dir with a fast lane, a deep lane (tool use) and one ask lane, plus a meeting folder."""
 
-    def __init__(self, test, fast=(), deep=(), asks=()):
+    def __init__(self, test, fast=(), deep=(), asks=(), asks_deep=()):
         self.dir = tempfile.mkdtemp()
         test.addCleanup(lambda: __import__("shutil").rmtree(self.dir, ignore_errors=True))
         self.sessions = os.path.join(self.dir, "sessions")
@@ -56,7 +56,8 @@ class Fixture:
             json.dump({"created_at": START}, fh)
         rows = brief_rows("f")
         for i, (q, reply, pts, rts) in enumerate(fast):
-            rows += [user(trig(q), pts, "fu%d" % i), assistant(reply, rts, "fa%d" % i)]
+            prompt = q[4:] if q.startswith("RAW:") else trig(q)
+            rows += [user(prompt, pts, "fu%d" % i), assistant(reply, rts, "fa%d" % i)]
         write_jsonl(os.path.join(self.sessions, "fast.jsonl"), rows)
         rows = brief_rows("d")
         for i, (q, reply, pts, rts) in enumerate(deep):
@@ -64,9 +65,17 @@ class Fixture:
                      user("", rts, "dr%d" % i), assistant(reply, rts, "da%d" % i)]
         write_jsonl(os.path.join(self.sessions, "deep.jsonl"), rows)
         rows = brief_rows("k")
-        for i, (reply, rts) in enumerate(asks):
-            rows += [user(ask_prompt(i), rts, "ku%d" % i), assistant(reply, rts, "ka%d" % i)]
+        for i, a in enumerate(asks):
+            reply, rts = a[0], a[-1]
+            pts = a[1] if len(a) == 3 else rts
+            rows += [user(ask_prompt(i), pts, "ku%d" % i), assistant(reply, rts, "ka%d" % i)]
         write_jsonl(os.path.join(self.sessions, "ask.jsonl"), rows)
+        if asks_deep:
+            rows = brief_rows("e")
+            for i, (reply, pts, rts) in enumerate(asks_deep):
+                rows += [user(ask_prompt(i), pts, "eu%d" % i), assistant("", rts, "et%d" % i, tool=True),
+                         user("", rts, "er%d" % i), assistant(reply, rts, "ea%d" % i)]
+            write_jsonl(os.path.join(self.sessions, "askdeep.jsonl"), rows)
 
     def items(self):
         return bf.build_items(self.sessions, self.folder)[0]
@@ -163,6 +172,24 @@ class Cards(unittest.TestCase):
         os.rename(os.path.join(fx.sessions, "fast.jsonl"), os.path.join(fx.sessions, "zz.jsonl"))
         self.assertEqual(fx.items()[0]["lead"], "from deep")
 
+    def test_catchup_questions_follow_the_app_first_then_last_five_minutes(self):
+        body = "CATCH ME UP on this stretch of the meeting:\n\nThem: hi"
+        fx = Fixture(self, fast=[
+            ("Anything?", "SKIP", "2026-10-20T17:33:00.000Z", "2026-10-20T17:33:02.000Z"),
+            ("RAW:" + body, "LEAD: one", "2026-10-20T17:34:00.000Z", "2026-10-20T17:34:02.000Z"),
+            ("RAW:" + body, "LEAD: two", "2026-10-20T17:36:00.000Z", "2026-10-20T17:36:02.000Z"),
+        ])
+        self.assertEqual([(i["kind"], i["question"]) for i in fx.items()], [
+            ("catchup", "Catch-up, the meeting so far"), ("catchup", "Catch-up, last 5 minutes")])
+
+    def test_a_direct_ask_is_kind_ask_with_only_the_question(self):
+        prompt = ("NEW TRANSCRIPT since your last turn:\nThem: hi\n\nTRIGGER: Is it safe?\n\n"
+                  "This question was asked by Joseph directly. Do not reply SKIP.\n\n"
+                  "Answer in the card format, or reply SKIP.")
+        fx = Fixture(self, fast=[("RAW:" + prompt, "LEAD: Yes", "2026-10-20T17:34:00.000Z", "2026-10-20T17:34:02.000Z")])
+        items = fx.items()
+        self.assertEqual([(i["kind"], i["question"]) for i in items], [("ask", "Is it safe?")])
+
 
 class Asks(unittest.TestCase):
     def test_dedupe_across_lanes_keeps_latest_wording_and_first_time(self):
@@ -205,6 +232,40 @@ class Asks(unittest.TestCase):
         po = [i for i in items if "purchase" in i["question"]][0]
         self.assertEqual((po["callTime"], po["why"]), (34.443, "c"))
 
+    def test_a_quick_list_that_lands_after_a_later_checked_list_only_counts_its_done_lines(self):
+        # fast1 (sent 0s, lands 3s) shows Q1/Q2. deep (sent 19s, lands 25s) shows Q1/Q3 (checked).
+        # fast2 was sent at 18s, before the checked list's point, but lands at 30s: it is stale.
+        fx = Fixture(
+            self,
+            asks=[
+                ("ASK: Is Q1 ready here? | WHY: a\nASK: Is Q2 ready here? | WHY: b",
+                 "2026-10-20T17:33:00.000Z", "2026-10-20T17:33:03.000Z"),
+                ("ASK: Stale quick question about badges? | WHY: x\n"
+                 "DONE: Is Q1 ready here? | ANSWER: yes it is | BY: call",
+                 "2026-10-20T17:33:18.000Z", "2026-10-20T17:33:30.000Z"),
+            ],
+            asks_deep=[
+                ("ASK: Is Q1 ready here? | WHY: a\nASK: Does Q3 exist somewhere? | WHY: c",
+                 "2026-10-20T17:33:19.000Z", "2026-10-20T17:33:25.000Z"),
+            ],
+        )
+        items = fx.items()
+        questions = sorted(i["question"] for i in items)
+        self.assertNotIn("Stale quick question about badges?", questions)
+        self.assertEqual(questions, ["Does Q3 exist somewhere?", "Is Q1 ready here?", "Is Q2 ready here?"])
+        q1 = [i for i in items if i["question"] == "Is Q1 ready here?"][0]
+        self.assertEqual((q1["answer"], q1["answeredHow"]), ("yes it is", "call"))
+        self.assertEqual(q1["answeredCallTime"], 57.443)
+
+    def test_a_quick_list_sent_later_than_the_checked_one_still_applies(self):
+        fx = Fixture(
+            self,
+            asks=[("ASK: Fresh quick question here? | WHY: x", "2026-10-20T17:33:20.000Z", "2026-10-20T17:33:30.000Z")],
+            asks_deep=[("ASK: Checked question about it? | WHY: c", "2026-10-20T17:33:10.000Z", "2026-10-20T17:33:25.000Z")],
+        )
+        self.assertEqual(sorted(i["question"] for i in fx.items()),
+                         ["Checked question about it?", "Fresh quick question here?"])
+
     def test_same_item_matcher_threshold(self):
         self.assertTrue(bf.same_item("What are the other badges under health?", "What are the other badges under health, besides workload?"))
         self.assertFalse(bf.same_item("Who signs the purchase order?", "Where is the datacenter located?"))
@@ -232,12 +293,12 @@ class Asks(unittest.TestCase):
 
 
 class Apply(unittest.TestCase):
-    def make_db(self, with_table=True, with_meeting=True):
+    def make_db(self, with_table=True, with_meeting=True, folder=None):
         path = os.path.join(tempfile.mkdtemp(), "m.sqlite")
         conn = sqlite3.connect(path)
-        conn.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT)")
+        conn.execute("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, folder_path TEXT)")
         if with_meeting:
-            conn.execute("INSERT INTO meetings VALUES (?, 'x')", (MEETING,))
+            conn.execute("INSERT INTO meetings VALUES (?, 'x', ?)", (MEETING, folder))
         if with_table:
             conn.executescript(bf.CREATE_TABLE)
         conn.commit()
@@ -253,7 +314,7 @@ class Apply(unittest.TestCase):
 
     def test_apply_writes_rows_and_file_then_refuses_a_second_run(self):
         fx = self.fixture()
-        db = self.make_db()
+        db = self.make_db(folder=fx.folder)
         items, start, _ = bf.build_items(fx.sessions, fx.folder)
         self.assertEqual(bf.apply_items(db, fx.folder, MEETING, items, start), 2)
         conn = sqlite3.connect(db)
@@ -273,15 +334,115 @@ class Apply(unittest.TestCase):
         fx = self.fixture()
         items, start, _ = bf.build_items(fx.sessions, fx.folder)
         with self.assertRaises(bf.BackfillError) as cm:
-            bf.apply_items(self.make_db(with_table=False), fx.folder, MEETING, items, start)
+            bf.apply_items(self.make_db(with_table=False, folder=fx.folder), fx.folder, MEETING, items, start)
         self.assertIn("run the new meetily-fork build once", str(cm.exception))
 
     def test_refuses_an_unknown_meeting(self):
         fx = self.fixture()
         items, start, _ = bf.build_items(fx.sessions, fx.folder)
         with self.assertRaises(bf.BackfillError):
-            bf.apply_items(self.make_db(with_meeting=False), fx.folder, MEETING, items, start)
+            bf.apply_items(self.make_db(with_meeting=False, folder=fx.folder), fx.folder, MEETING, items, start)
         self.assertFalse(os.path.exists(os.path.join(fx.folder, "assistant.json")))
+
+
+    def test_refuses_a_folder_that_is_not_the_meetings_folder(self):
+        fx = self.fixture()
+        other = tempfile.mkdtemp()
+        db = self.make_db(folder=other)
+        items, start, _ = bf.build_items(fx.sessions, fx.folder)
+        with self.assertRaises(bf.BackfillError) as cm:
+            bf.apply_items(db, fx.folder, MEETING, items, start)
+        self.assertIn("is not meeting", str(cm.exception))
+        self.assertFalse(os.path.exists(os.path.join(fx.folder, "assistant.json")))
+        conn = sqlite3.connect(db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM meeting_assistant_items").fetchone()[0], 0)
+        conn.close()
+
+    def test_refuses_a_meeting_with_no_folder_path(self):
+        fx = self.fixture()
+        items, start, _ = bf.build_items(fx.sessions, fx.folder)
+        with self.assertRaises(bf.BackfillError) as cm:
+            bf.apply_items(self.make_db(folder=None), fx.folder, MEETING, items, start)
+        self.assertIn("no folder_path", str(cm.exception))
+
+    def run_main(self, *args):
+        import contextlib
+        import io
+        err = io.StringIO()
+        with contextlib.redirect_stderr(err), contextlib.redirect_stdout(io.StringIO()):
+            rc = bf.main(list(args))
+        return rc, err.getvalue()
+
+    def test_apply_needs_a_folder_argument(self):
+        fx = self.fixture()
+        db = self.make_db(folder=fx.folder)
+        rc, err = self.run_main("--sessions", fx.sessions, "--meeting-id", MEETING, "--db", db, "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("--apply needs --folder", err)
+
+    def test_apply_refuses_a_mismatched_folder_from_the_command_line(self):
+        fx = self.fixture()
+        db = self.make_db(folder=tempfile.mkdtemp())
+        rc, err = self.run_main("--sessions", fx.sessions, "--meeting-id", MEETING, "--db", db,
+                                "--folder", fx.folder, "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("is not meeting", err)
+        self.assertFalse(os.path.exists(os.path.join(fx.folder, "assistant.json")))
+
+    def test_apply_refuses_an_unreadable_metadata_json_but_the_dry_run_falls_back(self):
+        fx = self.fixture()
+        os.unlink(os.path.join(fx.folder, "metadata.json"))
+        db = self.make_db(folder=fx.folder)
+        rc, err = self.run_main("--sessions", fx.sessions, "--meeting-id", MEETING, "--db", db,
+                                "--folder", fx.folder, "--apply")
+        self.assertEqual(rc, 1)
+        self.assertIn("no readable metadata.json", err)
+        self.assertFalse(os.path.exists(os.path.join(fx.folder, "assistant.json")))
+        rc, _ = self.run_main("--sessions", fx.sessions, "--folder", fx.folder)
+        self.assertEqual(rc, 0)
+
+    def test_apply_with_the_right_folder_succeeds_from_the_command_line(self):
+        fx = self.fixture()
+        db = self.make_db(folder=fx.folder)
+        rc, err = self.run_main("--sessions", fx.sessions, "--meeting-id", MEETING, "--db", db,
+                                "--folder", fx.folder, "--apply")
+        self.assertEqual((rc, err), (0, ""))
+        self.assertTrue(os.path.exists(os.path.join(fx.folder, "assistant.json")))
+        self.assertEqual([n for n in os.listdir(fx.folder) if n.endswith(".tmp")], [])
+
+    def test_a_failed_commit_leaves_the_old_file_and_no_temp_file(self):
+        fx = self.fixture()
+        db = self.make_db(folder=fx.folder)
+        items, start, _ = bf.build_items(fx.sessions, fx.folder)
+        target = os.path.join(fx.folder, "assistant.json")
+        with open(target, "w") as fh:
+            fh.write("OLD")
+        real = sqlite3.connect
+
+        class Proxy:
+            def __init__(self, conn):
+                self.conn = conn
+
+            def execute(self, sql, *a):
+                if sql == "COMMIT":
+                    raise sqlite3.OperationalError("disk full")
+                return self.conn.execute(sql, *a)
+
+            def __getattr__(self, name):
+                return getattr(self.conn, name)
+
+        bf.sqlite3.connect = lambda *a, **k: Proxy(real(*a, **k))
+        try:
+            with self.assertRaises(sqlite3.OperationalError):
+                bf.apply_items(db, fx.folder, MEETING, items, start)
+        finally:
+            bf.sqlite3.connect = real
+        with open(target) as fh:
+            self.assertEqual(fh.read(), "OLD")
+        self.assertEqual([n for n in os.listdir(fx.folder) if n.endswith(".tmp")], [])
+        conn = sqlite3.connect(db)
+        self.assertEqual(conn.execute("SELECT COUNT(*) FROM meeting_assistant_items").fetchone()[0], 0)
+        conn.close()
 
 
 if __name__ == "__main__":
