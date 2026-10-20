@@ -98,6 +98,7 @@ export function AssistantHistoryPanel({ meetingId }: { meetingId: string }) {
   const [deleting, setDeleting] = useState(false);
   const [deleteFailed, setDeleteFailed] = useState(false);
   const deleteButtonRef = useRef<HTMLButtonElement>(null);
+  const headingRef = useRef<HTMLHeadingElement>(null);
 
   useEffect(() => {
     let current = true;
@@ -140,7 +141,7 @@ export function AssistantHistoryPanel({ meetingId }: { meetingId: string }) {
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-gray-200 px-4 py-3">
-        <h2 className="text-sm font-semibold text-gray-900">
+        <h2 ref={headingRef} tabIndex={-1} className="text-sm font-semibold text-gray-900 focus-visible:outline-none">
           Assistant{state === 'ready' && items.length > 0 && <span className="ml-2 font-normal text-gray-600">{items.length}</span>}
         </h2>
         {state === 'ready' && items.length > 0 && (
@@ -179,10 +180,12 @@ export function AssistantHistoryPanel({ meetingId }: { meetingId: string }) {
       <Dialog open={confirming} onOpenChange={(open) => { if (!deleting) setConfirming(open); }}>
         <DialogContent
           onCloseAutoFocus={(event) => {
-            // No trigger element wraps the button, so hand focus back to it by hand.
-            if (deleteButtonRef.current) {
+            // No trigger element wraps the button, so hand focus back to it by hand. After a
+            // delete the button is gone, so focus lands on the panel heading instead.
+            const target = deleteButtonRef.current ?? headingRef.current;
+            if (target) {
               event.preventDefault();
-              deleteButtonRef.current.focus();
+              target.focus();
             }
           }}
         >

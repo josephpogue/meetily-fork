@@ -106,14 +106,9 @@ export function MeetingDetailsSplitView({
     writeStoredRatio(next);
   }, [ratio]);
 
+  // The transcript has no tab, so it stays a region; Summary and Assistant are real tab panels from Tabs.
   const transcriptPanelProps = isDesktop
-    ? { role: 'region' as const, 'aria-label': 'Transcript', tabIndex: -1 }
-    : {};
-  const summaryPanelProps = isDesktop
-    ? { role: 'region' as const, 'aria-label': 'Summary', tabIndex: -1 }
-    : {};
-  const assistantPanelProps = isDesktop
-    ? { role: 'region' as const, 'aria-label': 'Assistant', tabIndex: -1 }
+    ? { role: 'region' as const, 'aria-label': 'Transcript', 'aria-labelledby': undefined, tabIndex: -1 }
     : {};
 
   // On desktop the transcript has no tab of its own: 'transcript' shows the summary on the right.
@@ -181,7 +176,6 @@ export function MeetingDetailsSplitView({
             value="summary"
             forceMount
             className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"
-            {...summaryPanelProps}
           >
             {summary}
           </TabsContent>
@@ -189,7 +183,6 @@ export function MeetingDetailsSplitView({
             value="assistant"
             forceMount
             className="mt-0 flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden data-[state=inactive]:hidden"
-            {...assistantPanelProps}
           >
             {assistant}
           </TabsContent>

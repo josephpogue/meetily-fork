@@ -11,9 +11,13 @@ afterAll(() => {
 
 // react-test-renderer has no DOM, so the Radix portal is replaced by an inline stand-in
 // that renders its children only while open. Esc and focus are covered in the browser pass.
+let closeAutoFocus: ((event: { preventDefault: () => void }) => void) | undefined;
 mock.module('../../src/components/ui/dialog', () => ({
   Dialog: ({ open, children }: { open: boolean; children: ReactNode }) => (open ? <div data-testid="dialog">{children}</div> : null),
-  DialogContent: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  DialogContent: ({ children, onCloseAutoFocus }: { children: ReactNode; onCloseAutoFocus?: (event: { preventDefault: () => void }) => void }) => {
+    closeAutoFocus = onCloseAutoFocus;
+    return <div>{children}</div>;
+  },
   DialogHeader: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   DialogFooter: ({ children }: { children: ReactNode }) => <div>{children}</div>,
   DialogTitle: ({ children }: { children: ReactNode }) => <h2>{children}</h2>,
@@ -43,8 +47,9 @@ function item(id: string, kind: string, callTime: number, extra: Record<string, 
 }
 
 let renderer: ReactTestRenderer;
+const focused: string[] = [];
 async function mount() {
-  await act(async () => { renderer = create(<AssistantHistoryPanel meetingId="m1" />); });
+  await act(async () => { renderer = create(<AssistantHistoryPanel meetingId="m1" />, { createNodeMock: (element) => ({ focus: () => { focused.push(String(element.type)); } }) }); });
 }
 const textOf = (node: ReactTestInstance | string): string =>
   typeof node === 'string' ? node : node.children.map(textOf).join('');
@@ -121,5 +126,20 @@ describe('AssistantHistoryPanel', () => {
     await press('Delete');
     expect(deleteCalls()).toEqual([['api_delete_meeting_assistant', { meetingId: 'm1' }]]);
     expect(allText()).toContain('No assistant items were saved for this meeting.');
+  });
+
+  test('after a delete the button is gone, so focus goes to the panel heading', async () => {
+    stored = [item('a', 'answer', 10)];
+    focused.length = 0;
+    await mount();
+    await press('Delete assistant items');
+    await press('Delete');
+    expect(button('Delete assistant items')).toHaveLength(0);
+    const heading = renderer.root.findByType('h2');
+    expect(heading.props.tabIndex).toBe(-1);
+    const event = { preventDefault: mock(() => {}) };
+    closeAutoFocus?.(event);
+    expect(event.preventDefault).toHaveBeenCalled();
+    expect(focused).toEqual(['h2']);
   });
 });
