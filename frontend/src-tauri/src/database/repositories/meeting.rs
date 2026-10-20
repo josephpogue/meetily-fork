@@ -264,11 +264,58 @@ async fn delete_meeting_with_transaction(
         .execute(&mut *transaction)
         .await?;
 
-    // 4. Finally, delete the meeting
+    // 4. Delete the saved assistant items (explicitly, not through the FK cascade)
+    super::assistant_items::AssistantItemsRepository::delete_with_connection(&mut *transaction, meeting_id).await?;
+
+    // 5. Finally, delete the meeting
     let result = sqlx::query("DELETE FROM meetings WHERE id = ?")
         .bind(meeting_id)
         .execute(&mut *transaction)
         .await?;
 
     Ok(result.rows_affected() > 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::database::repositories::assistant_items::tests::{add_meeting, test_pool};
+    use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
+
+    #[tokio::test]
+    async fn deleting_a_meeting_removes_its_assistant_items_without_the_cascade() {
+        let pool = test_pool().await;
+        for t in ["transcript_chunks", "summary_processes", "transcripts"] {
+            sqlx::query(&format!("CREATE TABLE {} (id TEXT, meeting_id TEXT)", t))
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        // The cascade is off, so only the explicit delete can remove the rows.
+        sqlx::query("PRAGMA foreign_keys = OFF").execute(&pool).await.unwrap();
+        add_meeting(&pool, "m1", None).await;
+        let item = AssistantItem {
+            id: "a".into(),
+            kind: "answer".into(),
+            call_time: 1.0,
+            shown_at: "2026-10-20T17:34:21.030Z".into(),
+            question: String::new(),
+            lead: "x".into(),
+            bullets: vec![],
+            why: String::new(),
+            source: String::new(),
+            phase: "checked".into(),
+            changed_lines: vec![],
+            answer: String::new(),
+            answered_how: String::new(),
+            answered_call_time: None,
+        };
+        AssistantItemsRepository::replace_for_meeting(&pool, "m1", &[item]).await.unwrap();
+        assert!(MeetingsRepository::delete_meeting(&pool, "m1").await.unwrap());
+        let (left,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM meeting_assistant_items")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(left, 0);
+    }
 }

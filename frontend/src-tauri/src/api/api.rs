@@ -740,6 +740,43 @@ pub async fn api_delete_api_key<R: Runtime>(
     }
 }
 
+/// Saves the just-ended session's assistant items for a meeting (replacing
+/// any saved before) and writes `assistant.json` into its folder. Returns
+/// how many items were saved; 0 saves nothing.
+#[tauri::command]
+pub async fn api_save_meeting_assistant(
+    state: tauri::State<'_, AppState>,
+    handle: tauri::State<'_, crate::assistant::AssistantHandle>,
+    meeting_id: String,
+) -> Result<u32, String> {
+    let history = handle.0.lock().await.history_handle();
+    crate::assistant::history::save_for_meeting(state.db_manager.pool(), &history, &meeting_id).await
+}
+
+/// The meeting's saved assistant items in position order; empty when none.
+#[tauri::command]
+pub async fn api_get_meeting_assistant(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<Vec<crate::database::repositories::assistant_items::AssistantItem>, String> {
+    crate::database::repositories::assistant_items::AssistantItemsRepository::list_for_meeting(
+        state.db_manager.pool(),
+        &meeting_id,
+    )
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Deletes the meeting's saved assistant items and its `assistant.json`.
+/// Returns the rows deleted.
+#[tauri::command]
+pub async fn api_delete_meeting_assistant(
+    state: tauri::State<'_, AppState>,
+    meeting_id: String,
+) -> Result<u32, String> {
+    crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &meeting_id).await
+}
+
 #[tauri::command]
 pub async fn api_delete_meeting<R: Runtime>(
     _app: AppHandle<R>,

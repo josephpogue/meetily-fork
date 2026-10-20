@@ -112,6 +112,9 @@ pub struct AssistantCore {
     /// for an answer or a direct ask, appends to `qa_log` for the note.
     card_emit: super::lanes::EmitFn,
     qa_log: Arc<StdMutex<Vec<String>>>,
+    /// What the assistant showed this session, kept for the meeting save.
+    /// Reset when a session opens.
+    history: super::history::HistoryHandle,
     /// Ask cards Joseph had with the assistant this session, for the ask
     /// lane's sub-lanes to hear once. Shared with every session's ask lane.
     chat_log: ChatLog,
@@ -171,6 +174,7 @@ impl Default for AssistantCore {
             app: None,
             card_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
+            history: super::history::new_handle(),
             chat_log: Arc::new(StdMutex::new(Vec::new())),
             enabled: true,
             session_open: false,
@@ -228,6 +232,11 @@ impl AssistantCore {
     /// A fresh Ask lane, keeping only the brief it showed, and its empty
     /// snapshot sent to the panel. Called wherever the session transcript is
     /// cleared, so a meeting never inherits the last one's questions.
+    /// The collector the meeting save reads.
+    pub fn history_handle(&self) -> super::history::HistoryHandle {
+        self.history.clone()
+    }
+
     fn reset_ask_lane(&mut self) {
         let brief = self.ask_lane.snapshot().brief;
         self.ask_lane.close();
@@ -318,10 +327,12 @@ fn make_card_emit(
     handle: AssistantHandle,
     qa_log: Arc<StdMutex<Vec<String>>>,
     chat_log: ChatLog,
+    history: super::history::HistoryHandle,
     forward: super::lanes::EmitFn,
 ) -> super::lanes::EmitFn {
     Arc::new(move |card: CardOut| {
         record_card(&card, &qa_log, &chat_log);
+        super::history::record_card(&history, &card);
         if is_settled_ask(&card) {
             // A question worked out in Ask may have answered one on the
             // list: do not wait for the next utterance. Spawned, because the
@@ -388,11 +399,12 @@ fn make_voice_publish(app: AppHandle<Wry>) -> Arc<dyn Fn(VoiceState) + Send + Sy
 /// Ask lane hooks: every list change goes out as `assistant-asks`; a
 /// coalesced follow-up and a failure both need core, so they hop back in
 /// through a spawned task.
-fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle) -> AskHooks {
+fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle, history: super::history::HistoryHandle) -> AskHooks {
     let rerun_handle = handle.clone();
     let error_handle = handle;
     AskHooks {
         emit: Arc::new(move |out: AsksOut| {
+            super::history::record_asks(&history, &out);
             if let Err(e) = app.emit("assistant-asks", &out) {
                 log::warn!("assistant: failed to emit assistant-asks: {}", e);
             }
@@ -987,6 +999,7 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.trigger.reset();
         core.qa_log.lock().unwrap().clear();
         core.chat_log.lock().unwrap().clear();
+        core.history.lock().unwrap().reset(chrono::Utc::now().timestamp_millis());
         core.note_state = NoteState::Idle;
         core.note_draft = None;
         core.note_markdown.clear();
@@ -1217,9 +1230,9 @@ pub fn install(app: AppHandle<Wry>) {
 
 async fn wire(app: AppHandle<Wry>) {
     let handle = app.state::<AssistantHandle>().inner().clone();
-    let (qa_log, chat_log) = {
+    let (qa_log, chat_log, history) = {
         let core = handle.0.lock().await;
-        (core.qa_log.clone(), core.chat_log.clone())
+        (core.qa_log.clone(), core.chat_log.clone(), core.history.clone())
     };
     let forward_app = app.clone();
     let forward: super::lanes::EmitFn = Arc::new(move |card: CardOut| {
@@ -1227,13 +1240,13 @@ async fn wire(app: AppHandle<Wry>) {
             log::warn!("assistant: failed to emit assistant-card: {}", e);
         }
     });
-    let card_emit = make_card_emit(handle.clone(), qa_log, chat_log, forward);
+    let card_emit = make_card_emit(handle.clone(), qa_log, chat_log, history.clone(), forward);
 
     {
         let mut core = handle.0.lock().await;
         core.app = Some(app.clone());
         core.card_emit = card_emit;
-        core.ask_hooks = make_ask_hooks(app.clone(), handle.clone());
+        core.ask_hooks = make_ask_hooks(app.clone(), handle.clone(), history.clone());
         core.ask_lane = AskLane::new(claude_runner(PathBuf::new()), core.ask_hooks.clone());
 
         let fire_handle = handle.clone();
@@ -1971,7 +1984,7 @@ mod tests {
             let mut core = handle.0.lock().await;
             core.listening = false;
             let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
-            let emit = make_card_emit(handle.clone(), qa, chats, Arc::new(|_| {}));
+            let emit = make_card_emit(handle.clone(), qa, chats, core.history.clone(), Arc::new(|_| {}));
             core.card_emit = emit.clone();
             emit
         };

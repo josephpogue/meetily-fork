@@ -11,6 +11,7 @@ pub mod ask_list;
 pub mod claude_cli;
 pub mod commands;
 pub mod core;
+pub mod history;
 pub mod lanes;
 pub mod note;
 pub mod settings;
