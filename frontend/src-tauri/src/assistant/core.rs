@@ -157,6 +157,14 @@ pub struct AssistantCore {
 
 impl Default for AssistantCore {
     fn default() -> Self {
+        Self::with_history(super::history::new_handle())
+    }
+}
+
+impl AssistantCore {
+    /// A core that collects into `history`, the same handle the app manages
+    /// as its own state so the meeting-save commands never take the core lock.
+    pub fn with_history(history: super::history::HistoryHandle) -> Self {
         Self {
             settings: AssistantSettings::default(),
             transcript: TranscriptLog::default(),
@@ -174,7 +182,7 @@ impl Default for AssistantCore {
             app: None,
             card_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
-            history: super::history::new_handle(),
+            history,
             chat_log: Arc::new(StdMutex::new(Vec::new())),
             enabled: true,
             session_open: false,
@@ -229,14 +237,15 @@ impl AssistantCore {
         self.last_error = err;
     }
 
-    /// The collector the meeting save reads.
-    pub fn history_handle(&self) -> super::history::HistoryHandle {
-        self.history.clone()
-    }
-
     /// A fresh Ask lane, keeping only the brief it showed, and its empty
     /// snapshot sent to the panel. Called wherever the session transcript is
     /// cleared, so a meeting never inherits the last one's questions.
+
+    #[cfg(test)]
+    fn history_handle_for_test(&self) -> super::history::HistoryHandle {
+        self.history.clone()
+    }
+
     fn reset_ask_lane(&mut self) {
         let brief = self.ask_lane.snapshot().brief;
         self.ask_lane.close();
@@ -999,7 +1008,6 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.trigger.reset();
         core.qa_log.lock().unwrap().clear();
         core.chat_log.lock().unwrap().clear();
-        core.history.lock().unwrap().reset(chrono::Utc::now().timestamp_millis());
         core.note_state = NoteState::Idle;
         core.note_draft = None;
         core.note_markdown.clear();
@@ -1307,8 +1315,12 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
     }
     {
         let handle = handle.clone();
+        let history = app.state::<super::history::HistoryHandle>().inner().clone();
         app.listen("recording-started", move |_event| {
             log::info!("assistant: recording-started event received");
+            // A new recording starts a new history, and its start time is now.
+            // Only here: a mid-call off/on reopens the session without this.
+            history.lock().unwrap().reset(chrono::Utc::now().timestamp_millis());
             let handle = handle.clone();
             tauri::async_runtime::spawn(async move {
                 open_session(&handle, None).await;
@@ -2097,6 +2109,38 @@ mod tests {
             .map(|t| t.prompt.clone())
             .expect("a note turn ran");
         assert!(note_prompt.contains("QUESTIONS ANSWERED DURING THE CALL:\n- What are your fees? Answer: Ten percent of rent."));
+    }
+
+    #[tokio::test]
+    async fn a_mid_call_off_and_on_keeps_everything_shown_earlier_in_the_call() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        history.lock().unwrap().reset(1_000); // recording-started
+        let root = std::env::temp_dir().join(format!("meetily-reopen-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&root).unwrap();
+        let card = |id: &str, ts: i64| CardOut {
+            id: id.into(),
+            kind: super::super::lanes::CardKind::Answer,
+            question: "Q?".into(),
+            lead: "lead".into(),
+            bullets: vec![],
+            source: String::new(),
+            phase: "checked".into(),
+            changed_lines: vec![],
+            ts,
+        };
+        open_session_in(&handle, Some(true), &root).await;
+        super::super::history::record_card(&history, &card("c1", 5_000));
+        // Turned off, then on again, in the same call.
+        open_session_in(&handle, Some(false), &root).await;
+        open_session_in(&handle, Some(true), &root).await;
+        super::super::history::record_card(&history, &card("c2", 9_000));
+        let _ = std::fs::remove_dir_all(&root);
+        let items = history.lock().unwrap().finalize(1_000);
+        assert_eq!(items.len(), 2, "both cards survive the reopen");
+        assert_eq!(items[0].call_time, 4.0);
+        assert_eq!(items[1].call_time, 8.0);
+        assert_eq!(history.lock().unwrap().opened_ms(), 1_000, "fallback start stays the recording start");
     }
 
     #[tokio::test]

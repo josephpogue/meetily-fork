@@ -34,6 +34,12 @@ use crate::state::AppState;
 pub struct AssistantHandle(pub Arc<Mutex<AssistantCore>>);
 
 impl AssistantHandle {
+    /// A handle whose core collects into `history`, which the app also
+    /// manages as its own state (see `lib.rs`).
+    pub fn with_history(history: history::HistoryHandle) -> Self {
+        Self(Arc::new(Mutex::new(AssistantCore::with_history(history))))
+    }
+
     pub fn new() -> Self {
         Self(Arc::new(Mutex::new(AssistantCore::default())))
     }

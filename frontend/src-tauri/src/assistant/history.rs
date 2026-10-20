@@ -144,7 +144,9 @@ impl HistoryCollector {
         }
     }
 
-    fn find_question(&self, id: &str, question: &str) -> Option<usize> {
+    /// The entry for an id seen before, else one in the same `kind` with the
+    /// same wording: a gap question and a For-you question never merge.
+    fn find_question(&self, id: &str, question: &str, kind: &str) -> Option<usize> {
         if !id.is_empty() {
             if let Some(i) = self.entries.iter().position(|e| !e.is_card && e.ids.iter().any(|x| x == id)) {
                 return Some(i);
@@ -156,11 +158,11 @@ impl HistoryCollector {
         }
         self.entries
             .iter()
-            .position(|e| !e.is_card && normalize_question(&e.question) == norm)
+            .position(|e| !e.is_card && e.kind == kind && normalize_question(&e.question) == norm)
     }
 
     fn observe_open(&mut self, item: &AskItem, kind: &str, now_ms: i64) {
-        let idx = match self.find_question(&item.id, &item.question) {
+        let idx = match self.find_question(&item.id, &item.question, kind) {
             Some(i) => i,
             None => {
                 self.entries.push(Entry::blank(kind, false, &item.id, now_ms));
@@ -177,10 +179,10 @@ impl HistoryCollector {
     }
 
     fn observe_answered(&mut self, done: &AnsweredItem) {
-        let idx = match self.find_question(&done.id, &done.question) {
+        let kind = if matches!(done.how, AnswerHow::You) { "for_you" } else { "question" };
+        let idx = match self.find_question(&done.id, &done.question, kind) {
             Some(i) => i,
             None => {
-                let kind = if matches!(done.how, AnswerHow::You) { "for_you" } else { "question" };
                 let mut e = Entry::blank(kind, false, &done.id, done.at);
                 e.question = done.question.clone();
                 self.entries.push(e);
@@ -274,7 +276,7 @@ pub fn write_folder_file(
     std::fs::rename(&tmp, folder_file(folder))
 }
 
-async fn folder_path_of(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
+pub async fn folder_path_of(pool: &SqlitePool, meeting_id: &str) -> Option<String> {
     sqlx::query_scalar::<_, Option<String>>("SELECT folder_path FROM meetings WHERE id = ?")
         .bind(meeting_id)
         .fetch_optional(pool)
@@ -328,14 +330,20 @@ pub async fn delete_for_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<u
         .await
         .map_err(|e| e.to_string())?;
     if let Some(folder) = folder {
-        let file = folder_file(Path::new(&folder));
-        if file.exists() {
-            if let Err(e) = std::fs::remove_file(&file) {
-                log::warn!("assistant: could not remove {}: {}", file.display(), e);
-            }
-        }
+        remove_folder_file(Path::new(&folder));
     }
     Ok(n)
+}
+
+/// Removes `<folder>/assistant.json` and nothing else in the folder. A
+/// missing file is fine; a failure is logged.
+pub fn remove_folder_file(folder: &Path) {
+    let file = folder_file(folder);
+    match std::fs::remove_file(&file) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => log::warn!("assistant: could not remove {}: {}", file.display(), e),
+    }
 }
 
 impl HistoryCollector {
@@ -514,6 +522,41 @@ mod tests {
         c.reset(7);
         assert!(c.is_empty());
         assert_eq!(c.opened_ms(), 7);
+    }
+
+    #[test]
+    fn same_wording_in_a_different_kind_stays_two_items() {
+        let mut c = HistoryCollector::default();
+        c.reset(0);
+        c.observe_asks(&asks_out(vec![ask("a1", "Is pricing in scope?")], vec![], vec![]), 1_000);
+        // A For-you question with the same wording but a new id.
+        c.observe_asks(
+            &asks_out(vec![ask("a1", "Is pricing in scope?")], vec![ask("y1", "is pricing in scope")], vec![]),
+            2_000,
+        );
+        let items = c.finalize(0);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, "question");
+        assert_eq!(items[1].kind, "for_you");
+        // Same kind, same wording, new id still merges.
+        c.observe_asks(&asks_out(vec![ask("a2", "Is pricing in scope")], vec![], vec![]), 3_000);
+        let items = c.finalize(0);
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].kind, "question");
+        assert_eq!(items[1].kind, "for_you");
+    }
+
+    #[test]
+    fn removing_the_folder_file_leaves_everything_else() {
+        let dir = tempfile::tempdir().unwrap();
+        remove_folder_file(dir.path()); // missing file: fine
+        std::fs::write(dir.path().join("assistant.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("metadata.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("audio.mp4"), "x").unwrap();
+        remove_folder_file(dir.path());
+        assert!(!dir.path().join("assistant.json").exists());
+        assert!(dir.path().join("metadata.json").exists());
+        assert!(dir.path().join("audio.mp4").exists());
     }
 
     fn seeded() -> HistoryHandle {

@@ -746,10 +746,9 @@ pub async fn api_delete_api_key<R: Runtime>(
 #[tauri::command]
 pub async fn api_save_meeting_assistant(
     state: tauri::State<'_, AppState>,
-    handle: tauri::State<'_, crate::assistant::AssistantHandle>,
+    history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
     meeting_id: String,
 ) -> Result<u32, String> {
-    let history = handle.0.lock().await.history_handle();
     crate::assistant::history::save_for_meeting(state.db_manager.pool(), &history, &meeting_id).await
 }
 
@@ -792,9 +791,15 @@ pub async fn api_delete_meeting<R: Runtime>(
 
     let pool = state.db_manager.pool();
 
+    // The folder is only known while the meeting row exists.
+    let folder = crate::assistant::history::folder_path_of(pool, &meeting_id).await;
+
     match MeetingsRepository::delete_meeting(pool, &meeting_id).await {
         Ok(true) => {
             log_info!("Successfully deleted meeting {}", meeting_id);
+            if let Some(folder) = folder {
+                crate::assistant::history::remove_folder_file(std::path::Path::new(&folder));
+            }
             Ok(serde_json::json!({
                 "status": "success",
                 "message": "Meeting deleted successfully"
