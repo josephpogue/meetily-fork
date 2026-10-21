@@ -80,7 +80,7 @@ struct VoiceOut {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NoteOut {
+pub struct NoteOut {
     state: &'static str,
     markdown: String,
     error: Option<String>,
@@ -114,6 +114,9 @@ pub struct AssistantCore {
     /// Built once in `install`; every settled card reaches the panel and,
     /// for an answer or a direct ask, appends to `qa_log` for the note.
     card_emit: super::lanes::EmitFn,
+    /// Sends the note's state to the panel (`assistant-note`); a no-op until
+    /// `wire` sets it, and replaced in tests to see what was sent.
+    note_emit: Arc<dyn Fn(NoteOut) + Send + Sync>,
     /// (card id, "Q: ...\nA: ...") per settled card, so a deleted card's entry
     /// can be removed before the note is drafted.
     qa_log: QaLog,
@@ -186,6 +189,7 @@ impl AssistantCore {
             voice_baseline: String::new(),
             app: None,
             card_emit: Arc::new(|_| {}),
+            note_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
             history,
             chat_log: Arc::new(StdMutex::new(Vec::new())),
@@ -271,16 +275,14 @@ impl AssistantCore {
         }
     }
 
+    /// Tells the panel the note's state. Every place that changes `note_state`
+    /// calls this right after, so the panel never keeps a state the core left.
     fn emit_note(&self) {
-        let Some(app) = &self.app else { return };
-        let out = NoteOut {
+        (self.note_emit)(NoteOut {
             state: self.note_state.label(),
             markdown: self.note_markdown.clone(),
             error: self.note_error.clone(),
-        };
-        if let Err(e) = app.emit("assistant-note", &out) {
-            log::warn!("assistant: failed to emit assistant-note: {}", e);
-        }
+        });
     }
 }
 
@@ -640,42 +642,59 @@ pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
     if !core.session_open || !core.ask_lane.dismiss(&id) {
         return;
     }
-    // A question Joseph dismissed is not saved with the meeting. One the model
-    // merely dropped from a later list stays, because it was shown.
-    core.history.lock().unwrap().delete(&[id]);
+    // A question Joseph dismissed is not saved with the meeting, nor kept in
+    // the note's Q&A log. One the model merely dropped from a later list
+    // stays, because it was shown. A session open means the collector holds a
+    // new call, so there are no saved rows to reach.
+    forget_live_items(&core, &[id]);
     if core.session_open && core.enabled {
         core.ask_lane.request(&core.transcript, false);
     }
+}
+
+/// Where a live item leaves the session's records, for every delete: the
+/// history collector (so the meeting save never has it and no observe path
+/// brings it back) and the note's Q&A log. Returns the removed entries' row ids.
+fn forget_live_items(core: &AssistantCore, ids: &[String]) -> Vec<String> {
+    let removed = core.history.lock().unwrap().delete(ids);
+    core.qa_log.lock().unwrap().retain(|(id, _)| !ids.contains(id));
+    removed
 }
 
 /// Deletes assistant items by their live ids (a card's id, a question's id, a
 /// to-do's id), during the call or after Stop. They leave the collector, so
 /// the meeting save never has them, and the note's Q&A log. With the session
 /// open the ask lane also forgets them for good (same as the x); with it
-/// closed the lane is not touched (see `dismiss_ask`). When the meeting was
-/// already saved at Stop, its saved rows and `assistant.json` are deleted
-/// first, and only when that worked do the items leave the collector, the
-/// Q&A log and the lane: a database failure returns Err and changes nothing,
-/// so a retry still finds them. A ready note draft is made again without
-/// them. Returns how many items were removed.
+/// closed the lane is not touched (see `dismiss_ask`). Holds the items write
+/// gate throughout, so it never interleaves with the Stop save. When the
+/// meeting was already saved at Stop, its saved rows are deleted first and
+/// `assistant.json` and the vault note are rebuilt from the rows left; a
+/// database failure there returns Err and changes nothing, so a retry still
+/// finds the items. Once the rows are gone the collector, the Q&A log, the
+/// lane and a ready note draft are updated even when rebuilding the files
+/// failed (that Err comes back after, and a retry rebuilds them). A ready note
+/// draft is made again without the items. Returns how many items were removed.
 pub async fn delete_items(handle: &AssistantHandle, pool: &SqlitePool, ids: Vec<String>) -> Result<u32, String> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let (saved_ids, saved_meeting) = {
-        let core = handle.0.lock().await;
-        let history = core.history.lock().unwrap();
-        (history.saved_ids_of(&ids), history.saved_meeting_id())
+    let history = handle.0.lock().await.history.clone();
+    let _gate = super::history::lock_items_gate(&history).await;
+    let (saved_meeting, saved_ids) = {
+        let h = history.lock().unwrap();
+        (h.saved_meeting_id(), h.saved_ids_of(&ids))
     };
-    if let Some(meeting_id) = saved_meeting {
-        if !saved_ids.is_empty() {
-            super::history::delete_saved_items(pool, &meeting_id, &saved_ids).await?;
+    let mut files = Ok(());
+    if let Some(meeting_id) = &saved_meeting {
+        let (_, gone) = super::history::delete_saved_rows(pool, meeting_id, &saved_ids).await?;
+        files = super::history::after_items_deleted(pool, meeting_id, &gone).await;
+        if let Err(e) = &files {
+            log::warn!("assistant: rows of {} deleted but its files not rebuilt: {}", meeting_id, e);
         }
     }
     let removed = {
         let core = handle.0.lock().await;
-        let removed = core.history.lock().unwrap().delete(&ids);
-        core.qa_log.lock().unwrap().retain(|(id, _)| !ids.contains(id));
+        let removed = forget_live_items(&core, &ids);
         if core.session_open {
             let mut dismissed = false;
             for id in &ids {
@@ -688,15 +707,17 @@ pub async fn delete_items(handle: &AssistantHandle, pool: &SqlitePool, ids: Vec<
         removed
     };
     redraft_if_ready(handle).await;
-    Ok(removed.len() as u32)
+    files.map(|_| removed.len() as u32)
 }
 
-/// Deletes a past meeting's saved rows by row id (the Assistant tab). When
-/// that meeting is the one the live collector saved, its entries leave the
-/// collector too, the cards leave the note's Q&A log, a ready note is made
-/// again without them, and `on_deleted` gets every live id of the removed
-/// entries so the panel can hide them. A database failure returns Err and
-/// changes nothing.
+/// Deletes a past meeting's saved rows by row id (the Assistant tab). Holds
+/// the items write gate throughout. When that meeting is the one the live
+/// collector saved, its entries leave the collector too, the cards leave the
+/// note's Q&A log, a ready note is made again without them, and `on_deleted`
+/// gets every live id of the removed entries so the panel can hide them. A
+/// database failure on the rows returns Err and changes nothing; a failure
+/// rebuilding the files afterwards returns Err only after the live session
+/// was updated, and a retry rebuilds them.
 pub async fn delete_past_items(
     handle: &AssistantHandle,
     pool: &SqlitePool,
@@ -704,12 +725,18 @@ pub async fn delete_past_items(
     ids: Vec<String>,
     on_deleted: impl FnOnce(Vec<String>),
 ) -> Result<u32, String> {
-    let n = super::history::delete_saved_items(pool, meeting_id, &ids).await?;
+    let history = handle.0.lock().await.history.clone();
+    let _gate = super::history::lock_items_gate(&history).await;
+    let (n, gone) = super::history::delete_saved_rows(pool, meeting_id, &ids).await?;
+    let files = super::history::after_items_deleted(pool, meeting_id, &gone).await;
+    if let Err(e) = &files {
+        log::warn!("assistant: rows of {} deleted but its files not rebuilt: {}", meeting_id, e);
+    }
     let live_ids = {
         let core = handle.0.lock().await;
         let mut history = core.history.lock().unwrap();
         if history.saved_meeting_id().as_deref() != Some(meeting_id) {
-            return Ok(n);
+            return files.map(|_| n);
         }
         let live_ids = history.delete_saved(&ids);
         core.qa_log.lock().unwrap().retain(|(id, _)| !live_ids.contains(id));
@@ -719,7 +746,7 @@ pub async fn delete_past_items(
         redraft_if_ready(handle).await;
         on_deleted(live_ids);
     }
-    Ok(n)
+    files.map(|_| n)
 }
 
 /// After a delete: a note still Ready is drafted again without the deleted
@@ -902,8 +929,46 @@ async fn draft_note_if_ready(handle: &AssistantHandle) -> Result<(), String> {
     draft_note_gated(handle, true).await
 }
 
+/// Marks the note Drafting and builds the draft's inputs from what is left
+/// now (the transcript, the Q&A log, the answered and open questions less the
+/// deleted ones). Returns them with the collector's delete generation as it
+/// stood, so a delete that lands while the draft runs can be told apart.
+fn start_draft(core: &mut AssistantCore) -> (String, String, u64) {
+    core.note_state = NoteState::Drafting;
+    core.note_error = None;
+    core.emit_note();
+    let transcript_text = core.transcript.all();
+    let qa_log_text = qa_log_text(&core.qa_log);
+    // After Stop the lane still holds what Joseph deleted: leave it out.
+    let (deleted, generation) = {
+        let h = core.history.lock().unwrap();
+        (h.deleted_ids(), h.delete_generation())
+    };
+    let open_asks = open_asks_kept(&core.ask_lane, &deleted);
+    let mut draft_input = qa_log_text;
+    let answered = answered_kept(&core.ask_lane, &deleted);
+    if !answered.is_empty() {
+        let list = answered
+            .iter()
+            .map(|a| format!("- {} Answer: {}", a.question, a.answer))
+            .collect::<Vec<_>>()
+            .join("\n");
+        draft_input = format!("{}\n\nQUESTIONS ANSWERED DURING THE CALL:\n{}", draft_input, list);
+    }
+    if !open_asks.is_empty() {
+        let list = open_asks
+            .iter()
+            .map(|q| format!("- {}", q))
+            .collect::<Vec<_>>()
+            .join("\n");
+        draft_input = format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", draft_input, list);
+    }
+    core.session_transcript = transcript_text.clone();
+    (transcript_text, draft_input, generation)
+}
+
 async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Result<(), String> {
-    let (transcript_text, qa_log_text) = {
+    let (mut transcript_text, mut qa_log_text, mut generation) = {
         let mut core = handle.0.lock().await;
         if only_if_ready && !matches!(core.note_state, NoteState::Ready) {
             return Ok(());
@@ -911,66 +976,52 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
         if core.session_open {
             return Err("stop the recording before drafting a note".to_string());
         }
-        core.note_state = NoteState::Drafting;
-        core.note_error = None;
-        core.emit_note();
-        let transcript_text = core.transcript.all();
-        let qa_log_text = qa_log_text(&core.qa_log);
-        // After Stop the lane still holds what Joseph deleted: leave it out.
-        let deleted = core.history.lock().unwrap().deleted_ids();
-        let open_asks = open_asks_kept(&core.ask_lane, &deleted);
-        let mut draft_input = qa_log_text;
-        let answered = answered_kept(&core.ask_lane, &deleted);
-        if !answered.is_empty() {
-            let list = answered
-                .iter()
-                .map(|a| format!("- {} Answer: {}", a.question, a.answer))
-                .collect::<Vec<_>>()
-                .join("\n");
-            draft_input = format!("{}\n\nQUESTIONS ANSWERED DURING THE CALL:\n{}", draft_input, list);
-        }
-        if !open_asks.is_empty() {
-            let list = open_asks
-                .iter()
-                .map(|q| format!("- {}", q))
-                .collect::<Vec<_>>()
-                .join("\n");
-            draft_input = format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", draft_input, list);
-        }
-        core.session_transcript = transcript_text.clone();
-        (transcript_text, draft_input)
+        start_draft(&mut core)
     };
 
-    let result = {
+    loop {
+        let result = {
+            let mut core = handle.0.lock().await;
+            core.lanes.draft_note(transcript_text, qa_log_text).await
+        };
+
         let mut core = handle.0.lock().await;
-        core.lanes.draft_note(transcript_text, qa_log_text).await
-    };
-
-    let mut core = handle.0.lock().await;
-    match result {
-        Ok(raw) => match note::parse_note(&raw) {
-            Ok(draft) => {
-                // The preview carries the answered list as it stands, built in
-                // code. The draft keeps only the model's body: the saved file
-                // builds its own code sections from the meeting's rows.
-                let deleted = core.history.lock().unwrap().deleted_ids();
-                core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
-                core.note_draft = Some(draft);
-                core.note_state = NoteState::Ready;
-                core.note_error = None;
-            }
+        match result {
+            Ok(raw) => match note::parse_note(&raw) {
+                Ok(draft) => {
+                    // An item deleted while this draft ran may be named in the
+                    // model's text, which was written from the old inputs: draft
+                    // again from what is left, staying Drafting until that lands.
+                    if core.history.lock().unwrap().delete_generation() != generation {
+                        if core.session_open {
+                            // A new call opened meanwhile and reset the note.
+                            return Ok(());
+                        }
+                        (transcript_text, qa_log_text, generation) = start_draft(&mut core);
+                        continue;
+                    }
+                    // The preview carries the answered list as it stands, built in
+                    // code. The draft keeps only the model's body: the saved file
+                    // builds its own code sections from the meeting's rows.
+                    let deleted = core.history.lock().unwrap().deleted_ids();
+                    core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
+                    core.note_draft = Some(draft);
+                    core.note_state = NoteState::Ready;
+                    core.note_error = None;
+                }
+                Err(e) => {
+                    core.note_state = NoteState::Failed;
+                    core.note_error = Some(e);
+                }
+            },
             Err(e) => {
                 core.note_state = NoteState::Failed;
                 core.note_error = Some(e);
             }
-        },
-        Err(e) => {
-            core.note_state = NoteState::Failed;
-            core.note_error = Some(e);
         }
+        core.emit_note();
+        return Ok(());
     }
-    core.emit_note();
-    Ok(())
 }
 
 /// What the vault note is built from: the meeting's rows (saved rows when the
@@ -1309,6 +1360,9 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.note_draft = None;
         core.note_markdown.clear();
         core.note_error = None;
+        // The panel must not keep the last call's note state (a Saved note
+        // would make the next Stop skip the note bar).
+        core.emit_note();
         core.session_transcript.clear();
         // The previous meeting's answered and open questions go with its
         // transcript, however far this attempt gets.
@@ -1551,6 +1605,12 @@ async fn wire(app: AppHandle<Wry>) {
         let mut core = handle.0.lock().await;
         core.app = Some(app.clone());
         core.card_emit = card_emit;
+        let note_app = app.clone();
+        core.note_emit = Arc::new(move |out: NoteOut| {
+            if let Err(e) = note_app.emit("assistant-note", &out) {
+                log::warn!("assistant: failed to emit assistant-note: {}", e);
+            }
+        });
         core.ask_hooks = make_ask_hooks(app.clone(), handle.clone(), history.clone());
         core.ask_lane = AskLane::new(claude_runner(PathBuf::new()), core.ask_hooks.clone());
 
@@ -3010,6 +3070,227 @@ mod tests {
         let core = handle.0.lock().await;
         assert!(core.history.lock().unwrap().is_deleted(&id));
         assert!(core.qa_log.lock().unwrap().is_empty());
+    }
+
+    /// A collector with an ask ("What are your fees?") and a settled card
+    /// ("c2"), a closed session, and meeting `m1` waiting to be saved.
+    async fn two_items_ready_to_save(
+        pool: &SqlitePool,
+        folder: &std::path::Path,
+    ) -> (AssistantHandle, super::super::history::HistoryHandle, String) {
+        add_meeting(pool, "m1", Some(folder.to_str().unwrap())).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        super::super::history::record_card(&history, &settled_card("c2", "Who owns backups?"));
+        close_session(&handle).await;
+        (handle, history, id)
+    }
+
+    fn json_questions(folder: &std::path::Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(folder.join("assistant.json")).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        file["items"].as_array().unwrap().iter().map(|i| i["question"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_delete_waits_for_the_stop_save_then_reaches_its_rows_and_files() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+
+        // The Stop save is in flight: it holds the items gate.
+        let gate = super::super::history::lock_items_gate(&history).await;
+        let delete = {
+            let (handle, pool) = (handle.clone(), pool.clone());
+            tokio::spawn(async move { delete_items(&handle, &pool, vec![id]).await })
+        };
+        settle().await;
+        assert!(!delete.is_finished(), "a delete never runs between the save's steps");
+        let snapshot = super::super::history::snapshot_for_save(&history);
+        let written = super::super::history::write_rows(&pool, "m1", &snapshot).await.unwrap();
+        assert_eq!(super::super::history::finish_save(&pool, &history, "m1", &snapshot, written).await, Ok(2));
+        drop(gate);
+
+        assert_eq!(delete.await.unwrap(), Ok(1));
+        assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"]);
+        assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"]);
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+    }
+
+    /// The window the first round left open: a delete has decided the meeting
+    /// is not saved yet and is about to take the item out of the collector,
+    /// and the Stop save starts right then. The save must wait for the delete.
+    #[tokio::test]
+    async fn a_save_that_starts_while_a_delete_is_between_its_steps_waits_for_it() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+        let core_lock = handle.0.lock().await;
+        let delete = {
+            let (handle, pool) = (handle.clone(), pool.clone());
+            tokio::spawn(async move { delete_items(&handle, &pool, vec![id]).await })
+        };
+        tokio::task::yield_now().await;
+        drop(core_lock);
+        // Queued behind the delete's first look at the core, so it holds the
+        // lock the delete needs for its last step.
+        let core_lock = handle.0.lock().await;
+        let save = {
+            let (pool, history) = (pool.clone(), history.clone());
+            tokio::spawn(async move { super::super::history::save_for_meeting(&pool, &history, "m1").await })
+        };
+        settle().await;
+        drop(core_lock);
+
+        assert_eq!(delete.await.unwrap(), Ok(1));
+        save.await.unwrap().unwrap();
+        assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"]);
+        assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"]);
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+    }
+
+    /// Saves and deletes started together on real threads, with the delete
+    /// starting a little later each round: whichever order they take, the
+    /// deleted item is in no row, no `assistant.json` and no collector.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saves_and_deletes_started_together_never_leave_the_deleted_item_behind() {
+        for round in 0..40 {
+            let pool = test_pool().await;
+            let folder = tempfile::tempdir().unwrap();
+            let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+            let save = {
+                let (pool, history) = (pool.clone(), history.clone());
+                tokio::spawn(async move { super::super::history::save_for_meeting(&pool, &history, "m1").await })
+            };
+            let delete = {
+                let (handle, pool) = (handle.clone(), pool.clone());
+                tokio::spawn(async move {
+                    for _ in 0..round % 10 {
+                        tokio::task::yield_now().await;
+                    }
+                    delete_items(&handle, &pool, vec![id]).await
+                })
+            };
+            save.await.unwrap().unwrap();
+            delete.await.unwrap().unwrap();
+            assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"], "round {round}");
+            assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"], "round {round}");
+            assert_eq!(history.lock().unwrap().finalize(0).len(), 1, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_the_files_failed_to_rebuild_brings_them_in_line() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+        handle.0.lock().await.qa_log.lock().unwrap().push((id.clone(), "Q: fees\nA: ten".to_string()));
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert_eq!(json_questions(folder.path()).len(), 2);
+
+        // The row delete works, then reading the Brief to rebuild the file fails.
+        rename_items_table(&pool, "meeting_assistant_meta", "parked_meta").await;
+        assert!(delete_items(&handle, &pool, vec![id.clone()]).await.is_err());
+        assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"], "the row is gone");
+        {
+            let core = handle.0.lock().await;
+            assert!(core.history.lock().unwrap().is_deleted(&id), "the collector let go of it anyway");
+            assert!(core.qa_log.lock().unwrap().is_empty(), "so did the Q&A log");
+        }
+        assert_eq!(json_questions(folder.path()).len(), 2, "the file is stale until the retry");
+
+        rename_items_table(&pool, "parked_meta", "meeting_assistant_meta").await;
+        assert_eq!(delete_items(&handle, &pool, vec![id]).await, Ok(0), "nothing left to remove");
+        assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"]);
+    }
+
+    #[tokio::test]
+    async fn a_delete_made_while_the_note_drafts_is_drafted_again_before_the_note_is_ready() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let (history, qa) = {
+            let core = handle.0.lock().await;
+            (core.history_handle_for_test(), core.qa_log.clone())
+        };
+        let first_note = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let inner = note_runner(calls.clone());
+        // Joseph deletes c1 while the first note draft is with the model.
+        let runner: Runner = Arc::new(move |turn, on_delta, register| {
+            if turn.prompt.starts_with("TRANSCRIPT:") && first_note.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                history.lock().unwrap().delete(&["c1".to_string()]);
+                qa.lock().unwrap().retain(|(id, _)| id != "c1");
+            }
+            inner(turn, on_delta, register)
+        });
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), runner).await;
+        {
+            let core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            record_card(&settled_card("c1", "Where is the data center?"), &qa, &chats);
+            record_card(&settled_card("c2", "Who owns backups?"), &qa, &chats);
+        }
+        close_session(&handle).await;
+
+        assert!(draft_note(&handle).await.is_ok());
+        let prompts: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.prompt.starts_with("TRANSCRIPT:"))
+            .map(|t| t.prompt.clone())
+            .collect();
+        assert_eq!(prompts.len(), 2, "drafted again once the first draft landed");
+        assert!(prompts[0].contains("Where is the data center?"));
+        assert!(!prompts[1].contains("Where is the data center?") && prompts[1].contains("Who owns backups?"), "{}", prompts[1]);
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready);
+    }
+
+    #[tokio::test]
+    async fn the_x_on_an_ask_item_also_takes_it_out_of_the_q_and_a_log_and_the_draft() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        {
+            let core = handle.0.lock().await;
+            let mut qa = core.qa_log.lock().unwrap();
+            qa.push((id.clone(), "Q: Where is the data center?\nA: Building two.".to_string()));
+            qa.push(("c2".to_string(), "Q: Who owns backups?\nA: Building two.".to_string()));
+        }
+
+        dismiss_ask(&handle, id).await;
+        settle().await;
+        assert_eq!(handle.0.lock().await.qa_log.lock().unwrap().len(), 1);
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let prompt = last_note_prompt(&calls);
+        assert!(!prompt.contains("Where is the data center?"), "{prompt}");
+        assert!(prompt.contains("Who owns backups?"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn opening_a_session_after_a_saved_note_tells_the_panel_the_note_is_idle() {
+        let handle = AssistantHandle::new();
+        let sent = Arc::new(StdMutex::new(Vec::<(&'static str, String)>::new()));
+        {
+            let mut core = handle.0.lock().await;
+            let sink = sent.clone();
+            core.note_emit = Arc::new(move |out: NoteOut| sink.lock().unwrap().push((out.state, out.markdown)));
+            core.note_state = NoteState::Saved;
+            core.note_markdown = "## Summary".to_string();
+        }
+        let root = std::env::temp_dir().join(format!("meetily-note-idle-{}", uuid::Uuid::new_v4()));
+        open_session_in(&handle, Some(false), &root).await;
+
+        assert_eq!(sent.lock().unwrap().last(), Some(&("idle", String::new())));
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Idle);
     }
 
     #[tokio::test]

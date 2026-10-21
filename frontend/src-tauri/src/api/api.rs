@@ -810,9 +810,10 @@ pub async fn api_get_meeting_assistant_meta(
 #[tauri::command]
 pub async fn api_delete_meeting_assistant(
     state: tauri::State<'_, AppState>,
+    history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
     meeting_id: String,
 ) -> Result<u32, String> {
-    crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &meeting_id).await
+    crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &history, &meeting_id).await
 }
 
 /// Deletes saved assistant items of one meeting by row id (as
