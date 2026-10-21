@@ -1,7 +1,7 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -816,23 +816,25 @@ pub async fn api_delete_meeting_assistant(
 }
 
 /// Deletes saved assistant items of one meeting by row id (as
-/// `api_get_meeting_assistant` returns them). Also drops them from the live
-/// collector when it holds this meeting, so a later save does not bring them
-/// back. Returns the rows deleted.
+/// `api_get_meeting_assistant` returns them). When the live session saved this
+/// meeting, its items also leave the live collector and the note's Q&A log, a
+/// ready note is drafted again without them, and `assistant-items-deleted`
+/// `{ ids }` (every live id of the removed items) tells the panel to hide them.
+/// Returns the rows deleted.
 #[tauri::command]
-pub async fn api_delete_meeting_assistant_items(
+pub async fn api_delete_meeting_assistant_items<R: Runtime>(
+    app: AppHandle<R>,
     state: tauri::State<'_, AppState>,
-    history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
+    handle: tauri::State<'_, crate::assistant::AssistantHandle>,
     meeting_id: String,
     ids: Vec<String>,
 ) -> Result<u32, String> {
-    {
-        let mut collector = history.lock().unwrap();
-        if collector.saved_meeting_id().as_deref() == Some(meeting_id.as_str()) {
-            collector.delete_saved(&ids);
+    crate::assistant::core::delete_past_items(handle.inner(), state.db_manager.pool(), &meeting_id, ids, |live_ids| {
+        if let Err(e) = app.emit("assistant-items-deleted", serde_json::json!({ "ids": live_ids })) {
+            log::warn!("assistant: failed to emit assistant-items-deleted: {}", e);
         }
-    }
-    crate::assistant::history::delete_saved_items(state.db_manager.pool(), &meeting_id, &ids).await
+    })
+    .await
 }
 
 #[tauri::command]

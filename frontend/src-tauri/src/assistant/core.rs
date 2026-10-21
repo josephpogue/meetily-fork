@@ -348,7 +348,11 @@ fn make_card_emit(
     forward: super::lanes::EmitFn,
 ) -> super::lanes::EmitFn {
     Arc::new(move |card: CardOut| {
-        record_card(&card, &qa_log, &chat_log);
+        // A card Joseph deleted while it drafted must not re-enter the logs
+        // when it settles (the collector already refuses it).
+        if !history.lock().unwrap().is_deleted(&card.id) {
+            record_card(&card, &qa_log, &chat_log);
+        }
         super::history::record_card(&history, &card);
         if is_settled_ask(&card) {
             // A question worked out in Ask may have answered one on the
@@ -649,20 +653,28 @@ pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
 /// the meeting save never has them, and the note's Q&A log. With the session
 /// open the ask lane also forgets them for good (same as the x); with it
 /// closed the lane is not touched (see `dismiss_ask`). When the meeting was
-/// already saved at Stop, its saved rows and `assistant.json` lose them too,
-/// and a ready note draft is made again without them. Returns how many items
-/// were removed.
+/// already saved at Stop, its saved rows and `assistant.json` are deleted
+/// first, and only when that worked do the items leave the collector, the
+/// Q&A log and the lane: a database failure returns Err and changes nothing,
+/// so a retry still finds them. A ready note draft is made again without
+/// them. Returns how many items were removed.
 pub async fn delete_items(handle: &AssistantHandle, pool: &SqlitePool, ids: Vec<String>) -> Result<u32, String> {
     if ids.is_empty() {
         return Ok(0);
     }
-    let (saved_ids, saved_meeting, note_ready) = {
+    let (saved_ids, saved_meeting) = {
         let core = handle.0.lock().await;
-        let (saved_ids, saved_meeting) = {
-            let mut history = core.history.lock().unwrap();
-            let saved_ids = history.delete(&ids);
-            (saved_ids, history.saved_meeting_id())
-        };
+        let history = core.history.lock().unwrap();
+        (history.saved_ids_of(&ids), history.saved_meeting_id())
+    };
+    if let Some(meeting_id) = saved_meeting {
+        if !saved_ids.is_empty() {
+            super::history::delete_saved_items(pool, &meeting_id, &saved_ids).await?;
+        }
+    }
+    let removed = {
+        let core = handle.0.lock().await;
+        let removed = core.history.lock().unwrap().delete(&ids);
         core.qa_log.lock().unwrap().retain(|(id, _)| !ids.contains(id));
         if core.session_open {
             let mut dismissed = false;
@@ -673,20 +685,54 @@ pub async fn delete_items(handle: &AssistantHandle, pool: &SqlitePool, ids: Vec<
                 core.ask_lane.request(&core.transcript, false);
             }
         }
-        (saved_ids, saved_meeting, matches!(core.note_state, NoteState::Ready))
+        removed
     };
-    if let Some(meeting_id) = saved_meeting {
-        if !saved_ids.is_empty() {
-            super::history::delete_saved_items(pool, &meeting_id, &saved_ids).await?;
+    redraft_if_ready(handle).await;
+    Ok(removed.len() as u32)
+}
+
+/// Deletes a past meeting's saved rows by row id (the Assistant tab). When
+/// that meeting is the one the live collector saved, its entries leave the
+/// collector too, the cards leave the note's Q&A log, a ready note is made
+/// again without them, and `on_deleted` gets every live id of the removed
+/// entries so the panel can hide them. A database failure returns Err and
+/// changes nothing.
+pub async fn delete_past_items(
+    handle: &AssistantHandle,
+    pool: &SqlitePool,
+    meeting_id: &str,
+    ids: Vec<String>,
+    on_deleted: impl FnOnce(Vec<String>),
+) -> Result<u32, String> {
+    let n = super::history::delete_saved_items(pool, meeting_id, &ids).await?;
+    let live_ids = {
+        let core = handle.0.lock().await;
+        let mut history = core.history.lock().unwrap();
+        if history.saved_meeting_id().as_deref() != Some(meeting_id) {
+            return Ok(n);
         }
+        let live_ids = history.delete_saved(&ids);
+        core.qa_log.lock().unwrap().retain(|(id, _)| !live_ids.contains(id));
+        live_ids
+    };
+    if !live_ids.is_empty() {
+        redraft_if_ready(handle).await;
+        on_deleted(live_ids);
     }
-    if note_ready {
+    Ok(n)
+}
+
+/// After a delete: a note still Ready is drafted again without the deleted
+/// items, in the background. The draft starts only if the note is still Ready
+/// when it takes the lock, so a Save or a draft that ran meanwhile is left alone.
+async fn redraft_if_ready(handle: &AssistantHandle) {
+    let ready = matches!(handle.0.lock().await.note_state, NoteState::Ready);
+    if ready {
         let handle = handle.clone();
         tauri::async_runtime::spawn(async move {
-            let _ = draft_note(&handle).await;
+            let _ = draft_note_if_ready(&handle).await;
         });
     }
-    Ok(saved_ids.len() as u32)
 }
 
 /// Joseph typed the answer to a list question. The item moves to the
@@ -847,8 +893,21 @@ pub async fn voice_toggle(handle: &AssistantHandle) {
 }
 
 pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
+    draft_note_gated(handle, false).await
+}
+
+/// The draft a delete asks for: runs only if the note is still Ready when it
+/// takes the lock (Saved, or a draft already running, is left as it is).
+async fn draft_note_if_ready(handle: &AssistantHandle) -> Result<(), String> {
+    draft_note_gated(handle, true).await
+}
+
+async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Result<(), String> {
     let (transcript_text, qa_log_text) = {
         let mut core = handle.0.lock().await;
+        if only_if_ready && !matches!(core.note_state, NoteState::Ready) {
+            return Ok(());
+        }
         if core.session_open {
             return Err("stop the recording before drafting a note".to_string());
         }
@@ -924,14 +983,14 @@ struct MeetingFacts {
 }
 
 async fn meeting_facts(pool: &SqlitePool, history: &super::history::HistoryHandle) -> Result<MeetingFacts, String> {
-    let (saved_id, brief, live_rows) = {
+    let (saved_id, live_brief, live_rows) = {
         let h = history.lock().unwrap();
         let saved_id = h.saved_meeting_id();
         let live_rows = if saved_id.is_none() { h.finalize(h.opened_ms()) } else { Vec::new() };
         (saved_id, h.brief().to_string(), live_rows)
     };
     let Some(id) = saved_id.clone() else {
-        return Ok(MeetingFacts { saved_id, rows: live_rows, title: None, brief });
+        return Ok(MeetingFacts { saved_id, rows: live_rows, title: None, brief: live_brief });
     };
     let rows = AssistantItemsRepository::list_for_meeting(pool, &id).await.map_err(|e| e.to_string())?;
     let title = sqlx::query_scalar::<_, Option<String>>("SELECT title FROM meetings WHERE id = ?")
@@ -941,15 +1000,13 @@ async fn meeting_facts(pool: &SqlitePool, history: &super::history::HistoryHandl
         .map_err(|e| e.to_string())?
         .flatten()
         .filter(|t| !t.trim().is_empty());
-    let brief = if brief.trim().is_empty() {
-        AssistantMetaRepository::get(pool, &id)
-            .await
-            .map_err(|e| e.to_string())?
-            .map(|m| m.brief)
-            .unwrap_or_default()
-    } else {
-        brief
-    };
+    // After Stop the collector's Brief belongs to the NEXT call, so a saved
+    // meeting takes the brief it was saved with.
+    let brief = AssistantMetaRepository::get(pool, &id)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|m| m.brief)
+        .unwrap_or_default();
     Ok(MeetingFacts { saved_id, rows, title, brief })
 }
 
@@ -2881,5 +2938,190 @@ mod tests {
         let core = handle.0.lock().await;
         assert!(!core.note_markdown.contains("Answered questions"), "{}", core.note_markdown);
         assert_eq!(core.qa_log.lock().unwrap().len(), 1);
+    }
+    // ---- delete and save races ----
+
+    #[tokio::test]
+    async fn a_card_deleted_while_drafting_leaves_no_trace_when_it_settles() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        let pool = test_pool().await;
+        let (qa, chats, history, emit) = {
+            let mut core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            core.history.lock().unwrap().reset(0);
+            let emit = make_card_emit(handle.clone(), qa.clone(), chats.clone(), core.history.clone(), Arc::new(|_| {}));
+            core.card_emit = emit.clone();
+            (qa, chats, core.history.clone(), emit)
+        };
+        let mut drafting = settled_card("c1", "Where is the data center?");
+        drafting.phase = "drafting".to_string();
+        emit(drafting);
+        assert_eq!(delete_items(&handle, &pool, vec!["c1".to_string()]).await, Ok(1));
+        let mut checked = settled_card("c1", "Where is the data center?");
+        checked.kind = CardKind::Ask;
+        emit(checked);
+        emit(settled_card("c2", "Who owns backups?"));
+        settle().await;
+
+        assert_eq!(qa.lock().unwrap().len(), 1, "only c2 is in the Q&A log");
+        assert!(chats.lock().unwrap().is_empty(), "the deleted Ask card is not chat either");
+        assert!(history.lock().unwrap().finalize(0).iter().all(|i| i.lead == "Building two." && i.question != "Where is the data center?"));
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let prompt = last_note_prompt(&calls);
+        assert!(!prompt.contains("Where is the data center?"), "{prompt}");
+        assert!(prompt.contains("Who owns backups?"), "{prompt}");
+    }
+
+    async fn rename_items_table(pool: &SqlitePool, from: &str, to: &str) {
+        sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}")).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_database_delete_changes_nothing_and_a_retry_works() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        handle.0.lock().await.qa_log.lock().unwrap().push((id.clone(), "Q: x\nA: y".to_string()));
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert_eq!(saved_questions(&pool, "m1").await.len(), 1);
+
+        rename_items_table(&pool, "meeting_assistant_items", "parked_items").await;
+        assert!(delete_items(&handle, &pool, vec![id.clone()]).await.is_err());
+        {
+            let core = handle.0.lock().await;
+            assert_eq!(core.history.lock().unwrap().finalize(0).len(), 1, "the entry is still in the collector");
+            assert!(!core.history.lock().unwrap().is_deleted(&id));
+            assert_eq!(core.qa_log.lock().unwrap().len(), 1, "the Q&A log keeps it");
+            assert_eq!(core.ask_lane.snapshot().asks.len(), 1, "the lane keeps it");
+        }
+
+        rename_items_table(&pool, "parked_items", "meeting_assistant_items").await;
+        assert_eq!(delete_items(&handle, &pool, vec![id.clone()]).await, Ok(1));
+        assert!(saved_questions(&pool, "m1").await.is_empty(), "the retry deleted the row");
+        let core = handle.0.lock().await;
+        assert!(core.history.lock().unwrap().is_deleted(&id));
+        assert!(core.qa_log.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_on_the_past_meetings_tab_updates_the_live_session() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        add_meeting(&pool, "m2", None).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        {
+            let core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            record_card(&settled_card("c1", "Where is the data center?"), &qa, &chats);
+            record_card(&settled_card("c2", "Who owns backups?"), &qa, &chats);
+        }
+        super::super::history::record_card(&history, &settled_card("c1", "Where is the data center?"));
+        super::super::history::record_card(&history, &settled_card("c2", "Who owns backups?"));
+        let answered_id = handle.0.lock().await.ask_lane.snapshot().answered[0].id.clone();
+        close_session(&handle).await;
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert!(draft_note(&handle).await.is_ok());
+        let rows = AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap();
+        let row_of = |q: &str| rows.iter().find(|r| r.question == q).unwrap().id.clone();
+        let (c1_row, answered_row) = (row_of("Where is the data center?"), row_of("What are your fees?"));
+
+        // Another meeting's tab: nothing live changes, nothing is announced.
+        let announced = Arc::new(StdMutex::new(Vec::<Vec<String>>::new()));
+        let sink = announced.clone();
+        assert_eq!(
+            delete_past_items(&handle, &pool, "m2", vec![c1_row.clone()], move |ids| sink.lock().unwrap().push(ids)).await,
+            Ok(0)
+        );
+        assert!(announced.lock().unwrap().is_empty());
+        assert_eq!(handle.0.lock().await.qa_log.lock().unwrap().len(), 2);
+
+        // The saved meeting's tab: the live session follows.
+        let sink = announced.clone();
+        assert_eq!(
+            delete_past_items(&handle, &pool, "m1", vec![c1_row, answered_row], move |ids| sink.lock().unwrap().push(ids)).await,
+            Ok(2)
+        );
+        let announced = announced.lock().unwrap().clone();
+        assert_eq!(announced.len(), 1);
+        assert!(announced[0].contains(&"c1".to_string()), "{:?}", announced);
+        assert!(announced[0].contains(&answered_id), "{:?}", announced);
+        {
+            let core = handle.0.lock().await;
+            assert_eq!(core.qa_log.lock().unwrap().iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["c2"]);
+            assert!(core.history.lock().unwrap().is_deleted("c1"));
+        }
+        settle().await;
+        settle().await;
+        let again = last_note_prompt(&calls);
+        assert!(!again.contains("Where is the data center?") && !again.contains("What are your fees?"), "{again}");
+        assert!(again.contains("Who owns backups?"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_redraft_never_flips_a_saved_or_drafting_note() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready);
+        let turns = calls.lock().unwrap().len();
+
+        // A delete saw Ready and queued a redraft; Save ran before it started.
+        handle.0.lock().await.note_state = NoteState::Saved;
+        assert!(draft_note_if_ready(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Saved);
+        handle.0.lock().await.note_state = NoteState::Drafting;
+        assert!(draft_note_if_ready(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Drafting);
+        assert_eq!(calls.lock().unwrap().len(), turns, "no draft turn ran");
+
+        handle.0.lock().await.note_state = NoteState::Ready;
+        assert!(draft_note_if_ready(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready);
+        assert!(calls.lock().unwrap().len() > turns, "a Ready note is drafted again");
+    }
+
+    #[tokio::test]
+    async fn the_note_uses_the_saved_meetings_brief_not_the_next_calls() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = super::super::history::new_handle();
+        h.lock().unwrap().reset(0);
+        h.lock().unwrap().set_brief("Plan the move");
+        super::super::history::save_for_meeting(&pool, &h, "m1").await.unwrap();
+        // After Stop the Brief box edits the next call's brief.
+        h.lock().unwrap().set_brief("Next call: pricing");
+        assert_eq!(meeting_facts(&pool, &h).await.unwrap().brief, "Plan the move");
+
+        // A meeting that was saved with no brief has none, whatever is typed after.
+        add_meeting(&pool, "m2", None).await;
+        let h2 = super::super::history::new_handle();
+        h2.lock().unwrap().reset(0);
+        super::super::history::save_for_meeting(&pool, &h2, "m2").await.unwrap();
+        h2.lock().unwrap().set_brief("Typed after Stop");
+        assert_eq!(meeting_facts(&pool, &h2).await.unwrap().brief, "");
+
+        // Not saved yet: the collector's brief is the only one there is.
+        let h3 = super::super::history::new_handle();
+        h3.lock().unwrap().reset(0);
+        h3.lock().unwrap().set_brief("Live brief");
+        assert_eq!(meeting_facts(&pool, &h3).await.unwrap().brief, "Live brief");
     }
 }

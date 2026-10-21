@@ -169,6 +169,26 @@ impl HistoryCollector {
         saved
     }
 
+    /// The `saved_id`s of the entries seen under any of `ids`, without
+    /// removing them: a delete finds the rows first and removes the entries
+    /// only once the rows are gone.
+    pub fn saved_ids_of(&self, ids: &[String]) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| e.ids.iter().any(|x| ids.contains(x)))
+            .map(|e| e.saved_id.clone())
+            .collect()
+    }
+
+    /// Every live id the entries saved under these row ids were seen under.
+    pub fn live_ids_of_saved(&self, saved_ids: &[String]) -> Vec<String> {
+        self.entries
+            .iter()
+            .filter(|e| saved_ids.contains(&e.saved_id))
+            .flat_map(|e| e.ids.iter().cloned())
+            .collect()
+    }
+
     pub fn is_deleted(&self, id: &str) -> bool {
         self.deleted.iter().any(|d| d == id)
     }
@@ -185,15 +205,11 @@ impl HistoryCollector {
 
     /// Deletes the entries that were saved under these row ids, with every
     /// live id they were seen under. For a row deleted from a past meeting's
-    /// Assistant tab while its collector is still live.
-    pub fn delete_saved(&mut self, saved_ids: &[String]) {
-        let ids: Vec<String> = self
-            .entries
-            .iter()
-            .filter(|e| saved_ids.contains(&e.saved_id))
-            .flat_map(|e| e.ids.iter().cloned())
-            .collect();
+    /// Assistant tab while its collector is still live. Returns those live ids.
+    pub fn delete_saved(&mut self, saved_ids: &[String]) -> Vec<String> {
+        let ids = self.live_ids_of_saved(saved_ids);
         self.delete(&ids);
+        ids
     }
 
     pub fn is_empty(&self) -> bool {
@@ -471,20 +487,33 @@ pub async fn folder_path_of(pool: &SqlitePool, meeting_id: &str) -> Option<Strin
         .filter(|p| !p.trim().is_empty())
 }
 
-/// Saves the collector's items for `meeting_id`: replaces the meeting's rows
-/// and writes `assistant.json` into its folder. No items saves nothing. A
-/// folder write failure is logged and the rows stay.
-pub async fn save_for_meeting(
-    pool: &SqlitePool,
-    history: &HistoryHandle,
-    meeting_id: &str,
-) -> Result<u32, String> {
-    let (collector_opened, snapshot) = {
-        let c = history.lock().unwrap();
-        (c.opened_ms(), c.clone_entries())
-    };
+/// The collector as the save saw it, taken under the lock in one step.
+pub struct SaveSnapshot {
+    opened_ms: i64,
+    entries: HistoryCollector,
+}
+
+/// What the first half of a save wrote: the rows, and where and against what
+/// start `assistant.json` goes.
+pub struct WrittenRows {
+    items: Vec<AssistantItem>,
+    folder: Option<std::path::PathBuf>,
+    start_ms: i64,
+    brief: String,
+}
+
+/// Step 1 of a save: copy the collector.
+pub fn snapshot_for_save(history: &HistoryHandle) -> SaveSnapshot {
+    let c = history.lock().unwrap();
+    SaveSnapshot { opened_ms: c.opened_ms(), entries: c.clone_entries() }
+}
+
+/// Step 2 of a save: write the brief and replace the meeting's rows from the
+/// snapshot. Nothing in the collector changes. No items writes no rows.
+pub async fn write_rows(pool: &SqlitePool, meeting_id: &str, snapshot: &SaveSnapshot) -> Result<WrittenRows, String> {
     // The brief goes in first: it is kept even when no item was shown.
-    let brief = snapshot.brief().to_string();
+    let brief = snapshot.entries.brief().to_string();
+    let none = |brief: String| WrittenRows { items: Vec::new(), folder: None, start_ms: 0, brief };
     let has_row = AssistantMetaRepository::get(pool, meeting_id)
         .await
         .map_err(|e| e.to_string())?
@@ -494,29 +523,87 @@ pub async fn save_for_meeting(
             .await
             .map_err(|e| e.to_string())?;
     }
-    if snapshot.is_empty() {
-        return Ok(0);
+    if snapshot.entries.is_empty() {
+        return Ok(none(brief));
     }
     let folder = folder_path_of(pool, meeting_id).await.map(std::path::PathBuf::from);
     let start_ms = folder
         .as_deref()
         .and_then(recording_start_from_folder)
         .map(|d| d.timestamp_millis())
-        .unwrap_or(collector_opened);
-    let items = snapshot.finalize(start_ms);
+        .unwrap_or(snapshot.opened_ms);
+    let items = snapshot.entries.finalize(start_ms);
     if items.is_empty() {
-        return Ok(0);
+        return Ok(none(brief));
     }
-    let count = AssistantItemsRepository::replace_for_meeting(pool, meeting_id, &items)
+    AssistantItemsRepository::replace_for_meeting(pool, meeting_id, &items)
         .await
         .map_err(|e| e.to_string())?;
-    history.lock().unwrap().saved_meeting_id = Some(meeting_id.to_string());
-    if let Some(folder) = folder.filter(|f| f.is_dir()) {
-        if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &items, &brief) {
-            log::warn!("assistant: could not write assistant.json for {}: {}", meeting_id, e);
+    Ok(WrittenRows { items, folder, start_ms, brief })
+}
+
+/// Step 3 of a save. Deletes from the database every row written whose entry
+/// was deleted from the collector since the snapshot, and repeats until, with
+/// the collector locked, nothing written is stale: only then does the
+/// collector record the meeting (so a delete from here on reaches the rows
+/// itself). A collector reset meanwhile (a new session opened) is left alone:
+/// the new session never gets the old meeting's id. Then `assistant.json` is
+/// written from the rows that stayed. Returns how many rows stayed.
+pub async fn finish_save(
+    pool: &SqlitePool,
+    history: &HistoryHandle,
+    meeting_id: &str,
+    snapshot: &SaveSnapshot,
+    written: WrittenRows,
+) -> Result<u32, String> {
+    let WrittenRows { mut items, folder, start_ms, brief } = written;
+    let had_rows = !items.is_empty();
+    loop {
+        let stale: Vec<String> = {
+            let mut c = history.lock().unwrap();
+            if c.opened_ms() != snapshot.opened_ms {
+                break;
+            }
+            let stale: Vec<String> = items
+                .iter()
+                .filter(|i| !c.entries.iter().any(|e| e.saved_id == i.id))
+                .map(|i| i.id.clone())
+                .collect();
+            if stale.is_empty() {
+                c.saved_meeting_id = Some(meeting_id.to_string());
+                break;
+            }
+            stale
+        };
+        AssistantItemsRepository::delete_items(pool, meeting_id, &stale)
+            .await
+            .map_err(|e| e.to_string())?;
+        items.retain(|i| !stale.contains(&i.id));
+    }
+    if had_rows {
+        if let Some(folder) = folder.filter(|f| f.is_dir()) {
+            if items.is_empty() {
+                remove_folder_file(&folder);
+            } else if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &items, &brief) {
+                log::warn!("assistant: could not write assistant.json for {}: {}", meeting_id, e);
+            }
         }
     }
-    Ok(count)
+    Ok(items.len() as u32)
+}
+
+/// Saves the collector's items for `meeting_id`: replaces the meeting's rows
+/// and writes `assistant.json` into its folder. No items saves no rows, but
+/// the meeting is still recorded on the collector. A folder write failure is
+/// logged and the rows stay.
+pub async fn save_for_meeting(
+    pool: &SqlitePool,
+    history: &HistoryHandle,
+    meeting_id: &str,
+) -> Result<u32, String> {
+    let snapshot = snapshot_for_save(history);
+    let written = write_rows(pool, meeting_id, &snapshot).await?;
+    finish_save(pool, history, meeting_id, &snapshot, written).await
 }
 
 /// Deletes the meeting's rows and its `assistant.json`; returns the rows deleted.
@@ -1277,6 +1364,93 @@ mod tests {
         let after: Vec<_> =
             AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap().into_iter().map(|i| i.question).collect();
         assert_eq!(after, vec!["Two?"]);
+    }
+
+    async fn row_questions(pool: &SqlitePool, meeting: &str) -> Vec<String> {
+        AssistantItemsRepository::list_for_meeting(pool, meeting)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.question)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn an_item_deleted_while_the_save_runs_is_not_resurrected() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        record_asks(&h, &asks_out(vec![ask("a1", "One?")], vec![ask("f1", "Two?")], vec![]));
+
+        let snapshot = snapshot_for_save(&h);
+        // Joseph deletes One? while the save is between its two halves.
+        h.lock().unwrap().delete(&["a1".to_string()]);
+        let written = write_rows(&pool, "m1", &snapshot).await.unwrap();
+        assert_eq!(row_questions(&pool, "m1").await.len(), 2, "the stale snapshot was written");
+        assert_eq!(finish_save(&pool, &h, "m1", &snapshot, written).await.unwrap(), 1);
+
+        assert_eq!(row_questions(&pool, "m1").await, vec!["Two?"]);
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
+        assert_eq!(file["items"].as_array().unwrap().len(), 1);
+        assert_eq!(file["items"][0]["question"], "Two?");
+        assert_eq!(h.lock().unwrap().saved_meeting_id(), Some("m1".to_string()));
+    }
+
+    #[tokio::test]
+    async fn every_item_deleted_while_the_save_runs_leaves_no_rows_and_no_file() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        record_asks(&h, &asks_out(vec![ask("a1", "One?")], vec![], vec![]));
+        let snapshot = snapshot_for_save(&h);
+        h.lock().unwrap().delete(&["a1".to_string()]);
+        let written = write_rows(&pool, "m1", &snapshot).await.unwrap();
+        assert_eq!(finish_save(&pool, &h, "m1", &snapshot, written).await.unwrap(), 0);
+        assert!(row_questions(&pool, "m1").await.is_empty());
+        assert!(!dir.path().join("assistant.json").exists());
+    }
+
+    #[tokio::test]
+    async fn a_session_opened_during_the_save_never_gets_the_old_meeting() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(1_000);
+        record_asks(&h, &asks_out(vec![ask("a1", "One?")], vec![], vec![]));
+        let snapshot = snapshot_for_save(&h);
+        let written = write_rows(&pool, "m1", &snapshot).await.unwrap();
+        // recording-started: the next meeting's collector opens mid-save.
+        h.lock().unwrap().reset(9_000);
+        assert_eq!(finish_save(&pool, &h, "m1", &snapshot, written).await.unwrap(), 1);
+        assert_eq!(h.lock().unwrap().saved_meeting_id(), None);
+        assert!(h.lock().unwrap().is_empty());
+        assert_eq!(row_questions(&pool, "m1").await, vec!["One?"], "the old meeting keeps its rows");
+    }
+
+    #[tokio::test]
+    async fn a_meeting_with_no_items_still_records_its_id() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(1_000);
+        h.lock().unwrap().set_brief("Plan the move");
+        assert_eq!(save_for_meeting(&pool, &h, "m1").await.unwrap(), 0);
+        assert_eq!(h.lock().unwrap().saved_meeting_id(), Some("m1".to_string()));
+        assert_eq!(AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap().brief, "Plan the move");
+    }
+
+    #[test]
+    fn finding_saved_ids_removes_nothing() {
+        let c = open_two();
+        let found = c.saved_ids_of(&["a1".to_string()]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(c.finalize(0).len(), 2);
+        assert!(!c.is_deleted("a1"));
     }
 
     fn row(id: &str, call_time: f64) -> AssistantItem {
