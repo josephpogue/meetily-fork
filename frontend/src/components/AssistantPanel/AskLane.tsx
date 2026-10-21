@@ -5,10 +5,11 @@ import { Check, CircleHelp, Loader2, RefreshCw, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useAssistant } from '@/contexts/AssistantContext';
-import { AssistantAskItem } from '@/types';
+import { AssistantAnsweredItem, AssistantAsks, AssistantAskItem } from '@/types';
 import { answeredHowLine, appendBriefAnswer, formatOpenStamp, newAskIds } from '@/lib/ask-next';
 import { cn } from '@/lib/utils';
 import { KindChip, LANE_TONE } from './KindChip';
+import { ItemCheckbox, LaneAll, useRowSelection, useSelection } from './selection';
 
 // How often the "Checked 12s ago" stamp re-renders.
 const STAMP_TICK_MS = 5000;
@@ -16,7 +17,10 @@ const STAMP_TICK_MS = 5000;
 const CHANGED_HIGHLIGHT_MS = 2500;
 
 const DISMISS_CLASS =
-  'mt-0.5 shrink-0 rounded text-gray-300 opacity-0 hover:text-gray-500 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-violet-400 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-50';
+  'mt-0.5 shrink-0 rounded text-gray-300 opacity-0 hover:text-gray-500 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 group-hover:opacity-100';
+
+// The number or tick circle's slot; a checkbox takes it in select mode so the text never moves.
+const SLOT = 'mt-0.5 grid h-5 w-5 shrink-0 place-items-center';
 
 /**
  * The Ask lane: open gap questions, For-you questions, then every answered
@@ -24,8 +28,18 @@ const DISMISS_CLASS =
  * whole; nothing in it is clamped. Refreshes when someone finishes speaking,
  * on the Refresh button, and on Option-Q. The last lists stay after the call.
  */
+/**
+ * The question ids the Ask lane renders, for Select all and the counts. When the
+ * lane says "Questions unavailable" instead of its open list, those open
+ * questions are hidden and so are left out; For you and answered always show.
+ */
+export function askLaneIds(asks: AssistantAsks): string[] {
+  const open = asks.state === 'unavailable' ? [] : asks.asks;
+  return [...open, ...asks.forYou, ...asks.answered].map((item) => item.id);
+}
+
 export function AskLane({ disabled }: { disabled: boolean }) {
-  const { status, asks, refreshAsks, dismissAsk, answerAsk, setBrief } = useAssistant();
+  const { status, asks, refreshAsks, deleteItems, answerAsk, setBrief } = useAssistant();
   const [now, setNow] = useState(() => Date.now());
 
   useEffect(() => {
@@ -68,7 +82,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
   if (!status.sessionOpen && !hasItems && !hasAnswered) {
     return (
       <section aria-label="Ask" className="flex min-h-0 min-w-0 flex-1 flex-col">
-        <LaneHeader openCount={0} answeredCount={0} thinking={false} refreshOff onRefresh={refreshAsks} />
+        <LaneHeader openCount={0} answeredCount={0} thinking={false} refreshOff onRefresh={refreshAsks} allIds={[]} />
         <p className="px-3 py-2 text-xs text-gray-400">Questions appear once the call starts.</p>
       </section>
     );
@@ -101,6 +115,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
         thinking={thinking}
         refreshOff={disabled || asks.state === 'unavailable'}
         onRefresh={refreshAsks}
+        allIds={askLaneIds(asks)}
       />
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
         <div className="flex items-center justify-between gap-2 py-2">
@@ -125,15 +140,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
         ) : (
           <ol className="flex flex-col">
             {asks.asks.map((item, i) => (
-              <li key={item.id} className="group flex items-start gap-2.5 border-t border-gray-100 py-2 first:border-t-0">
-                <span
-                  className={cn(
-                    'mt-px flex h-5 w-5 shrink-0 items-center justify-center rounded-full text-[11px] font-bold ring-1 ring-inset',
-                    'bg-violet-50 text-violet-700 ring-violet-200'
-                  )}
-                >
-                  {i + 1}
-                </span>
+              <OpenRow key={item.id} item={item} index={i} onDelete={() => void deleteItems([item.id])}>
                 <div
                   className={cn(
                     'min-w-0 flex-1 rounded transition-colors duration-1000',
@@ -148,8 +155,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
                   </p>
                   {item.why && <p className="mt-0.5 break-words text-xs leading-snug text-gray-500">{item.why}</p>}
                 </div>
-                <DismissButton question={item.question} disabled={disabled} onClick={() => dismissAsk(item.id)} />
-              </li>
+              </OpenRow>
             ))}
           </ol>
         )}
@@ -165,7 +171,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
                   changed={isChanged(item.id)}
                   disabled={disabled}
                   onAnswer={(answer) => answerForYou(item, answer)}
-                  onDismiss={() => dismissAsk(item.id)}
+                  onDelete={() => void deleteItems([item.id])}
                 />
               ))}
             </ul>
@@ -182,21 +188,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
         {hasAnswered ? (
           <ul className="flex flex-col">
             {asks.answered.map((item) => (
-              <li key={item.id} className="flex items-start gap-2.5 border-t border-gray-100 py-2 first:border-t-0">
-                <span
-                  className={cn(
-                    'mt-px flex h-5 w-5 shrink-0 items-center justify-center rounded-full ring-1 ring-inset',
-                    'bg-emerald-50 text-emerald-700 ring-emerald-200'
-                  )}
-                >
-                  <Check className="h-3 w-3" aria-hidden="true" />
-                </span>
-                <div className="min-w-0 flex-1">
-                  <p className="break-words text-[13px] font-semibold leading-snug text-gray-500">{item.question}</p>
-                  <p className="mt-0.5 break-words text-sm leading-snug text-gray-900">{item.answer}</p>
-                  <p className="mt-0.5 text-xs text-gray-500">{answeredHowLine(item.how, item.at)}</p>
-                </div>
-              </li>
+              <AnsweredRow key={item.id} item={item} onDelete={() => void deleteItems([item.id])} />
             ))}
           </ul>
         ) : (
@@ -213,13 +205,17 @@ function LaneHeader({
   thinking,
   refreshOff,
   onRefresh,
+  allIds,
 }: {
   openCount: number;
   answeredCount: number;
   thinking: boolean;
   refreshOff: boolean;
   onRefresh: () => void;
+  /** Every question in the lane: open, For you and answered. */
+  allIds: string[];
 }) {
+  const { selecting } = useSelection();
   return (
     <header className="flex shrink-0 items-center gap-2 border-b border-gray-100 px-3 py-2">
       <span className={cn('flex h-6 w-6 items-center justify-center rounded-md', LANE_TONE.ask.badge)}>
@@ -229,33 +225,98 @@ function LaneHeader({
       <span className="flex-1 text-xs tabular-nums text-gray-500">
         {`${openCount} open, ${answeredCount} answered`}
       </span>
-      <Button
-        variant="ghost"
-        size="icon"
-        className="h-6 w-6"
-        onClick={onRefresh}
-        disabled={refreshOff}
-        title="Refresh (Option-Q)"
-        aria-label="Refresh questions"
-      >
-        {thinking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
-      </Button>
+      {selecting ? (
+        <LaneAll ids={allIds} label="Select all in Ask" />
+      ) : (
+        <Button
+          variant="ghost"
+          size="icon"
+          className="h-6 w-6"
+          onClick={onRefresh}
+          disabled={refreshOff}
+          title="Refresh (Option-Q)"
+          aria-label="Refresh questions"
+        >
+          {thinking ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <RefreshCw className="h-3.5 w-3.5" />}
+        </Button>
+      )}
     </header>
   );
 }
 
-function DismissButton({ question, disabled, onClick }: { question: string; disabled: boolean; onClick: () => void }) {
+function DismissButton({ label, ring, onClick }: { label: string; ring: string; onClick: () => void }) {
   return (
-    <button
-      type="button"
-      onClick={onClick}
-      title="Dismiss"
-      aria-label={`Dismiss ${question}`}
-      disabled={disabled}
-      className={DISMISS_CLASS}
-    >
+    <button type="button" onClick={onClick} title="Dismiss" aria-label={label} className={cn(DISMISS_CLASS, ring)}>
       <X className="h-3.5 w-3.5" />
     </button>
+  );
+}
+
+/** One open question: its number (a checkbox in select mode), the text, and the x. */
+function OpenRow({
+  item,
+  index,
+  onDelete,
+  children,
+}: {
+  item: AssistantAskItem;
+  index: number;
+  onDelete: () => void;
+  children: React.ReactNode;
+}) {
+  const row = useRowSelection(item.id);
+  return (
+    <li
+      {...row.rowProps}
+      className={cn('group flex items-start gap-2.5 border-t border-gray-100 py-2 first:border-t-0', row.rowClass)}
+    >
+      {row.selecting ? (
+        <span className={SLOT}>
+          <ItemCheckbox id={item.id} label={`Select question: ${item.question}`} />
+        </span>
+      ) : (
+        <span className="mt-px flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-violet-50 text-[11px] font-bold text-violet-700 ring-1 ring-inset ring-violet-200">
+          {index + 1}
+        </span>
+      )}
+      {children}
+      {!row.selecting && (
+        <DismissButton label={`Dismiss ${item.question}`} ring="focus-visible:ring-violet-400" onClick={onDelete} />
+      )}
+    </li>
+  );
+}
+
+/** One answered question with its answer; the circle holds a tick, or a checkbox in select mode. */
+function AnsweredRow({ item, onDelete }: { item: AssistantAnsweredItem; onDelete: () => void }) {
+  const row = useRowSelection(item.id);
+  return (
+    <li
+      {...row.rowProps}
+      className={cn('group flex items-start gap-2.5 border-t border-gray-100 py-2 first:border-t-0', row.rowClass)}
+    >
+      {row.selecting ? (
+        <span className={SLOT}>
+          <ItemCheckbox id={item.id} label={`Select question: ${item.question}`} />
+        </span>
+      ) : (
+        <span className="mt-px flex h-5 w-5 shrink-0 items-center justify-center rounded-full bg-emerald-50 text-emerald-700 ring-1 ring-inset ring-emerald-200">
+          <Check className="h-3 w-3" aria-hidden="true" />
+        </span>
+      )}
+      <div className="min-w-0 flex-1">
+        <p className="break-words text-[13px] font-semibold leading-snug text-gray-500">{item.question}</p>
+        <p className="mt-0.5 break-words text-sm leading-snug text-gray-900">{item.answer}</p>
+        <p className="mt-0.5 text-xs text-gray-500">{answeredHowLine(item.how, item.at)}</p>
+      </div>
+      {!row.selecting && (
+        <DismissButton
+          label={`Dismiss answered: ${item.question}`}
+          ring="focus-visible:ring-emerald-400"
+          onClick={onDelete}
+        />
+      )}
+    </li>
   );
 }
 
@@ -264,15 +325,16 @@ function ForYouItem({
   changed,
   disabled,
   onAnswer,
-  onDismiss,
+  onDelete,
 }: {
   item: AssistantAskItem;
   changed: boolean;
   disabled: boolean;
   onAnswer: (answer: string) => void;
-  onDismiss: () => void;
+  onDelete: () => void;
 }) {
   const [value, setValue] = useState('');
+  const row = useRowSelection(item.id);
 
   const submit = () => {
     if (!value.trim()) return;
@@ -288,8 +350,13 @@ function ForYouItem({
   };
 
   return (
-    <li className="group flex flex-col gap-1.5">
+    <li {...row.rowProps} className={cn('group flex flex-col gap-1.5', row.rowClass)}>
       <div className="flex items-start gap-2">
+        {row.selecting && (
+          <span className={SLOT}>
+            <ItemCheckbox id={item.id} label={`Select question: ${item.question}`} />
+          </span>
+        )}
         <p
           className={cn(
             'min-w-0 flex-1 break-words rounded text-sm text-gray-900 transition-colors duration-1000',
@@ -298,31 +365,35 @@ function ForYouItem({
         >
           {item.question}
         </p>
-        <DismissButton question={item.question} disabled={disabled} onClick={onDismiss} />
+        {!row.selecting && (
+          <DismissButton label={`Dismiss ${item.question}`} ring="focus-visible:ring-violet-400" onClick={onDelete} />
+        )}
       </div>
-      <div className="flex items-center gap-1.5">
-        <Input
-          aria-label={`Answer: ${item.question}`}
-          disabled={disabled}
-          value={value}
-          onChange={(e) => setValue(e.target.value)}
-          onKeyDown={handleKeyDown}
-          placeholder="Answer, then Enter"
-          className="h-7 min-w-0 flex-1 bg-white text-xs"
-        />
-        <Button
-          type="button"
-          variant="outline"
-          size="icon"
-          aria-label={`Save answer: ${item.question}`}
-          title="Save answer"
-          disabled={disabled || !value.trim()}
-          onClick={submit}
-          className="h-7 w-7 shrink-0"
-        >
-          <Check className="h-3.5 w-3.5" aria-hidden="true" />
-        </Button>
-      </div>
+      {!row.selecting && (
+        <div className="flex items-center gap-1.5">
+          <Input
+            aria-label={`Answer: ${item.question}`}
+            disabled={disabled}
+            value={value}
+            onChange={(e) => setValue(e.target.value)}
+            onKeyDown={handleKeyDown}
+            placeholder="Answer, then Enter"
+            className="h-7 min-w-0 flex-1 bg-white text-xs"
+          />
+          <Button
+            type="button"
+            variant="outline"
+            size="icon"
+            aria-label={`Save answer: ${item.question}`}
+            title="Save answer"
+            disabled={disabled || !value.trim()}
+            onClick={submit}
+            className="h-7 w-7 shrink-0"
+          >
+            <Check className="h-3.5 w-3.5" aria-hidden="true" />
+          </Button>
+        </div>
+      )}
     </li>
   );
 }

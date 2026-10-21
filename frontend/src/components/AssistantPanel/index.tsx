@@ -1,25 +1,29 @@
 'use client';
 
-import { useCallback, useEffect, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import {
   AlertCircle,
   ChevronsLeft,
   ChevronsRight,
   History,
+  ListChecks,
   MessageCircleQuestion,
   Sparkles,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Switch } from '@/components/ui/switch';
+import { cn } from '@/lib/utils';
 import { useAssistant } from '@/contexts/AssistantContext';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import { AskBox } from './AskBox';
 import { NoteBar } from './NoteBar';
 import { BriefBar } from './BriefBar';
 import { BriefFull } from './BriefFull';
+import { SelectBar } from './SelectBar';
+import { SelectionContext, type SelectionValue } from './selection';
 import { SayLane } from './SayLane';
-import { AskLane } from './AskLane';
+import { AskLane, askLaneIds } from './AskLane';
 import { TodoDock } from './TodoDock';
 import { ScreenRecordingLine } from './ScreenRecordingLine';
 import {
@@ -53,6 +57,8 @@ export function AssistantPanel() {
   const {
     status,
     cards,
+    asks,
+    deleteItems,
     note,
     voice,
     setEnabled,
@@ -224,6 +230,110 @@ export function AssistantPanel() {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, [voice.state, voiceCancel]);
 
+  // Select mode: Joseph picks items, then deletes them. `picked` holds live ids
+  // and may name items that have since gone; only ids still shown count.
+  const lanesShown = status.enabled && status.claudeOk;
+  const [selecting, setSelecting] = useState(false);
+  const [confirming, setConfirming] = useState(false);
+  // The number being deleted while the command runs, else null.
+  const [deletingCount, setDeletingCount] = useState<number | null>(null);
+  const [picked, setPicked] = useState<ReadonlySet<string>>(() => new Set());
+  const selectButton = useRef<HTMLButtonElement>(null);
+
+  const allIds = useMemo(
+    () => [...cards.map(item => item.id), ...askLaneIds(asks), ...(asks.todos ?? []).map(item => item.id)],
+    [cards, asks]
+  );
+  const selectedIds = useMemo(() => allIds.filter(id => picked.has(id)), [allIds, picked]);
+  const selectedSet = useMemo(() => new Set(selectedIds), [selectedIds]);
+
+  const selection = useMemo<SelectionValue>(
+    () => ({
+      selecting,
+      isSelected: id => selectedSet.has(id),
+      toggle: id =>
+        setPicked(prev => {
+          const next = new Set(prev);
+          if (!next.delete(id)) next.add(id);
+          return next;
+        }),
+      setMany: (ids, on) =>
+        setPicked(prev => {
+          const next = new Set(prev);
+          for (const id of ids) {
+            if (on) next.add(id);
+            else next.delete(id);
+          }
+          return next;
+        }),
+    }),
+    [selecting, selectedSet]
+  );
+
+  const leaveSelecting = useCallback(() => {
+    setSelecting(false);
+    setConfirming(false);
+    setPicked(new Set());
+  }, []);
+  const toggleSelecting = () => {
+    if (selecting) {
+      leaveSelecting();
+      return;
+    }
+    // The full brief takes the Ask column; select mode needs it for the lane.
+    setBriefOpen(false);
+    setBriefEditing(false);
+    setSelecting(true);
+  };
+
+  // Focus returns to the header Select button when select mode ends.
+  const wasSelecting = useRef(false);
+  useEffect(() => {
+    if (!selecting && wasSelecting.current) selectButton.current?.focus?.();
+    wasSelecting.current = selecting;
+  }, [selecting]);
+
+  // No lanes to pick from (assistant off, Claude missing): select mode ends.
+  useEffect(() => {
+    if (!lanesShown && selecting) leaveSelecting();
+  }, [lanesShown, selecting, leaveSelecting]);
+
+  // Nothing left to delete under an open confirm (everything went away).
+  useEffect(() => {
+    if (confirming && deletingCount === null && selectedIds.length === 0) setConfirming(false);
+  }, [confirming, deletingCount, selectedIds.length]);
+
+  // Esc while confirming is Keep; Esc while selecting leaves select mode. The
+  // capture-phase listener marks it handled, so the To do drawer (which skips a
+  // handled Esc) stays open. While voice capture is listening, Esc is the capture's.
+  useEffect(() => {
+    if (!selecting || voice.state === 'listening') return;
+    const handleKeyDown = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return;
+      e.preventDefault();
+      if (deletingCount !== null) return;
+      if (confirming) setConfirming(false);
+      else leaveSelecting();
+    };
+    window.addEventListener('keydown', handleKeyDown, true);
+    return () => window.removeEventListener('keydown', handleKeyDown, true);
+  }, [selecting, confirming, deletingCount, voice.state, leaveSelecting]);
+
+  const confirmDelete = async () => {
+    const ids = selectedIds;
+    setDeletingCount(ids.length);
+    const ok = await deleteItems(ids);
+    setDeletingCount(null);
+    if (ok) {
+      leaveSelecting();
+      showQuietError(`Deleted ${ids.length} ${ids.length === 1 ? 'item' : 'items'}.`);
+    } else {
+      // The items are back and still picked.
+      setConfirming(false);
+      showQuietError('Could not delete. Try again.');
+    }
+  };
+
   if (collapsed) {
     return (
       <div ref={panelRef} className="flex w-10 flex-col items-center gap-3 border-l border-gray-200 bg-white py-3">
@@ -313,6 +423,21 @@ export function AssistantPanel() {
           </button>
         </div>
         <div className="flex items-center gap-2">
+          <button
+            ref={selectButton}
+            type="button"
+            onClick={toggleSelecting}
+            disabled={!selecting && (!lanesShown || allIds.length === 0)}
+            aria-pressed={selecting}
+            aria-label="Select items"
+            className={cn(
+              'inline-flex h-7 items-center gap-1.5 rounded-full px-2.5 text-[12.5px] font-semibold focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-slate-500 disabled:opacity-40',
+              selecting ? 'bg-slate-800 text-white' : 'text-gray-600 hover:bg-gray-100 hover:text-gray-900'
+            )}
+          >
+            <ListChecks className="h-3.5 w-3.5" aria-hidden="true" />
+            Select
+          </button>
           <Switch checked={status.enabled} onCheckedChange={setEnabled} aria-label="Assistant on or off" />
           <Button variant="ghost" size="icon" onClick={() => setCollapsed(true)} title="Collapse">
             <ChevronsRight className="h-4 w-4" />
@@ -323,60 +448,83 @@ export function AssistantPanel() {
       <ScreenRecordingLine enabled={status.enabled} isRecording={isRecording} />
 
       {/* Meeting brief preview, editable before and during the call */}
-      <BriefBar
-        open={briefOpen}
-        onToggleOpen={toggleBrief}
-        onEdit={() => openBrief(true)}
-      />
+      {selecting ? (
+        <SelectBar
+          total={allIds.length}
+          count={deletingCount ?? selectedIds.length}
+          confirming={confirming}
+          busy={deletingCount !== null}
+          onToggleAll={() => selection.setMany(allIds, selectedIds.length !== allIds.length)}
+          onDelete={() => setConfirming(true)}
+          onCancel={leaveSelecting}
+          onConfirm={() => void confirmDelete()}
+          onKeep={() => setConfirming(false)}
+        />
+      ) : (
+        <BriefBar
+          open={briefOpen}
+          onToggleOpen={toggleBrief}
+          onEdit={() => openBrief(true)}
+        />
+      )}
 
       {/* Body: empty states or the two lanes */}
-      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
-        {briefOpen && (!status.enabled || !status.claudeOk) ? (
-          // The brief stays usable while the assistant is off or Claude is
-          // missing; it takes the place of the empty-state message.
-          <BriefFull
-            editing={briefEditing}
-            onEdit={() => setBriefEditing(true)}
-            onSaved={() => setBriefEditing(false)}
-          />
-        ) : !status.enabled ? (
-          <EmptyState
-            icon={<Sparkles className="h-5 w-5 text-gray-400" />}
-            message="Assistant is off."
-            action={<Button size="sm" onClick={() => setEnabled(true)}>Enable</Button>}
-          />
-        ) : !status.claudeOk ? (
-          <EmptyState
-            icon={<AlertCircle className="h-5 w-5 text-amber-500" />}
-            message="Claude CLI isn't available."
-            action={
-              <Button size="sm" variant="outline" onClick={() => router.push('/settings')}>
-                Open Settings
-              </Button>
-            }
-          />
-        ) : (
-          <>
-            <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
-              <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
-                <SayLane />
+      <SelectionContext.Provider value={selection}>
+        <div
+          className={cn(
+            'relative flex min-h-0 flex-1 flex-col overflow-hidden',
+            confirming && 'pointer-events-none opacity-50'
+          )}
+          // The selection cannot change under the question.
+          {...(confirming ? ({ inert: '' } as object) : {})}
+        >
+          {briefOpen && (!status.enabled || !status.claudeOk) ? (
+            // The brief stays usable while the assistant is off or Claude is
+            // missing; it takes the place of the empty-state message.
+            <BriefFull
+              editing={briefEditing}
+              onEdit={() => setBriefEditing(true)}
+              onSaved={() => setBriefEditing(false)}
+            />
+          ) : !status.enabled ? (
+            <EmptyState
+              icon={<Sparkles className="h-5 w-5 text-gray-400" />}
+              message="Assistant is off."
+              action={<Button size="sm" onClick={() => setEnabled(true)}>Enable</Button>}
+            />
+          ) : !status.claudeOk ? (
+            <EmptyState
+              icon={<AlertCircle className="h-5 w-5 text-amber-500" />}
+              message="Claude CLI isn't available."
+              action={
+                <Button size="sm" variant="outline" onClick={() => router.push('/settings')}>
+                  Open Settings
+                </Button>
+              }
+            />
+          ) : (
+            <>
+              <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
+                <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+                  <SayLane />
+                </div>
+                <div className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-gray-200">
+                  {briefOpen ? (
+                    <BriefFull
+                      editing={briefEditing}
+                      onEdit={() => setBriefEditing(true)}
+                      onSaved={() => setBriefEditing(false)}
+                    />
+                  ) : (
+                    <AskLane disabled={actionsDisabled} />
+                  )}
+                </div>
               </div>
-              <div className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-gray-200">
-                {briefOpen ? (
-                  <BriefFull
-                    editing={briefEditing}
-                    onEdit={() => setBriefEditing(true)}
-                    onSaved={() => setBriefEditing(false)}
-                  />
-                ) : (
-                  <AskLane disabled={actionsDisabled} />
-                )}
-              </div>
-            </div>
-            <TodoDock disabled={actionsDisabled} />
-          </>
-        )}
-      </div>
+              <TodoDock />
+            </>
+          )}
+        </div>
+      </SelectionContext.Provider>
 
       {(status.enabled && hasRecorded && !isRecording) || note.state !== 'idle' ? <NoteBar /> : null}
 

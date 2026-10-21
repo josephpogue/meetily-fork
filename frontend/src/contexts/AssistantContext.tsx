@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AssistantCard, AssistantStatus, AssistantVoice, AssistantNote, AssistantAsks } from '@/types';
 import { assistantService } from '@/services/assistantService';
 import { reconcileBrief, type BriefState } from '@/lib/ask-next';
@@ -22,6 +22,9 @@ const DEFAULT_STATUS: AssistantStatus = {
   lastError: null,
   lastErrorSeq: 0,
 };
+
+const NO_IDS: ReadonlySet<string> = new Set();
+const INITIAL_CARDS: AssistantCard[] = [];
 
 const DEFAULT_VOICE: AssistantVoice = { state: 'off', heard: '' };
 const DEFAULT_NOTE: AssistantNote = { state: 'idle', markdown: '', error: null };
@@ -50,6 +53,12 @@ interface AssistantContextType {
   /** Add a typed to-do. Resolves with null on success, or the command's error message. */
   addTodo: (text: string) => Promise<string | null>;
   dismissTodo: (id: string) => Promise<void>;
+  /**
+   * Delete items by their live ids. They leave every list at once and stay out
+   * for the session, whatever the backend keeps sending. Resolves true when the
+   * backend deleted them; on failure the items come back and it resolves false.
+   */
+  deleteItems: (ids: string[]) => Promise<boolean>;
   /** Joseph's answer to a For-you question; the backend moves it to the answered list. */
   answerAsk: (id: string, answer: string) => Promise<void>;
   ask: (text: string) => Promise<void>;
@@ -62,7 +71,15 @@ interface AssistantContextType {
   voiceFinish: () => Promise<void>;
   voiceCancel: () => Promise<void>;
   draftNote: () => Promise<void>;
-  saveNote: () => Promise<void>;
+  /** Files the drafted note under the chosen vault project slug, or null for none. */
+  saveNote: (project: string | null) => Promise<void>;
+  /** The project the note was last filed under: undefined before a save, null for none. */
+  savedNoteProject: string | null | undefined;
+  /** Why the last Save failed, or null. The note stays ready so Joseph can pick again. */
+  saveNoteError: string | null;
+  /** The vault's project slugs, or null when they could not be read. */
+  listVaultProjects: () => Promise<string[] | null>;
+  suggestVaultProject: () => Promise<string | null>;
   discardNote: () => Promise<void>;
   setBrief: (text: string) => Promise<void>;
   /** The brief box's text, kept here so it survives the box unmounting. */
@@ -86,19 +103,57 @@ export const useAssistant = () => {
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AssistantStatus>(DEFAULT_STATUS);
-  const [cards, setCards] = useState<AssistantCard[]>([]);
   const [voice, setVoice] = useState<AssistantVoice>(DEFAULT_VOICE);
   const [note, setNote] = useState<AssistantNote>(DEFAULT_NOTE);
-  const [asks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
+  const [savedNoteProject, setSavedNoteProject] = useState<string | null | undefined>(undefined);
+  const [saveNoteError, setSaveNoteError] = useState<string | null>(null);
+  const [rawAsks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
+  const [rawCards, setCards] = useState<AssistantCard[]>(INITIAL_CARDS);
+  // Ids Joseph deleted this session. The backend keeps sending some of them (an
+  // answered question stays in the lane's snapshots, a drafting card is emitted
+  // again when checked), so every list is filtered through this set.
+  const [deletedIds, setDeletedIds] = useState<ReadonlySet<string>>(NO_IDS);
   const [brief, setBriefState] = useState<BriefState>({ draft: DEFAULT_ASKS.brief, saved: DEFAULT_ASKS.brief });
   const [backendBrief, setBackendBrief] = useState(DEFAULT_ASKS.brief);
 
   // Take the backend's latest copy of the brief as the saved baseline; the
   // draft adopts it, or absorbs an appended For-you answer, per reconcileBrief.
-  if (asks.brief !== backendBrief) {
-    setBackendBrief(asks.brief);
-    setBriefState(reconcileBrief(brief, asks.brief));
+  if (rawAsks.brief !== backendBrief) {
+    setBackendBrief(rawAsks.brief);
+    setBriefState(reconcileBrief(brief, rawAsks.brief));
   }
+
+  const cards = useMemo(
+    () => (deletedIds.size === 0 ? rawCards : rawCards.filter(c => !deletedIds.has(c.id))),
+    [rawCards, deletedIds]
+  );
+  const asks = useMemo<AssistantAsks>(() => {
+    if (deletedIds.size === 0) return rawAsks;
+    const keep = <T extends { id: string }>(list: T[]) => list.filter(item => !deletedIds.has(item.id));
+    return {
+      ...rawAsks,
+      asks: keep(rawAsks.asks),
+      forYou: keep(rawAsks.forYou),
+      answered: keep(rawAsks.answered),
+      // An older payload has no todos field: leave it as it came.
+      todos: rawAsks.todos ? keep(rawAsks.todos) : rawAsks.todos,
+    };
+  }, [rawAsks, deletedIds]);
+
+  // A new recording starts a new session with new ids, and nothing from the
+  // last call comes with it: its cards, questions and to-dos leave, and the
+  // deleted set resets. After Stop they stay (Joseph deletes and drafts the
+  // note then); only the next session's start clears them. Done in the status
+  // handler, not an effect, so an event that follows the status in the same
+  // batch lands on the cleared lists. The brief is not reset here: the backend
+  // sends the new call's brief (empty unless one was typed after Stop) and the
+  // draft follows it.
+  const sessionWasOpen = useRef(false);
+  const startNewSession = useCallback(() => {
+    setCards(INITIAL_CARDS);
+    setAsks(prev => ({ ...DEFAULT_ASKS, brief: prev.brief }));
+    setDeletedIds(NO_IDS);
+  }, []);
 
   // Initial state fetch. A missing backend command (Rust module not built yet,
   // or the assistant disabled) leaves status at its off-by-default value.
@@ -106,6 +161,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     const loadInitialState = async () => {
       try {
         const initial = await assistantService.getState();
+        sessionWasOpen.current = initial.sessionOpen;
         setStatus(initial);
       } catch (error) {
         console.warn('[AssistantContext] assistant_get_state unavailable, using defaults:', error);
@@ -136,6 +192,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         unsubscribers.push(unlistenCard);
 
         const unlistenStatus = await assistantService.onStatus((next) => {
+          if (next.sessionOpen && !sessionWasOpen.current) startNewSession();
+          sessionWasOpen.current = next.sessionOpen;
           setStatus(next);
         });
         unsubscribers.push(unlistenStatus);
@@ -147,6 +205,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
         const unlistenNote = await assistantService.onNote((next) => {
           setNote(next);
+          // A new draft is a new note: it shows neither the last note's saved
+          // project nor the last save's error.
+          if (next.state === 'drafting') {
+            setSavedNoteProject(undefined);
+            setSaveNoteError(null);
+          }
         });
         unsubscribers.push(unlistenNote);
 
@@ -154,6 +218,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           setAsks(next);
         });
         unsubscribers.push(unlistenAsks);
+
+        // Deletes made on the Assistant tab: the same live ids leave this panel.
+        const unlistenDeleted = await assistantService.onItemsDeleted(({ ids }) => {
+          setDeletedIds(prev => new Set([...prev, ...ids]));
+        });
+        unsubscribers.push(unlistenDeleted);
 
         console.log('[AssistantContext] Event listeners set up successfully');
       } catch (error) {
@@ -167,7 +237,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       console.log('[AssistantContext] Cleaning up event listeners');
       unsubscribers.forEach(unsub => unsub());
     };
-  }, []);
+  }, [startNewSession]);
 
   const ask = useCallback(async (text: string) => {
     try {
@@ -252,11 +322,32 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const saveNote = useCallback(async () => {
+  const saveNote = useCallback(async (project: string | null) => {
+    setSaveNoteError(null);
     try {
-      await assistantService.saveNote();
+      const saved = await assistantService.saveNote(project);
+      setSavedNoteProject(saved.project);
     } catch (error) {
       console.error('[AssistantContext] assistant_save_note failed:', error);
+      setSaveNoteError(typeof error === 'string' ? error : error instanceof Error ? error.message : 'Unknown error.');
+    }
+  }, []);
+
+  const listVaultProjects = useCallback(async () => {
+    try {
+      return await assistantService.listVaultProjects();
+    } catch (error) {
+      console.error('[AssistantContext] assistant_list_vault_projects failed:', error);
+      return null;
+    }
+  }, []);
+
+  const suggestVaultProject = useCallback(async () => {
+    try {
+      return await assistantService.suggestVaultProject();
+    } catch (error) {
+      console.error('[AssistantContext] assistant_suggest_vault_project failed:', error);
+      return null;
     }
   }, []);
 
@@ -322,6 +413,20 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const deleteItems = useCallback(async (ids: string[]): Promise<boolean> => {
+    if (ids.length === 0) return true;
+    // Gone at once; a failed command brings them back below.
+    setDeletedIds(prev => new Set([...prev, ...ids]));
+    try {
+      await assistantService.deleteItems(ids);
+      return true;
+    } catch (error) {
+      console.error('[AssistantContext] assistant_delete_items failed:', error);
+      setDeletedIds(prev => new Set([...prev].filter(id => !ids.includes(id))));
+      return false;
+    }
+  }, []);
+
   const answerAsk = useCallback(async (id: string, answer: string) => {
     try {
       await assistantService.answerAsk(id, answer);
@@ -340,6 +445,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     dismissAsk,
     addTodo,
     dismissTodo,
+    deleteItems,
     answerAsk,
     ask,
     explain,
@@ -352,6 +458,10 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     voiceCancel,
     draftNote,
     saveNote,
+    savedNoteProject,
+    saveNoteError,
+    listVaultProjects,
+    suggestVaultProject,
     discardNote,
     setBrief,
     briefDraft: brief.draft,

@@ -6,6 +6,8 @@
 
 use tauri::State;
 
+use crate::state::AppState;
+
 use super::core::{self, StatusOut};
 use super::lanes::CardKind;
 use super::AssistantHandle;
@@ -82,10 +84,30 @@ pub async fn assistant_draft_note(handle: State<'_, AssistantHandle>) -> Result<
     core::draft_note(handle.inner()).await
 }
 
+/// Files the drafted note under `project` (a slug from
+/// `assistant_list_vault_projects`, or None) and returns where it went.
 #[tauri::command]
-pub async fn assistant_save_note(handle: State<'_, AssistantHandle>) -> Result<(), String> {
-    core::save_note(handle.inner()).await;
-    Ok(())
+pub async fn assistant_save_note(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+    project: Option<String>,
+) -> Result<core::SavedNote, String> {
+    core::save_note(handle.inner(), state.db_manager.pool(), project).await
+}
+
+/// Slugs of the vault's project pages, sorted.
+#[tauri::command]
+pub async fn assistant_list_vault_projects(handle: State<'_, AssistantHandle>) -> Result<Vec<String>, String> {
+    Ok(core::list_vault_projects(handle.inner()).await)
+}
+
+/// The project the finished meeting most likely belongs to, if any.
+#[tauri::command]
+pub async fn assistant_suggest_vault_project(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(core::suggest_vault_project(handle.inner(), state.db_manager.pool()).await)
 }
 
 #[tauri::command]
@@ -135,6 +157,17 @@ pub async fn assistant_add_todo(handle: State<'_, AssistantHandle>, text: String
 pub async fn assistant_dismiss_todo(handle: State<'_, AssistantHandle>, id: String) -> Result<(), String> {
     core::dismiss_todo(handle.inner(), id).await;
     Ok(())
+}
+
+/// Deletes assistant items by live id (a card's, a question's or a to-do's),
+/// during the call or after Stop. Returns how many items were removed.
+#[tauri::command]
+pub async fn assistant_delete_items(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<u32, String> {
+    core::delete_items(handle.inner(), state.db_manager.pool(), ids).await
 }
 
 #[tauri::command]

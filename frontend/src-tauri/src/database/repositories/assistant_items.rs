@@ -138,6 +138,27 @@ impl AssistantItemsRepository {
             .await?;
         Ok(result.rows_affected() as u32)
     }
+
+    /// Deletes the rows of `meeting_id` whose id is in `ids` and returns how
+    /// many went. Rows of other meetings are never touched.
+    pub async fn delete_items(
+        pool: &SqlitePool,
+        meeting_id: &str,
+        ids: &[String],
+    ) -> Result<u32, sqlx::Error> {
+        let mut tx = pool.begin().await?;
+        let mut n = 0u32;
+        for id in ids {
+            let result = sqlx::query("DELETE FROM meeting_assistant_items WHERE meeting_id = ? AND id = ?")
+                .bind(meeting_id)
+                .bind(id)
+                .execute(&mut *tx)
+                .await?;
+            n += result.rows_affected() as u32;
+        }
+        tx.commit().await?;
+        Ok(n)
+    }
 }
 
 #[cfg(test)]
@@ -161,6 +182,7 @@ pub(crate) mod tests {
         for migration in [
             include_str!("../../../migrations/20261020120000_meeting_assistant_items.sql"),
             include_str!("../../../migrations/20261021120000_meeting_assistant_todo_fields.sql"),
+            include_str!("../../../migrations/20261022120000_meeting_assistant_meta.sql"),
         ] {
             for stmt in migration.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                 sqlx::query(stmt).execute(&pool).await.unwrap();
@@ -252,5 +274,24 @@ pub(crate) mod tests {
         assert_eq!(AssistantItemsRepository::delete_for_meeting(&pool, "m1").await.unwrap(), 2);
         assert!(AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap().is_empty());
         assert_eq!(AssistantItemsRepository::list_for_meeting(&pool, "m2").await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn delete_items_removes_only_the_named_rows_of_that_meeting() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        add_meeting(&pool, "m2", None).await;
+        AssistantItemsRepository::replace_for_meeting(&pool, "m1", &[item("x", 1.0), item("y", 2.0), item("z", 3.0)])
+            .await
+            .unwrap();
+        AssistantItemsRepository::replace_for_meeting(&pool, "m2", &[item("w", 1.0)]).await.unwrap();
+        let ids: Vec<String> = ["x", "z", "w"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(AssistantItemsRepository::delete_items(&pool, "m1", &ids).await.unwrap(), 2);
+        let m1: Vec<_> =
+            AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(m1, vec!["y"]);
+        let m2: Vec<_> =
+            AssistantItemsRepository::list_for_meeting(&pool, "m2").await.unwrap().into_iter().map(|i| i.id).collect();
+        assert_eq!(m2, vec!["w"]);
     }
 }

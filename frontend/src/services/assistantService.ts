@@ -19,6 +19,12 @@ import {
   AssistantClaudeProbe,
 } from '@/types';
 
+/** What `assistant_save_note` returns: where the note went and under which project. */
+export interface SavedNote {
+  notePath: string;
+  project: string | null;
+}
+
 /**
  * Assistant Service
  * Singleton service for managing live-assistant commands and event subscriptions
@@ -70,8 +76,19 @@ export class AssistantService {
     return invoke('assistant_draft_note');
   }
 
-  async saveNote(): Promise<void> {
-    return invoke('assistant_save_note');
+  /** Files the drafted note under `project` (a vault project slug) or, with null, under none. */
+  async saveNote(project: string | null): Promise<SavedNote> {
+    return invoke('assistant_save_note', { project });
+  }
+
+  /** Slugs of the vault's project pages, sorted. */
+  async listVaultProjects(): Promise<string[]> {
+    return invoke('assistant_list_vault_projects');
+  }
+
+  /** The project the finished meeting most likely belongs to, or null. */
+  async suggestVaultProject(): Promise<string | null> {
+    return invoke('assistant_suggest_vault_project');
   }
 
   async discardNote(): Promise<void> {
@@ -98,6 +115,14 @@ export class AssistantService {
   /** Dismiss a to-do (open or done) from the live list. */
   async dismissTodo(id: string): Promise<void> {
     return invoke('assistant_dismiss_todo', { id });
+  }
+
+  /**
+   * Delete items by their live ids (cards, Ask, For-you and answered questions,
+   * to-dos), during the call and after Stop. Resolves with how many were deleted.
+   */
+  async deleteItems(ids: string[]): Promise<number> {
+    return invoke<number>('assistant_delete_items', { ids });
   }
 
   /** Joseph answered a For-you question: it moves to the answered list with his answer. */
@@ -167,6 +192,16 @@ export class AssistantService {
    */
   async onAsks(callback: (asks: AssistantAsks) => void): Promise<UnlistenFn> {
     return listen<AssistantAsks>('assistant-asks', (event) => {
+      callback(event.payload);
+    });
+  }
+
+  /**
+   * Listen for deletes made on the Assistant tab: the live ids that were removed,
+   * so the live panel drops the same items.
+   */
+  async onItemsDeleted(callback: (payload: { ids: string[] }) => void): Promise<UnlistenFn> {
+    return listen<{ ids: string[] }>('assistant-items-deleted', (event) => {
       callback(event.payload);
     });
   }

@@ -19,6 +19,7 @@ mock.module('../../src/services/assistantService', () => ({
     onVoice: async () => () => {},
     onNote: async () => () => {},
     onAsks: async (cb: (asks: unknown) => void) => { asksListener = cb; return () => {}; },
+    onItemsDeleted: async () => () => {},
     setBrief,
     answerAsk,
     dismissAsk,

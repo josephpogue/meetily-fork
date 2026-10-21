@@ -15,9 +15,12 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::Serialize;
+use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::audio::TranscriptUpdate;
+use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
+use crate::database::repositories::assistant_meta::AssistantMetaRepository;
 
 use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut, ChatExchange, ChatLog};
 use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, FrameFeed, LaneConfig, Runner};
@@ -77,7 +80,7 @@ struct VoiceOut {
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
-struct NoteOut {
+pub struct NoteOut {
     state: &'static str,
     markdown: String,
     error: Option<String>,
@@ -111,7 +114,12 @@ pub struct AssistantCore {
     /// Built once in `install`; every settled card reaches the panel and,
     /// for an answer or a direct ask, appends to `qa_log` for the note.
     card_emit: super::lanes::EmitFn,
-    qa_log: Arc<StdMutex<Vec<String>>>,
+    /// Sends the note's state to the panel (`assistant-note`); a no-op until
+    /// `wire` sets it, and replaced in tests to see what was sent.
+    note_emit: Arc<dyn Fn(NoteOut) + Send + Sync>,
+    /// (card id, "Q: ...\nA: ...") per settled card, so a deleted card's entry
+    /// can be removed before the note is drafted.
+    qa_log: QaLog,
     /// What the assistant showed this session, kept for the meeting save.
     /// Reset when a session opens.
     history: super::history::HistoryHandle,
@@ -129,8 +137,8 @@ pub struct AssistantCore {
     listening: bool,
 
     /// Typed in the panel while no session is open; seeds the next session
-    /// and is cleared once used. A closing session puts its brief back here,
-    /// because the panel's box still shows it.
+    /// and is cleared once used. Stop clears it: the call's own brief does
+    /// not carry over, only one typed after Stop.
     pending_brief: Option<String>,
     /// Set by a `set_brief` made while no session is open, cleared when an
     /// open takes the brief. `open_lanes_with` reads it to tell "cleared in
@@ -181,6 +189,7 @@ impl AssistantCore {
             voice_baseline: String::new(),
             app: None,
             card_emit: Arc::new(|_| {}),
+            note_emit: Arc::new(|_| {}),
             qa_log: Arc::new(StdMutex::new(Vec::new())),
             history,
             chat_log: Arc::new(StdMutex::new(Vec::new())),
@@ -266,16 +275,14 @@ impl AssistantCore {
         }
     }
 
+    /// Tells the panel the note's state. Every place that changes `note_state`
+    /// calls this right after, so the panel never keeps a state the core left.
     fn emit_note(&self) {
-        let Some(app) = &self.app else { return };
-        let out = NoteOut {
+        (self.note_emit)(NoteOut {
             state: self.note_state.label(),
             markdown: self.note_markdown.clone(),
             error: self.note_error.clone(),
-        };
-        if let Err(e) = app.emit("assistant-note", &out) {
-            log::warn!("assistant: failed to emit assistant-note: {}", e);
-        }
+        });
     }
 }
 
@@ -337,13 +344,17 @@ fn resolve_deep_read_dirs(raw: &str) -> Vec<PathBuf> {
 /// catch-up does not. `forward` then passes the card on (to the panel).
 fn make_card_emit(
     handle: AssistantHandle,
-    qa_log: Arc<StdMutex<Vec<String>>>,
+    qa_log: QaLog,
     chat_log: ChatLog,
     history: super::history::HistoryHandle,
     forward: super::lanes::EmitFn,
 ) -> super::lanes::EmitFn {
     Arc::new(move |card: CardOut| {
-        record_card(&card, &qa_log, &chat_log);
+        // A card Joseph deleted while it drafted must not re-enter the logs
+        // when it settles (the collector already refuses it).
+        if !history.lock().unwrap().is_deleted(&card.id) {
+            record_card(&card, &qa_log, &chat_log);
+        }
         super::history::record_card(&history, &card);
         if is_settled_ask(&card) {
             // A question worked out in Ask may have answered one on the
@@ -361,6 +372,23 @@ fn make_card_emit(
     })
 }
 
+type QaLog = Arc<StdMutex<Vec<(String, String)>>>;
+
+/// The Q&A log's texts, joined for the note.
+fn qa_log_text(qa_log: &StdMutex<Vec<(String, String)>>) -> String {
+    qa_log.lock().unwrap().iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n\n")
+}
+
+/// The answered questions the lane holds, less the ones Joseph deleted.
+fn answered_kept(lane: &AskLane, deleted: &[String]) -> Vec<super::ask_list::AnsweredItem> {
+    lane.answered_items().into_iter().filter(|a| !deleted.contains(&a.id)).collect()
+}
+
+/// The open questions on the lane's list, less the ones Joseph deleted.
+fn open_asks_kept(lane: &AskLane, deleted: &[String]) -> Vec<String> {
+    lane.snapshot().asks.into_iter().filter(|a| !deleted.contains(&a.id)).map(|a| a.question).collect()
+}
+
 fn is_settled_ask(card: &CardOut) -> bool {
     matches!(card.kind, CardKind::Ask) && (card.phase == "checked" || card.phase == "corrected")
 }
@@ -368,7 +396,7 @@ fn is_settled_ask(card: &CardOut) -> bool {
 /// What a settled card leaves behind. An answer or an Ask card goes to the
 /// note's Q&A log; an Ask card (Joseph's own question) also goes to the chat
 /// log, so Ask next can hear it and mark a list question answered.
-fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<String>>, chat_log: &StdMutex<Vec<ChatExchange>>) {
+fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<(String, String)>>, chat_log: &StdMutex<Vec<ChatExchange>>) {
     let settled = card.phase == "checked" || card.phase == "corrected";
     if !settled {
         return;
@@ -377,7 +405,7 @@ fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<String>>, chat_log: &StdMut
         qa_log
             .lock()
             .unwrap()
-            .push(format!("Q: {}\nA: {}", card.question, card.lead));
+            .push((card.id.clone(), format!("Q: {}\nA: {}", card.question, card.lead)));
     }
     if matches!(card.kind, CardKind::Ask) {
         let mut answer = card.lead.clone();
@@ -539,6 +567,9 @@ pub async fn set_listening(handle: &AssistantHandle, listening: bool) {
 /// brief everywhere at once and asks for a fresh list.
 pub async fn set_brief(handle: &AssistantHandle, text: String) {
     let mut core = handle.0.lock().await;
+    // The meeting saves the brief as it stood at Stop, so every edit lands in
+    // the history at once, whether or not a session is open.
+    core.history.lock().unwrap().set_brief(&text);
     if !core.session_open {
         // Keep the panel's copy current before and after a recording too.
         core.ask_lane.set_brief(text.clone());
@@ -611,8 +642,123 @@ pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
     if !core.session_open || !core.ask_lane.dismiss(&id) {
         return;
     }
+    // A question Joseph dismissed is not saved with the meeting, nor kept in
+    // the note's Q&A log. One the model merely dropped from a later list
+    // stays, because it was shown. A session open means the collector holds a
+    // new call, so there are no saved rows to reach.
+    forget_live_items(&core, &[id]);
     if core.session_open && core.enabled {
         core.ask_lane.request(&core.transcript, false);
+    }
+}
+
+/// Where a live item leaves the session's records, for every delete: the
+/// history collector (so the meeting save never has it and no observe path
+/// brings it back) and the note's Q&A log. Returns the removed entries' row ids.
+fn forget_live_items(core: &AssistantCore, ids: &[String]) -> Vec<String> {
+    let removed = core.history.lock().unwrap().delete(ids);
+    core.qa_log.lock().unwrap().retain(|(id, _)| !ids.contains(id));
+    removed
+}
+
+/// Deletes assistant items by their live ids (a card's id, a question's id, a
+/// to-do's id), during the call or after Stop. They leave the collector, so
+/// the meeting save never has them, and the note's Q&A log. With the session
+/// open the ask lane also forgets them for good (same as the x); with it
+/// closed the lane is not touched (see `dismiss_ask`). Holds the items write
+/// gate throughout, so it never interleaves with the Stop save. When the
+/// meeting was already saved at Stop, its saved rows are deleted first and
+/// `assistant.json` and the vault note are rebuilt from the rows left; a
+/// database failure there returns Err and changes nothing, so a retry still
+/// finds the items. Once the rows are gone the collector, the Q&A log, the
+/// lane and a ready note draft are updated even when rebuilding the files
+/// failed (that Err comes back after, and a retry rebuilds them). A ready note
+/// draft is made again without the items. Returns how many items were removed.
+pub async fn delete_items(handle: &AssistantHandle, pool: &SqlitePool, ids: Vec<String>) -> Result<u32, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let history = handle.0.lock().await.history.clone();
+    let _gate = super::history::lock_items_gate(&history).await;
+    let (saved_meeting, saved_ids) = {
+        let h = history.lock().unwrap();
+        (h.saved_meeting_id(), h.saved_ids_of(&ids))
+    };
+    let mut files = Ok(());
+    if let Some(meeting_id) = &saved_meeting {
+        let (_, gone) = super::history::delete_saved_rows(pool, meeting_id, &saved_ids).await?;
+        files = super::history::after_items_deleted(pool, meeting_id, &gone).await;
+        if let Err(e) = &files {
+            log::warn!("assistant: rows of {} deleted but its files not rebuilt: {}", meeting_id, e);
+        }
+    }
+    let removed = {
+        let core = handle.0.lock().await;
+        let removed = forget_live_items(&core, &ids);
+        if core.session_open {
+            let mut dismissed = false;
+            for id in &ids {
+                dismissed |= core.ask_lane.dismiss(id) || core.ask_lane.dismiss_todo(id);
+            }
+            if dismissed && core.enabled {
+                core.ask_lane.request(&core.transcript, false);
+            }
+        }
+        removed
+    };
+    redraft_if_ready(handle).await;
+    files.map(|_| removed.len() as u32)
+}
+
+/// Deletes a past meeting's saved rows by row id (the Assistant tab). Holds
+/// the items write gate throughout. When that meeting is the one the live
+/// collector saved, its entries leave the collector too, the cards leave the
+/// note's Q&A log, a ready note is made again without them, and `on_deleted`
+/// gets every live id of the removed entries so the panel can hide them. A
+/// database failure on the rows returns Err and changes nothing; a failure
+/// rebuilding the files afterwards returns Err only after the live session
+/// was updated, and a retry rebuilds them.
+pub async fn delete_past_items(
+    handle: &AssistantHandle,
+    pool: &SqlitePool,
+    meeting_id: &str,
+    ids: Vec<String>,
+    on_deleted: impl FnOnce(Vec<String>),
+) -> Result<u32, String> {
+    let history = handle.0.lock().await.history.clone();
+    let _gate = super::history::lock_items_gate(&history).await;
+    let (n, gone) = super::history::delete_saved_rows(pool, meeting_id, &ids).await?;
+    let files = super::history::after_items_deleted(pool, meeting_id, &gone).await;
+    if let Err(e) = &files {
+        log::warn!("assistant: rows of {} deleted but its files not rebuilt: {}", meeting_id, e);
+    }
+    let live_ids = {
+        let core = handle.0.lock().await;
+        let mut history = core.history.lock().unwrap();
+        if history.saved_meeting_id().as_deref() != Some(meeting_id) {
+            return files.map(|_| n);
+        }
+        let live_ids = history.delete_saved(&ids);
+        core.qa_log.lock().unwrap().retain(|(id, _)| !live_ids.contains(id));
+        live_ids
+    };
+    if !live_ids.is_empty() {
+        redraft_if_ready(handle).await;
+        on_deleted(live_ids);
+    }
+    files.map(|_| n)
+}
+
+/// After a delete: a note still Ready is drafted again without the deleted
+/// items, in the background. The draft starts only if the note is still Ready
+/// when it takes the lock, so a Save or a draft that ran meanwhile is left alone.
+async fn redraft_if_ready(handle: &AssistantHandle) {
+    let ready = matches!(handle.0.lock().await.note_state, NoteState::Ready);
+    if ready {
+        let handle = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = draft_note_if_ready(&handle).await;
+        });
     }
 }
 
@@ -774,100 +920,252 @@ pub async fn voice_toggle(handle: &AssistantHandle) {
 }
 
 pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
-    let (transcript_text, qa_log_text) = {
+    draft_note_gated(handle, false).await
+}
+
+/// The draft a delete asks for: runs only if the note is still Ready when it
+/// takes the lock (Saved, or a draft already running, is left as it is).
+async fn draft_note_if_ready(handle: &AssistantHandle) -> Result<(), String> {
+    draft_note_gated(handle, true).await
+}
+
+/// Marks the note Drafting and builds the draft's inputs from what is left
+/// now (the transcript, the Q&A log, the answered and open questions less the
+/// deleted ones). Returns them with the collector's delete generation as it
+/// stood, so a delete that lands while the draft runs can be told apart.
+fn start_draft(core: &mut AssistantCore) -> (String, String, u64) {
+    core.note_state = NoteState::Drafting;
+    core.note_error = None;
+    core.emit_note();
+    let transcript_text = core.transcript.all();
+    let qa_log_text = qa_log_text(&core.qa_log);
+    // After Stop the lane still holds what Joseph deleted: leave it out.
+    let (deleted, generation) = {
+        let h = core.history.lock().unwrap();
+        (h.deleted_ids(), h.delete_generation())
+    };
+    let open_asks = open_asks_kept(&core.ask_lane, &deleted);
+    let mut draft_input = qa_log_text;
+    let answered = answered_kept(&core.ask_lane, &deleted);
+    if !answered.is_empty() {
+        let list = answered
+            .iter()
+            .map(|a| format!("- {} Answer: {}", a.question, a.answer))
+            .collect::<Vec<_>>()
+            .join("\n");
+        draft_input = format!("{}\n\nQUESTIONS ANSWERED DURING THE CALL:\n{}", draft_input, list);
+    }
+    if !open_asks.is_empty() {
+        let list = open_asks
+            .iter()
+            .map(|q| format!("- {}", q))
+            .collect::<Vec<_>>()
+            .join("\n");
+        draft_input = format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", draft_input, list);
+    }
+    core.session_transcript = transcript_text.clone();
+    (transcript_text, draft_input, generation)
+}
+
+async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Result<(), String> {
+    let (mut transcript_text, mut qa_log_text, mut generation) = {
         let mut core = handle.0.lock().await;
+        if only_if_ready && !matches!(core.note_state, NoteState::Ready) {
+            return Ok(());
+        }
         if core.session_open {
             return Err("stop the recording before drafting a note".to_string());
         }
-        core.note_state = NoteState::Drafting;
-        core.note_error = None;
-        core.emit_note();
-        let transcript_text = core.transcript.all();
-        let qa_log_text = core.qa_log.lock().unwrap().join("\n\n");
-        let open_asks = core.ask_lane.open_asks();
-        let mut draft_input = qa_log_text;
-        let answered = core.ask_lane.answered_items();
-        if !answered.is_empty() {
-            let list = answered
-                .iter()
-                .map(|a| format!("- {} Answer: {}", a.question, a.answer))
-                .collect::<Vec<_>>()
-                .join("\n");
-            draft_input = format!("{}\n\nQUESTIONS ANSWERED DURING THE CALL:\n{}", draft_input, list);
-        }
-        if !open_asks.is_empty() {
-            let list = open_asks
-                .iter()
-                .map(|q| format!("- {}", q))
-                .collect::<Vec<_>>()
-                .join("\n");
-            draft_input = format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", draft_input, list);
-        }
-        core.session_transcript = transcript_text.clone();
-        (transcript_text, draft_input)
+        start_draft(&mut core)
     };
 
-    let result = {
+    loop {
+        let result = {
+            let mut core = handle.0.lock().await;
+            core.lanes.draft_note(transcript_text, qa_log_text).await
+        };
+
         let mut core = handle.0.lock().await;
-        core.lanes.draft_note(transcript_text, qa_log_text).await
-    };
-
-    let mut core = handle.0.lock().await;
-    match result {
-        Ok(raw) => match note::parse_note(&raw) {
-            Ok(mut draft) => {
-                // Built in code, not by the model: the answered list as it
-                // stood, in the preview and in the saved file alike.
-                draft.markdown = note::with_answered(&draft.markdown, &core.ask_lane.answered_items());
-                core.note_markdown = draft.markdown.clone();
-                core.note_draft = Some(draft);
-                core.note_state = NoteState::Ready;
-                core.note_error = None;
-            }
+        match result {
+            Ok(raw) => match note::parse_note(&raw) {
+                Ok(draft) => {
+                    // An item deleted while this draft ran may be named in the
+                    // model's text, which was written from the old inputs: draft
+                    // again from what is left, staying Drafting until that lands.
+                    if core.history.lock().unwrap().delete_generation() != generation {
+                        if core.session_open {
+                            // A new call opened meanwhile and reset the note.
+                            return Ok(());
+                        }
+                        (transcript_text, qa_log_text, generation) = start_draft(&mut core);
+                        continue;
+                    }
+                    // The preview carries the answered list as it stands, built in
+                    // code. The draft keeps only the model's body: the saved file
+                    // builds its own code sections from the meeting's rows.
+                    let deleted = core.history.lock().unwrap().deleted_ids();
+                    core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
+                    core.note_draft = Some(draft);
+                    core.note_state = NoteState::Ready;
+                    core.note_error = None;
+                }
+                Err(e) => {
+                    core.note_state = NoteState::Failed;
+                    core.note_error = Some(e);
+                }
+            },
             Err(e) => {
                 core.note_state = NoteState::Failed;
                 core.note_error = Some(e);
             }
-        },
-        Err(e) => {
-            core.note_state = NoteState::Failed;
-            core.note_error = Some(e);
         }
+        core.emit_note();
+        return Ok(());
     }
-    core.emit_note();
-    Ok(())
 }
 
-pub async fn save_note(handle: &AssistantHandle) {
+/// What the vault note is built from: the meeting's rows (saved rows when the
+/// meeting was saved at Stop, else the live collector's), its title, the Brief.
+struct MeetingFacts {
+    saved_id: Option<String>,
+    rows: Vec<AssistantItem>,
+    title: Option<String>,
+    brief: String,
+}
+
+async fn meeting_facts(pool: &SqlitePool, history: &super::history::HistoryHandle) -> Result<MeetingFacts, String> {
+    let (saved_id, live_brief, live_rows) = {
+        let h = history.lock().unwrap();
+        let saved_id = h.saved_meeting_id();
+        let live_rows = if saved_id.is_none() { h.finalize(h.opened_ms()) } else { Vec::new() };
+        (saved_id, h.brief().to_string(), live_rows)
+    };
+    let Some(id) = saved_id.clone() else {
+        return Ok(MeetingFacts { saved_id, rows: live_rows, title: None, brief: live_brief });
+    };
+    let rows = AssistantItemsRepository::list_for_meeting(pool, &id).await.map_err(|e| e.to_string())?;
+    let title = sqlx::query_scalar::<_, Option<String>>("SELECT title FROM meetings WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter(|t| !t.trim().is_empty());
+    // After Stop the collector's Brief belongs to the NEXT call, so a saved
+    // meeting takes the brief it was saved with.
+    let brief = AssistantMetaRepository::get(pool, &id)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|m| m.brief)
+        .unwrap_or_default();
+    Ok(MeetingFacts { saved_id, rows, title, brief })
+}
+
+/// Slugs of the vault's project pages, for the note bar's dropdown.
+pub async fn list_vault_projects(handle: &AssistantHandle) -> Vec<String> {
+    let root = resolve_vault_root(&handle.0.lock().await.settings.vault_root);
+    note::list_projects(&root)
+}
+
+/// The project the finished meeting looks like it belongs to, if any.
+pub async fn suggest_vault_project(handle: &AssistantHandle, pool: &SqlitePool) -> Option<String> {
+    let (root, history, transcript) = {
+        let core = handle.0.lock().await;
+        let transcript = if core.session_transcript.is_empty() { core.transcript.all() } else { core.session_transcript.clone() };
+        (resolve_vault_root(&core.settings.vault_root), core.history.clone(), transcript)
+    };
+    let facts = match meeting_facts(pool, &history).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("assistant: no vault project suggestion, meeting data unreadable: {}", e);
+            return None;
+        }
+    };
+    note::suggest_project(&root, facts.title.as_deref().unwrap_or(""), &facts.brief, &transcript)
+}
+
+/// What a save returns to the note bar.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedNote {
+    pub note_path: String,
+    pub project: Option<String>,
+}
+
+/// Files the drafted note in the vault under `project` (None: no project) and
+/// links it on the project page. A project that is not a page in the vault is
+/// refused with an error and the note stays Ready; any other failure puts the
+/// note in Failed with its message, as it always did.
+pub async fn save_note(
+    handle: &AssistantHandle,
+    pool: &SqlitePool,
+    project: Option<String>,
+) -> Result<SavedNote, String> {
     let mut core = handle.0.lock().await;
     let Some(draft) = core.note_draft.clone() else {
         core.note_state = NoteState::Failed;
         core.note_error = Some("no note draft to save".to_string());
         core.emit_note();
-        return;
+        return Err("no note draft to save".to_string());
     };
     let vault_root = resolve_vault_root(&core.settings.vault_root);
+    note::check_project(&vault_root, project.as_deref())?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let dry_run = std::env::var("ASSISTANT_DRY_RUN").ok().as_deref() == Some("1");
-    let qa_log_text = core.qa_log.lock().unwrap().join("\n\n");
     let transcript_text = core.session_transcript.clone();
+    let history = core.history.clone();
 
-    match note::save_note(&vault_root, &date, &draft, &transcript_text, &qa_log_text, dry_run) {
-        Ok(paths) => {
+    let result = async {
+        let facts = meeting_facts(pool, &history).await?;
+        let filed = note::save_note(note::SaveInput {
+            vault_root: &vault_root,
+            date: &date,
+            draft: &draft,
+            title: facts.title.as_deref(),
+            brief: &facts.brief,
+            rows: &facts.rows,
+            transcript: &transcript_text,
+            project: project.as_deref(),
+            dry_run,
+        })?;
+        Ok::<_, String>((filed, facts.saved_id))
+    }
+    .await;
+
+    match result {
+        Ok((filed, saved_id)) => {
             if dry_run {
-                log::info!("assistant: dry-run, not written: {:?}", paths);
+                log::info!("assistant: dry-run, not written: {:?}", filed);
             } else {
-                log::info!("assistant: note saved: {:?}", paths);
+                log::info!("assistant: note saved: {:?}", filed);
+                if let Some(id) = saved_id {
+                    let filed_at = chrono::Utc::now().to_rfc3339();
+                    if let Err(e) = AssistantMetaRepository::set_filed(
+                        pool,
+                        &id,
+                        filed.project.as_deref(),
+                        &filed.note_path.to_string_lossy(),
+                        &filed.transcript_path.to_string_lossy(),
+                        &filed_at,
+                    )
+                    .await
+                    {
+                        log::warn!("assistant: filed the note but could not record it for {}: {}", id, e);
+                    }
+                }
             }
             core.note_state = NoteState::Saved;
             core.note_error = None;
+            core.emit_note();
+            Ok(SavedNote { note_path: filed.note_path.to_string_lossy().into_owned(), project: filed.project })
         }
         Err(e) => {
             core.note_state = NoteState::Failed;
-            core.note_error = Some(e);
+            core.note_error = Some(e.clone());
+            core.emit_note();
+            Err(e)
         }
     }
-    core.emit_note();
 }
 
 pub async fn discard_note(handle: &AssistantHandle) {
@@ -969,6 +1267,7 @@ async fn open_lanes_with(
     core.ask_lane.set_chat_log(core.chat_log.clone());
     core.ask_lane.set_frames(feed);
     core.brief = brief.clone();
+    core.history.lock().unwrap().set_brief(&brief);
     let trunk = core.lanes.trunk_id();
     let ask_cfg = AskConfig {
         cwd: cfg.cwd.clone(),
@@ -1010,6 +1309,14 @@ async fn open_lanes_with(
     if let Some(newer) = newer {
         refresh_startup(handle, newer).await;
     }
+}
+
+/// The brief the next session opens with: what was typed while no session
+/// was open, taken once. `None` when nothing was typed since the last call.
+async fn take_pending_brief(handle: &AssistantHandle) -> Option<String> {
+    let mut core = handle.0.lock().await;
+    core.brief_edited = false;
+    core.pending_brief.take()
 }
 
 /// Bound to `recording-started`. Reloads settings fresh (so a save made
@@ -1061,6 +1368,9 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.note_draft = None;
         core.note_markdown.clear();
         core.note_error = None;
+        // The panel must not keep the last call's note state (a Saved note
+        // would make the next Stop skip the note bar).
+        core.emit_note();
         core.session_transcript.clear();
         // The previous meeting's answered and open questions go with its
         // transcript, however far this attempt gets.
@@ -1121,11 +1431,7 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
 
     // Take the brief only now that the session is sure to open: an early
     // return above leaves it pending, so the next attempt still has it.
-    let brief = {
-        let mut core = handle.0.lock().await;
-        core.brief_edited = false;
-        core.pending_brief.take()
-    };
+    let brief = take_pending_brief(handle).await;
 
     let cfg = LaneConfig {
         cwd: session_dir,
@@ -1264,13 +1570,17 @@ async fn start_capture(handle: &AssistantHandle, app: Option<&AppHandle<Wry>>) {
 async fn close_session(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     core.stop_capture();
+    // The call is over, so its brief is not the next call's: whatever a
+    // mid-call switch-off left pending goes too. A brief typed after this
+    // lands in `pending_brief` again and opens the next session.
+    core.pending_brief = None;
+    core.brief_edited = false;
     if !core.session_open {
         return;
     }
     core.session_open = false;
     core.lanes.close();
     core.ask_lane.close();
-    core.pending_brief = Some(core.brief.clone()).filter(|b| !b.trim().is_empty());
     core.emit_status();
 }
 
@@ -1303,6 +1613,12 @@ async fn wire(app: AppHandle<Wry>) {
         let mut core = handle.0.lock().await;
         core.app = Some(app.clone());
         core.card_emit = card_emit;
+        let note_app = app.clone();
+        core.note_emit = Arc::new(move |out: NoteOut| {
+            if let Err(e) = note_app.emit("assistant-note", &out) {
+                log::warn!("assistant: failed to emit assistant-note: {}", e);
+            }
+        });
         core.ask_hooks = make_ask_hooks(app.clone(), handle.clone(), history.clone());
         core.ask_lane = AskLane::new(claude_runner(PathBuf::new()), core.ask_hooks.clone());
 
@@ -1371,7 +1687,15 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
             // Only here: a mid-call off/on reopens the session without this.
             history.lock().unwrap().reset(chrono::Utc::now().timestamp_millis());
             let handle = handle.clone();
+            let history = history.clone();
             tauri::async_runtime::spawn(async move {
+                // A brief typed before recording waits in `pending_brief`; the
+                // reset above cleared the history's copy, so put it back even
+                // when the assistant is off and no session will take it.
+                let pending = handle.0.lock().await.pending_brief.clone();
+                if let Some(brief) = pending {
+                    history.lock().unwrap().set_brief(&brief);
+                }
                 open_session(&handle, None).await;
             });
         });
@@ -1779,6 +2103,19 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn every_brief_edit_reaches_the_history_with_or_without_a_session() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        set_brief(&handle, "before".to_string()).await;
+        assert_eq!(history.lock().unwrap().brief(), "before");
+        handle.0.lock().await.session_open = true;
+        set_brief(&handle, "during".to_string()).await;
+        assert_eq!(history.lock().unwrap().brief(), "during");
+        set_brief(&handle, String::new()).await;
+        assert_eq!(history.lock().unwrap().brief(), "");
+    }
+
+    #[tokio::test]
     async fn a_session_that_fails_to_open_keeps_the_saved_brief() {
         let handle = AssistantHandle::new();
         set_brief(&handle, "intro call".to_string()).await;
@@ -1865,13 +2202,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The closing call's own brief does not open the next call.
     #[tokio::test]
-    async fn closing_the_session_carries_the_brief_into_the_next_one() {
+    async fn the_next_session_does_not_inherit_the_closing_calls_brief() {
+        let handle = AssistantHandle::new();
+        let emitted = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = emitted.clone();
+        let hooks = AskHooks {
+            emit: Arc::new(move |out| recorded.lock().unwrap().push(out)),
+            ..Default::default()
+        };
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.ask_hooks = hooks;
+        }
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls.clone())).await;
+        close_session(&handle).await;
+        assert_eq!(handle.0.lock().await.pending_brief, None);
+
+        let brief = take_pending_brief(&handle).await.unwrap_or_default();
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), brief, ask_runner(calls)).await;
+        let core = handle.0.lock().await;
+        assert_eq!(core.brief, "");
+        assert_eq!(core.ask_lane.snapshot().brief, "");
+        assert_eq!(core.history.lock().unwrap().brief(), "");
+        assert_eq!(emitted.lock().unwrap().last().unwrap().brief, "");
+    }
+
+    /// A brief typed after the previous call's Stop is the new call's brief.
+    #[tokio::test]
+    async fn a_brief_typed_between_calls_is_the_next_calls_brief() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls.clone())).await;
+        close_session(&handle).await;
+        set_brief(&handle, "goal B".to_string()).await;
+
+        let brief = take_pending_brief(&handle).await.unwrap_or_default();
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), brief, ask_runner(calls)).await;
+        let core = handle.0.lock().await;
+        assert_eq!(core.brief, "goal B");
+        assert_eq!(core.ask_lane.snapshot().brief, "goal B");
+        assert_eq!(core.history.lock().unwrap().brief(), "goal B");
+    }
+
+    /// Switching the assistant off in a call and closing it at Stop leaves
+    /// nothing for the next call either.
+    #[tokio::test]
+    async fn stop_after_a_mid_call_switch_off_leaves_no_brief_for_the_next_call() {
         let handle = AssistantHandle::new();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls)).await;
+        set_enabled(&handle, false).await;
+        assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"), "off and on again in one call keeps the brief");
         close_session(&handle).await;
-        assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"));
+        assert_eq!(handle.0.lock().await.pending_brief, None);
     }
 
     /// A brief cleared while the lanes open wins over the one the open path
@@ -2258,7 +2644,7 @@ mod tests {
             "## Answered questions\n\n- **What are your fees?** Ten percent of rent. (On the call)"
         ), "note was: {}", core.note_markdown);
         assert!(core.note_markdown.starts_with("## Summary"));
-        assert_eq!(core.note_draft.as_ref().unwrap().markdown, core.note_markdown, "the saved file gets it too");
+        assert!(!core.note_draft.as_ref().unwrap().markdown.contains("Answered questions"), "the saved file builds its own from the rows");
         let note_prompt = calls
             .lock()
             .unwrap()
@@ -2425,5 +2811,655 @@ mod tests {
         let core = handle.0.lock().await;
         assert!(!core.note_markdown.contains("Answered questions"));
         assert!(core.note_markdown.ends_with("- Who owns backups?"));
+    }
+
+    // ---- deleting items ----
+
+    use crate::database::repositories::assistant_items::tests::{add_meeting, test_pool};
+    use crate::database::repositories::assistant_items::AssistantItemsRepository;
+
+    /// Wires the ask hook the way the app does, so every snapshot is collected.
+    async fn collect_asks(handle: &AssistantHandle) -> super::super::history::HistoryHandle {
+        let history = handle.0.lock().await.history_handle_for_test();
+        let sink = history.clone();
+        handle.0.lock().await.ask_hooks.emit = Arc::new(move |out| super::super::history::record_asks(&sink, &out));
+        history.lock().unwrap().reset(0);
+        history
+    }
+
+    async fn saved_questions(pool: &SqlitePool, meeting: &str) -> Vec<String> {
+        AssistantItemsRepository::list_for_meeting(pool, meeting)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.question)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_question_is_not_saved_but_an_undismissed_one_is() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        add_meeting(&pool, "m2", None).await;
+        for (meeting, dismiss) in [("m1", true), ("m2", false)] {
+            let handle = AssistantHandle::new();
+            let history = collect_asks(&handle).await;
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+            refresh_asks(&handle).await;
+            settle().await;
+            let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+            if dismiss {
+                dismiss_ask(&handle, id).await;
+                settle().await;
+            }
+            close_session(&handle).await;
+            super::super::history::save_for_meeting(&pool, &history, meeting).await.unwrap();
+            let saved = saved_questions(&pool, meeting).await;
+            if dismiss {
+                assert!(saved.is_empty(), "dismissed question was saved: {:?}", saved);
+            } else {
+                assert_eq!(saved, vec!["What are your fees?"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_open_question_during_the_call_removes_it_for_good() {
+        let pool = test_pool().await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+
+        assert_eq!(delete_items(&handle, &pool, vec![id.clone()]).await, Ok(1));
+        settle().await;
+        assert!(handle.0.lock().await.ask_lane.snapshot().asks.is_empty());
+        assert!(history.lock().unwrap().finalize(0).is_empty());
+        assert!(ask_turns(&calls).len() >= 2, "the lane was told it was dismissed");
+        assert_eq!(delete_items(&handle, &pool, vec![id]).await, Ok(0), "already gone");
+        assert_eq!(delete_items(&handle, &pool, vec![]).await, Ok(0));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_todo_during_the_call_dismisses_it_on_the_lane() {
+        let pool = test_pool().await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        add_todo(&handle, "Send Dana the runbook".to_string()).await.unwrap();
+        let id = handle.0.lock().await.ask_lane.snapshot().todos[0].id.clone();
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+
+        assert_eq!(delete_items(&handle, &pool, vec![id.clone()]).await, Ok(1));
+        let out = handle.0.lock().await.ask_lane.snapshot();
+        assert!(out.todos.is_empty());
+        assert_eq!(out.dismissed_todos, vec![id]);
+        assert!(history.lock().unwrap().finalize(0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_after_stop_updates_the_saved_meeting_and_leaves_the_lane_alone() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let answered_id = handle.0.lock().await.ask_lane.snapshot().answered[0].id.clone();
+        close_session(&handle).await;
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert_eq!(saved_questions(&pool, "m1").await.len(), 1);
+        assert!(dir.path().join("assistant.json").exists());
+        let turns_before = calls.lock().unwrap().len();
+
+        assert_eq!(delete_items(&handle, &pool, vec![answered_id]).await, Ok(1));
+        assert!(saved_questions(&pool, "m1").await.is_empty());
+        assert!(!dir.path().join("assistant.json").exists(), "no rows left, no file");
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1, "a closed session's lane is not touched");
+        settle().await;
+        assert_eq!(calls.lock().unwrap().len(), turns_before, "no turn ran");
+    }
+
+    fn git_vault() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::create_dir_all(dir.path().join("Wiki/Projects")).unwrap();
+        std::fs::write(dir.path().join("Wiki/Projects/mission-control.md"), "# MC\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn saving_files_the_saved_rows_under_the_project_and_a_later_delete_updates_the_note() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(folder.path().to_str().unwrap())).await;
+        let vault = git_vault();
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let answered_id = handle.0.lock().await.ask_lane.snapshot().answered[0].id.clone();
+        close_session(&handle).await;
+        history.lock().unwrap().set_brief("Mission Control review");
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        handle.0.lock().await.settings.vault_root = vault.path().to_string_lossy().into_owned();
+        assert!(draft_note(&handle).await.is_ok());
+
+        assert_eq!(list_vault_projects(&handle).await, vec!["mission-control"]);
+        let err = save_note(&handle, &pool, Some("../secret".to_string())).await.unwrap_err();
+        assert!(err.contains("not a project"), "{err}");
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready, "a refusal leaves the note to save again");
+
+        let saved = save_note(&handle, &pool, Some("mission-control".to_string())).await.unwrap();
+        assert_eq!(saved.project.as_deref(), Some("mission-control"));
+        let note = std::fs::read_to_string(&saved.note_path).unwrap();
+        assert!(note.starts_with("# t\n\n- Date: "), "title is the meeting's: {note}");
+        assert!(note.contains("- Linked projects: [[mission-control]]"));
+        assert!(note.contains("## Brief\n\nMission Control review"));
+        assert_eq!(note.matches("## Answered questions").count(), 1, "{note}");
+        assert!(note.contains("- **What are your fees?** Ten percent of rent. (On the call)"));
+        let page = std::fs::read_to_string(vault.path().join("Wiki/Projects/mission-control.md")).unwrap();
+        assert!(page.contains("## Meetings\n\n- "), "{page}");
+        let meta = AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(meta.vault_project.as_deref(), Some("mission-control"));
+        assert_eq!(meta.vault_note_path.as_deref(), Some(saved.note_path.as_str()));
+        assert!(meta.filed_at.is_some());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Saved);
+
+        // A delete made after the save reaches the filed note.
+        assert_eq!(delete_items(&handle, &pool, vec![answered_id]).await, Ok(1));
+        let note = std::fs::read_to_string(&saved.note_path).unwrap();
+        assert!(!note.contains("What are your fees?"), "{note}");
+        assert!(note.contains("## Brief"), "the rest stays: {note}");
+    }
+
+    fn settled_card(id: &str, question: &str) -> CardOut {
+        CardOut {
+            id: id.to_string(),
+            kind: CardKind::Answer,
+            question: question.to_string(),
+            lead: "Building two.".to_string(),
+            bullets: vec![],
+            source: "deep".to_string(),
+            phase: "checked".to_string(),
+            changed_lines: Vec::new(),
+            ts: 1,
+        }
+    }
+
+    fn last_note_prompt(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> String {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|t| t.prompt.starts_with("TRANSCRIPT:"))
+            .map(|t| t.prompt.clone())
+            .expect("a note turn ran")
+    }
+
+    #[tokio::test]
+    async fn a_deleted_card_and_answered_question_stay_out_of_the_draft_and_a_ready_note_is_redrafted() {
+        let pool = test_pool().await;
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let answered_id = {
+            let core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            record_card(&settled_card("c1", "Where is the data center?"), &qa, &chats);
+            record_card(&settled_card("c2", "Who owns backups?"), &qa, &chats);
+            core.ask_lane.snapshot().answered[0].id.clone()
+        };
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let first = last_note_prompt(&calls);
+        assert!(first.contains("Where is the data center?") && first.contains("What are your fees?"), "{first}");
+        assert!(handle.0.lock().await.note_markdown.contains("Answered questions"));
+
+        // The note is Ready, so the delete drafts it again without them.
+        assert_eq!(delete_items(&handle, &pool, vec!["c1".to_string(), answered_id]).await, Ok(0));
+        settle().await;
+        settle().await;
+        let again = last_note_prompt(&calls);
+        assert!(!again.contains("Where is the data center?"), "{again}");
+        assert!(!again.contains("What are your fees?"), "{again}");
+        assert!(again.contains("Who owns backups?"), "other cards stay: {again}");
+        let core = handle.0.lock().await;
+        assert!(!core.note_markdown.contains("Answered questions"), "{}", core.note_markdown);
+        assert_eq!(core.qa_log.lock().unwrap().len(), 1);
+    }
+    // ---- delete and save races ----
+
+    #[tokio::test]
+    async fn a_card_deleted_while_drafting_leaves_no_trace_when_it_settles() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        let pool = test_pool().await;
+        let (qa, chats, history, emit) = {
+            let mut core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            core.history.lock().unwrap().reset(0);
+            let emit = make_card_emit(handle.clone(), qa.clone(), chats.clone(), core.history.clone(), Arc::new(|_| {}));
+            core.card_emit = emit.clone();
+            (qa, chats, core.history.clone(), emit)
+        };
+        let mut drafting = settled_card("c1", "Where is the data center?");
+        drafting.phase = "drafting".to_string();
+        emit(drafting);
+        assert_eq!(delete_items(&handle, &pool, vec!["c1".to_string()]).await, Ok(1));
+        let mut checked = settled_card("c1", "Where is the data center?");
+        checked.kind = CardKind::Ask;
+        emit(checked);
+        emit(settled_card("c2", "Who owns backups?"));
+        settle().await;
+
+        assert_eq!(qa.lock().unwrap().len(), 1, "only c2 is in the Q&A log");
+        assert!(chats.lock().unwrap().is_empty(), "the deleted Ask card is not chat either");
+        assert!(history.lock().unwrap().finalize(0).iter().all(|i| i.lead == "Building two." && i.question != "Where is the data center?"));
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let prompt = last_note_prompt(&calls);
+        assert!(!prompt.contains("Where is the data center?"), "{prompt}");
+        assert!(prompt.contains("Who owns backups?"), "{prompt}");
+    }
+
+    async fn rename_items_table(pool: &SqlitePool, from: &str, to: &str) {
+        sqlx::query(&format!("ALTER TABLE {from} RENAME TO {to}")).execute(pool).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_failed_database_delete_changes_nothing_and_a_retry_works() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        handle.0.lock().await.qa_log.lock().unwrap().push((id.clone(), "Q: x\nA: y".to_string()));
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert_eq!(saved_questions(&pool, "m1").await.len(), 1);
+
+        rename_items_table(&pool, "meeting_assistant_items", "parked_items").await;
+        assert!(delete_items(&handle, &pool, vec![id.clone()]).await.is_err());
+        {
+            let core = handle.0.lock().await;
+            assert_eq!(core.history.lock().unwrap().finalize(0).len(), 1, "the entry is still in the collector");
+            assert!(!core.history.lock().unwrap().is_deleted(&id));
+            assert_eq!(core.qa_log.lock().unwrap().len(), 1, "the Q&A log keeps it");
+            assert_eq!(core.ask_lane.snapshot().asks.len(), 1, "the lane keeps it");
+        }
+
+        rename_items_table(&pool, "parked_items", "meeting_assistant_items").await;
+        assert_eq!(delete_items(&handle, &pool, vec![id.clone()]).await, Ok(1));
+        assert!(saved_questions(&pool, "m1").await.is_empty(), "the retry deleted the row");
+        let core = handle.0.lock().await;
+        assert!(core.history.lock().unwrap().is_deleted(&id));
+        assert!(core.qa_log.lock().unwrap().is_empty());
+    }
+
+    /// A collector with an ask ("What are your fees?") and a settled card
+    /// ("c2"), a closed session, and meeting `m1` waiting to be saved.
+    async fn two_items_ready_to_save(
+        pool: &SqlitePool,
+        folder: &std::path::Path,
+    ) -> (AssistantHandle, super::super::history::HistoryHandle, String) {
+        add_meeting(pool, "m1", Some(folder.to_str().unwrap())).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        super::super::history::record_card(&history, &settled_card("c2", "Who owns backups?"));
+        close_session(&handle).await;
+        (handle, history, id)
+    }
+
+    fn json_questions(folder: &std::path::Path) -> Vec<String> {
+        let raw = std::fs::read_to_string(folder.join("assistant.json")).unwrap();
+        let file: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        file["items"].as_array().unwrap().iter().map(|i| i["question"].as_str().unwrap().to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn a_delete_waits_for_the_stop_save_then_reaches_its_rows_and_files() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+
+        // The Stop save is in flight: it holds the items gate.
+        let gate = super::super::history::lock_items_gate(&history).await;
+        let delete = {
+            let (handle, pool) = (handle.clone(), pool.clone());
+            tokio::spawn(async move { delete_items(&handle, &pool, vec![id]).await })
+        };
+        settle().await;
+        assert!(!delete.is_finished(), "a delete never runs between the save's steps");
+        let snapshot = super::super::history::snapshot_for_save(&history);
+        let written = super::super::history::write_rows(&pool, "m1", &snapshot).await.unwrap();
+        assert_eq!(super::super::history::finish_save(&pool, &history, "m1", &snapshot, written).await, Ok(2));
+        drop(gate);
+
+        assert_eq!(delete.await.unwrap(), Ok(1));
+        assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"]);
+        assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"]);
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+    }
+
+    /// The window the first round left open: a delete has decided the meeting
+    /// is not saved yet and is about to take the item out of the collector,
+    /// and the Stop save starts right then. The save must wait for the delete.
+    #[tokio::test]
+    async fn a_save_that_starts_while_a_delete_is_between_its_steps_waits_for_it() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+        let core_lock = handle.0.lock().await;
+        let delete = {
+            let (handle, pool) = (handle.clone(), pool.clone());
+            tokio::spawn(async move { delete_items(&handle, &pool, vec![id]).await })
+        };
+        tokio::task::yield_now().await;
+        drop(core_lock);
+        // Queued behind the delete's first look at the core, so it holds the
+        // lock the delete needs for its last step.
+        let core_lock = handle.0.lock().await;
+        let save = {
+            let (pool, history) = (pool.clone(), history.clone());
+            tokio::spawn(async move { super::super::history::save_for_meeting(&pool, &history, "m1").await })
+        };
+        settle().await;
+        drop(core_lock);
+
+        assert_eq!(delete.await.unwrap(), Ok(1));
+        save.await.unwrap().unwrap();
+        assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"]);
+        assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"]);
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+    }
+
+    /// Saves and deletes started together on real threads, with the delete
+    /// starting a little later each round: whichever order they take, the
+    /// deleted item is in no row, no `assistant.json` and no collector.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn saves_and_deletes_started_together_never_leave_the_deleted_item_behind() {
+        for round in 0..40 {
+            let pool = test_pool().await;
+            let folder = tempfile::tempdir().unwrap();
+            let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+            let save = {
+                let (pool, history) = (pool.clone(), history.clone());
+                tokio::spawn(async move { super::super::history::save_for_meeting(&pool, &history, "m1").await })
+            };
+            let delete = {
+                let (handle, pool) = (handle.clone(), pool.clone());
+                tokio::spawn(async move {
+                    for _ in 0..round % 10 {
+                        tokio::task::yield_now().await;
+                    }
+                    delete_items(&handle, &pool, vec![id]).await
+                })
+            };
+            save.await.unwrap().unwrap();
+            delete.await.unwrap().unwrap();
+            assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"], "round {round}");
+            assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"], "round {round}");
+            assert_eq!(history.lock().unwrap().finalize(0).len(), 1, "round {round}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_retry_after_the_files_failed_to_rebuild_brings_them_in_line() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        let (handle, history, id) = two_items_ready_to_save(&pool, folder.path()).await;
+        handle.0.lock().await.qa_log.lock().unwrap().push((id.clone(), "Q: fees\nA: ten".to_string()));
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert_eq!(json_questions(folder.path()).len(), 2);
+
+        // The row delete works, then reading the Brief to rebuild the file fails.
+        rename_items_table(&pool, "meeting_assistant_meta", "parked_meta").await;
+        assert!(delete_items(&handle, &pool, vec![id.clone()]).await.is_err());
+        assert_eq!(saved_questions(&pool, "m1").await, vec!["Who owns backups?"], "the row is gone");
+        {
+            let core = handle.0.lock().await;
+            assert!(core.history.lock().unwrap().is_deleted(&id), "the collector let go of it anyway");
+            assert!(core.qa_log.lock().unwrap().is_empty(), "so did the Q&A log");
+        }
+        assert_eq!(json_questions(folder.path()).len(), 2, "the file is stale until the retry");
+
+        rename_items_table(&pool, "parked_meta", "meeting_assistant_meta").await;
+        assert_eq!(delete_items(&handle, &pool, vec![id]).await, Ok(0), "nothing left to remove");
+        assert_eq!(json_questions(folder.path()), vec!["Who owns backups?"]);
+    }
+
+    #[tokio::test]
+    async fn a_delete_made_while_the_note_drafts_is_drafted_again_before_the_note_is_ready() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        let (history, qa) = {
+            let core = handle.0.lock().await;
+            (core.history_handle_for_test(), core.qa_log.clone())
+        };
+        let first_note = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let inner = note_runner(calls.clone());
+        // Joseph deletes c1 while the first note draft is with the model.
+        let runner: Runner = Arc::new(move |turn, on_delta, register| {
+            if turn.prompt.starts_with("TRANSCRIPT:") && first_note.swap(false, std::sync::atomic::Ordering::SeqCst) {
+                history.lock().unwrap().delete(&["c1".to_string()]);
+                qa.lock().unwrap().retain(|(id, _)| id != "c1");
+            }
+            inner(turn, on_delta, register)
+        });
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), runner).await;
+        {
+            let core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            record_card(&settled_card("c1", "Where is the data center?"), &qa, &chats);
+            record_card(&settled_card("c2", "Who owns backups?"), &qa, &chats);
+        }
+        close_session(&handle).await;
+
+        assert!(draft_note(&handle).await.is_ok());
+        let prompts: Vec<String> = calls
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|t| t.prompt.starts_with("TRANSCRIPT:"))
+            .map(|t| t.prompt.clone())
+            .collect();
+        assert_eq!(prompts.len(), 2, "drafted again once the first draft landed");
+        assert!(prompts[0].contains("Where is the data center?"));
+        assert!(!prompts[1].contains("Where is the data center?") && prompts[1].contains("Who owns backups?"), "{}", prompts[1]);
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready);
+    }
+
+    #[tokio::test]
+    async fn the_x_on_an_ask_item_also_takes_it_out_of_the_q_and_a_log_and_the_draft() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        {
+            let core = handle.0.lock().await;
+            let mut qa = core.qa_log.lock().unwrap();
+            qa.push((id.clone(), "Q: Where is the data center?\nA: Building two.".to_string()));
+            qa.push(("c2".to_string(), "Q: Who owns backups?\nA: Building two.".to_string()));
+        }
+
+        dismiss_ask(&handle, id).await;
+        settle().await;
+        assert_eq!(handle.0.lock().await.qa_log.lock().unwrap().len(), 1);
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let prompt = last_note_prompt(&calls);
+        assert!(!prompt.contains("Where is the data center?"), "{prompt}");
+        assert!(prompt.contains("Who owns backups?"), "{prompt}");
+    }
+
+    #[tokio::test]
+    async fn opening_a_session_after_a_saved_note_tells_the_panel_the_note_is_idle() {
+        let handle = AssistantHandle::new();
+        let sent = Arc::new(StdMutex::new(Vec::<(&'static str, String)>::new()));
+        {
+            let mut core = handle.0.lock().await;
+            let sink = sent.clone();
+            core.note_emit = Arc::new(move |out: NoteOut| sink.lock().unwrap().push((out.state, out.markdown)));
+            core.note_state = NoteState::Saved;
+            core.note_markdown = "## Summary".to_string();
+        }
+        let root = std::env::temp_dir().join(format!("meetily-note-idle-{}", uuid::Uuid::new_v4()));
+        open_session_in(&handle, Some(false), &root).await;
+
+        assert_eq!(sent.lock().unwrap().last(), Some(&("idle", String::new())));
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Idle);
+    }
+
+    #[tokio::test]
+    async fn deleting_on_the_past_meetings_tab_updates_the_live_session() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        add_meeting(&pool, "m2", None).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        {
+            let core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            record_card(&settled_card("c1", "Where is the data center?"), &qa, &chats);
+            record_card(&settled_card("c2", "Who owns backups?"), &qa, &chats);
+        }
+        super::super::history::record_card(&history, &settled_card("c1", "Where is the data center?"));
+        super::super::history::record_card(&history, &settled_card("c2", "Who owns backups?"));
+        let answered_id = handle.0.lock().await.ask_lane.snapshot().answered[0].id.clone();
+        close_session(&handle).await;
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert!(draft_note(&handle).await.is_ok());
+        let rows = AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap();
+        let row_of = |q: &str| rows.iter().find(|r| r.question == q).unwrap().id.clone();
+        let (c1_row, answered_row) = (row_of("Where is the data center?"), row_of("What are your fees?"));
+
+        // Another meeting's tab: nothing live changes, nothing is announced.
+        let announced = Arc::new(StdMutex::new(Vec::<Vec<String>>::new()));
+        let sink = announced.clone();
+        assert_eq!(
+            delete_past_items(&handle, &pool, "m2", vec![c1_row.clone()], move |ids| sink.lock().unwrap().push(ids)).await,
+            Ok(0)
+        );
+        assert!(announced.lock().unwrap().is_empty());
+        assert_eq!(handle.0.lock().await.qa_log.lock().unwrap().len(), 2);
+
+        // The saved meeting's tab: the live session follows.
+        let sink = announced.clone();
+        assert_eq!(
+            delete_past_items(&handle, &pool, "m1", vec![c1_row, answered_row], move |ids| sink.lock().unwrap().push(ids)).await,
+            Ok(2)
+        );
+        let announced = announced.lock().unwrap().clone();
+        assert_eq!(announced.len(), 1);
+        assert!(announced[0].contains(&"c1".to_string()), "{:?}", announced);
+        assert!(announced[0].contains(&answered_id), "{:?}", announced);
+        {
+            let core = handle.0.lock().await;
+            assert_eq!(core.qa_log.lock().unwrap().iter().map(|(id, _)| id.as_str()).collect::<Vec<_>>(), vec!["c2"]);
+            assert!(core.history.lock().unwrap().is_deleted("c1"));
+        }
+        settle().await;
+        settle().await;
+        let again = last_note_prompt(&calls);
+        assert!(!again.contains("Where is the data center?") && !again.contains("What are your fees?"), "{again}");
+        assert!(again.contains("Who owns backups?"), "{again}");
+    }
+
+    #[tokio::test]
+    async fn a_redraft_never_flips_a_saved_or_drafting_note() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready);
+        let turns = calls.lock().unwrap().len();
+
+        // A delete saw Ready and queued a redraft; Save ran before it started.
+        handle.0.lock().await.note_state = NoteState::Saved;
+        assert!(draft_note_if_ready(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Saved);
+        handle.0.lock().await.note_state = NoteState::Drafting;
+        assert!(draft_note_if_ready(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Drafting);
+        assert_eq!(calls.lock().unwrap().len(), turns, "no draft turn ran");
+
+        handle.0.lock().await.note_state = NoteState::Ready;
+        assert!(draft_note_if_ready(&handle).await.is_ok());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready);
+        assert!(calls.lock().unwrap().len() > turns, "a Ready note is drafted again");
+    }
+
+    #[tokio::test]
+    async fn the_note_uses_the_saved_meetings_brief_not_the_next_calls() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = super::super::history::new_handle();
+        h.lock().unwrap().reset(0);
+        h.lock().unwrap().set_brief("Plan the move");
+        super::super::history::save_for_meeting(&pool, &h, "m1").await.unwrap();
+        // After Stop the Brief box edits the next call's brief.
+        h.lock().unwrap().set_brief("Next call: pricing");
+        assert_eq!(meeting_facts(&pool, &h).await.unwrap().brief, "Plan the move");
+
+        // A meeting that was saved with no brief has none, whatever is typed after.
+        add_meeting(&pool, "m2", None).await;
+        let h2 = super::super::history::new_handle();
+        h2.lock().unwrap().reset(0);
+        super::super::history::save_for_meeting(&pool, &h2, "m2").await.unwrap();
+        h2.lock().unwrap().set_brief("Typed after Stop");
+        assert_eq!(meeting_facts(&pool, &h2).await.unwrap().brief, "");
+
+        // Not saved yet: the collector's brief is the only one there is.
+        let h3 = super::super::history::new_handle();
+        h3.lock().unwrap().reset(0);
+        h3.lock().unwrap().set_brief("Live brief");
+        assert_eq!(meeting_facts(&pool, &h3).await.unwrap().brief, "Live brief");
     }
 }

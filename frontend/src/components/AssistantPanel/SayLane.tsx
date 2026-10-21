@@ -5,6 +5,7 @@ import { CornerDownRight } from 'lucide-react';
 import { useAssistant } from '@/contexts/AssistantContext';
 import { cn } from '@/lib/utils';
 import { AssistantCard } from './AssistantCard';
+import { LaneAll, useSelection } from './selection';
 import { LANE_TONE } from './KindChip';
 
 type Filter = 'all' | 'answers' | 'mine';
@@ -22,7 +23,10 @@ const FILTERS: { id: Filter; label: string }[] = [
  */
 export function SayLane() {
   const { cards, status } = useAssistant();
-  const [filter, setFilter] = useState<Filter>('all');
+  const [chosenFilter, setFilter] = useState<Filter>('all');
+  // Select mode shows every card; the chosen filter comes back on leaving it.
+  const { selecting } = useSelection();
+  const filter: Filter = selecting ? 'all' : chosenFilter;
 
   const { pinned, earlier } = useMemo(() => {
     const newestFirst = [...cards].sort((a, b) => b.ts - a.ts);
@@ -45,22 +49,26 @@ export function SayLane() {
           <CornerDownRight className="h-3.5 w-3.5" aria-hidden="true" />
         </span>
         <h2 className={cn('flex-1 text-[15px] font-bold', LANE_TONE.say.title)}>Say</h2>
-        <div role="group" aria-label="Show" className="inline-flex gap-0.5 rounded-full bg-gray-100 p-0.5">
-          {FILTERS.map(f => (
-            <button
-              key={f.id}
-              type="button"
-              aria-pressed={filter === f.id}
-              onClick={() => setFilter(f.id)}
-              className={cn(
-                'rounded-full px-2.5 py-0.5 text-xs font-semibold',
-                filter === f.id ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
-              )}
-            >
-              {f.label}
-            </button>
-          ))}
-        </div>
+        {selecting ? (
+          <LaneAll ids={cards.map(c => c.id)} label="Select all in Say" />
+        ) : (
+          <div role="group" aria-label="Show" className="inline-flex gap-0.5 rounded-full bg-gray-100 p-0.5">
+            {FILTERS.map(f => (
+              <button
+                key={f.id}
+                type="button"
+                aria-pressed={filter === f.id}
+                onClick={() => setFilter(f.id)}
+                className={cn(
+                  'rounded-full px-2.5 py-0.5 text-xs font-semibold',
+                  filter === f.id ? 'bg-white text-gray-900 shadow-sm' : 'text-gray-500 hover:text-gray-700'
+                )}
+              >
+                {f.label}
+              </button>
+            ))}
+          </div>
+        )}
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto bg-gray-50">

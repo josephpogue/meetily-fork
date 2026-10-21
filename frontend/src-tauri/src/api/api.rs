@@ -1,7 +1,7 @@
 use log::{debug as log_debug, error as log_error, info as log_info, warn as log_warn};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
-use tauri::{AppHandle, Runtime};
+use tauri::{AppHandle, Emitter, Runtime};
 use tauri_plugin_store::StoreExt;
 
 use crate::{
@@ -766,14 +766,76 @@ pub async fn api_get_meeting_assistant(
     .map_err(|e| e.to_string())
 }
 
+/// What a past meeting's Assistant tab shows beside its items: the Brief and
+/// where the meeting was filed. No row gives an empty brief and nulls.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AssistantMetaOut {
+    pub brief: String,
+    pub vault_project: Option<String>,
+    pub vault_note_path: Option<String>,
+    pub filed_at: Option<String>,
+}
+
+impl From<Option<crate::database::repositories::assistant_meta::AssistantMeta>> for AssistantMetaOut {
+    fn from(m: Option<crate::database::repositories::assistant_meta::AssistantMeta>) -> Self {
+        match m {
+            Some(m) => Self {
+                brief: m.brief,
+                vault_project: m.vault_project,
+                vault_note_path: m.vault_note_path,
+                filed_at: m.filed_at,
+            },
+            None => Self { brief: String::new(), vault_project: None, vault_note_path: None, filed_at: None },
+        }
+    }
+}
+
+#[tauri::command]
+pub async fn api_get_meeting_assistant_meta(
+    state: tauri::State<'_, crate::state::AppState>,
+    meeting_id: String,
+) -> Result<AssistantMetaOut, String> {
+    crate::database::repositories::assistant_meta::AssistantMetaRepository::get(
+        state.db_manager.pool(),
+        &meeting_id,
+    )
+    .await
+    .map(AssistantMetaOut::from)
+    .map_err(|e| e.to_string())
+}
+
 /// Deletes the meeting's saved assistant items and its `assistant.json`.
 /// Returns the rows deleted.
 #[tauri::command]
 pub async fn api_delete_meeting_assistant(
     state: tauri::State<'_, AppState>,
+    history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
     meeting_id: String,
 ) -> Result<u32, String> {
-    crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &meeting_id).await
+    crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &history, &meeting_id).await
+}
+
+/// Deletes saved assistant items of one meeting by row id (as
+/// `api_get_meeting_assistant` returns them). When the live session saved this
+/// meeting, its items also leave the live collector and the note's Q&A log, a
+/// ready note is drafted again without them, and `assistant-items-deleted`
+/// `{ ids }` (every live id of the removed items) tells the panel to hide them.
+/// Returns the rows deleted.
+#[tauri::command]
+pub async fn api_delete_meeting_assistant_items<R: Runtime>(
+    app: AppHandle<R>,
+    state: tauri::State<'_, AppState>,
+    handle: tauri::State<'_, crate::assistant::AssistantHandle>,
+    meeting_id: String,
+    ids: Vec<String>,
+) -> Result<u32, String> {
+    crate::assistant::core::delete_past_items(handle.inner(), state.db_manager.pool(), &meeting_id, ids, |live_ids| {
+        if let Err(e) = app.emit("assistant-items-deleted", serde_json::json!({ "ids": live_ids })) {
+            log::warn!("assistant: failed to emit assistant-items-deleted: {}", e);
+        }
+    })
+    .await
 }
 
 #[tauri::command]
@@ -1421,5 +1483,19 @@ pub async fn api_test_custom_openai_connection<R: Runtime>(
                 Err(format!("Connection failed: {}", e))
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod assistant_meta_tests {
+    use super::*;
+
+    #[test]
+    fn no_row_serializes_to_an_empty_brief_and_nulls() {
+        let out = AssistantMetaOut::from(None);
+        assert_eq!(
+            serde_json::to_string(&out).unwrap(),
+            r#"{"brief":"","vaultProject":null,"vaultNotePath":null,"filedAt":null}"#
+        );
     }
 }

@@ -25,12 +25,23 @@ mock.module('../../src/components/ui/dialog', () => ({
 }));
 
 let stored: unknown[] | Error;
+let storedMeta: unknown | Error;
+const EMPTY_META = { brief: '', vaultProject: null, vaultNotePath: null, filedAt: null };
 const invoke = mock(async (command: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'api_get_meeting_assistant') {
     if (stored instanceof Error) throw stored;
     return stored;
   }
-  if (command === 'api_delete_meeting_assistant') return 3;
+  if (command === 'api_get_meeting_assistant_meta') {
+    if (storedMeta instanceof Error) throw storedMeta;
+    return storedMeta;
+  }
+  if (command === 'api_delete_meeting_assistant_items') {
+    // Like the backend: the deleted rows are gone from the next read.
+    const ids = (_args?.ids ?? []) as string[];
+    if (Array.isArray(stored)) stored = (stored as { id: string }[]).filter((row) => !ids.includes(row.id));
+    return ids.length;
+  }
   throw new Error(`unexpected ${command}`);
 });
 mock.module('@tauri-apps/api/core', () => ({ invoke }));
@@ -55,16 +66,29 @@ async function mount() {
 const textOf = (node: ReactTestInstance | string): string =>
   typeof node === 'string' ? node : node.children.map(textOf).join('');
 const allText = () => textOf(renderer.root);
-const button = (label: string) => renderer.root.findAll((n) => n.type === 'button' && textOf(n) === label);
+const button = (label: string) =>
+  renderer.root.findAll((n) => n.type === 'button' && (n.props['aria-label'] === label || textOf(n) === label));
 async function press(label: string) {
   await act(async () => { button(label)[0].props.onClick(); });
 }
-const deleteCalls = () => invoke.mock.calls.filter((c) => c[0] === 'api_delete_meeting_assistant');
+const box = (label: string) => renderer.root.findAll((n) => n.type === 'input' && n.props['aria-label'] === label);
+async function tick(label: string) {
+  await act(async () => { box(label)[0].props.onChange(); });
+}
+const deleteCalls = () => invoke.mock.calls.filter((c) => c[0] === 'api_delete_meeting_assistant_items');
+const listCalls = () => invoke.mock.calls.filter((c) => c[0] === 'api_get_meeting_assistant');
 
-afterEach(() => { mock.restore(); });
+// react-test-renderer has no window; the panel's Esc listener needs a stand-in, removed after each test.
+const keyListeners = new Set<(event: { key: string; defaultPrevented: boolean }) => void>();
+afterEach(() => { mock.restore(); delete (globalThis as { window?: unknown }).window; keyListeners.clear(); });
 beforeEach(() => {
+  (globalThis as { window?: unknown }).window = {
+    addEventListener: (_type: string, listener: never) => { keyListeners.add(listener); },
+    removeEventListener: (_type: string, listener: never) => { keyListeners.delete(listener); },
+  };
   invoke.mockClear();
   stored = [];
+  storedMeta = EMPTY_META;
   spyOn(console, 'error').mockImplementation(() => {});
 });
 
@@ -152,10 +176,10 @@ describe('AssistantHistoryPanel', () => {
     expect(allText()).toContain(`Answered (in Ask) at ${formatRecordingTime(125)}: Tuesday`);
   });
 
-  test('shows the empty state and no delete button when nothing was saved', async () => {
+  test('shows the empty state and no Select button when nothing was saved', async () => {
     await mount();
     expect(allText()).toContain('No assistant items were saved for this meeting.');
-    expect(button('Delete assistant items')).toHaveLength(0);
+    expect(button('Select assistant items')).toHaveLength(0);
   });
 
   test('shows a plain message when loading fails', async () => {
@@ -165,35 +189,185 @@ describe('AssistantHistoryPanel', () => {
     expect(allText()).not.toContain('secret path');
   });
 
-  test('deletes only after confirm; Cancel does not delete', async () => {
+  test('the old delete-all button is gone', async () => {
     stored = [item('a', 'answer', 10)];
     await mount();
-    await press('Delete assistant items');
-    expect(allText()).toContain('Delete the saved assistant items for this meeting? This also removes assistant.json from the recording folder.');
-    expect(deleteCalls()).toHaveLength(0);
-
-    await press('Cancel');
-    expect(deleteCalls()).toHaveLength(0);
-    expect(allText()).toContain('lead a');
-
-    await press('Delete assistant items');
-    await press('Delete');
-    expect(deleteCalls()).toEqual([['api_delete_meeting_assistant', { meetingId: 'm1' }]]);
-    expect(allText()).toContain('No assistant items were saved for this meeting.');
+    expect(button('Delete assistant items')).toHaveLength(0);
+    expect(button('Select assistant items')).toHaveLength(1);
+    expect(box('Select item: lead a')).toHaveLength(0);
   });
 
-  test('after a delete the button is gone, so focus goes to the panel heading', async () => {
-    stored = [item('a', 'answer', 10)];
+  test('selects one item, deletes it after confirm and reloads; Keep does not delete', async () => {
+    stored = [item('a', 'answer', 10), item('b', 'ask', 20), item('c', 'todo', 30, { owner: 'you', source: 'call' })];
+    await mount();
+    await press('Select assistant items');
+    expect(allText()).toContain('Pick items to delete');
+    expect(button('Delete selected assistant items')[0].props.disabled).toBe(true);
+    await tick('Select item: lead b');
+    expect(allText()).toContain('1 of 3 selected');
+    await press('Delete selected assistant items');
+    expect(allText()).toContain('Delete 1 assistant item?');
+    expect(allText()).toContain('They are removed from this meeting and from assistant.json. This can\u2019t be undone.');
+    expect(allText()).not.toContain('vault note');
+
+    await press('Keep assistant items');
+    expect(deleteCalls()).toHaveLength(0);
+    expect(allText()).toContain('lead b');
+
+    await press('Delete selected assistant items');
+    const reads = listCalls().length;
+    await press('Confirm delete assistant items');
+    expect(deleteCalls()).toEqual([['api_delete_meeting_assistant_items', { meetingId: 'm1', ids: ['b'] }]]);
+    expect(listCalls().length).toBe(reads + 1);
+    expect(allText()).not.toContain('lead b');
+    expect(allText()).toContain('lead a');
+    expect(allText()).toContain('lead c');
+    expect(button('Select assistant items')).toHaveLength(1);
+    expect(box('Select item: lead a')).toHaveLength(0);
+  });
+
+  test('a to-do row has its own checkbox and is deleted by its id', async () => {
+    stored = [
+      item('t1', 'todo', 2405, { lead: 'Send the design doc', owner: 'you', source: 'call' }),
+      item('t3', 'todo', 2170, { lead: 'Check the licence count', owner: 'you', source: 'call', answer: 'checked', answeredHow: 'call', answeredCallTime: 2530 }),
+      item('q', 'question', 600),
+    ];
+    await mount();
+    await press('Select assistant items');
+    expect(box('Select to-do: Send the design doc')).toHaveLength(1);
+    expect(box('Select to-do: Check the licence count')).toHaveLength(1);
+    await tick('Select to-do: Send the design doc');
+    await press('Delete selected assistant items');
+    await press('Confirm delete assistant items');
+    expect(deleteCalls()).toEqual([['api_delete_meeting_assistant_items', { meetingId: 'm1', ids: ['t1'] }]]);
+    expect(allText()).not.toContain('Send the design doc');
+  });
+
+  test('Select all then Delete confirms with the all wording and sends every id', async () => {
+    stored = [item('a', 'answer', 10), item('b', 'ask', 20), item('c', 'todo', 30, { owner: 'them', source: 'call' })];
     focused.length = 0;
     await mount();
-    await press('Delete assistant items');
-    await press('Delete');
-    expect(button('Delete assistant items')).toHaveLength(0);
-    const heading = renderer.root.findByType('h2');
-    expect(heading.props.tabIndex).toBe(-1);
+    await press('Select assistant items');
+    await tick('Select all assistant items');
+    expect(allText()).toContain('All 3 selected');
+    expect(box('Select all assistant items')[0].props.checked).toBe(true);
+    await press('Delete selected assistant items');
+    expect(allText()).toContain('Delete all 3 assistant items?');
+    expect(allText()).toContain('They are removed from this meeting, and assistant.json is removed from the recording folder.');
+    expect(button('Confirm delete assistant items').map(textOf)).toEqual(['Delete all']);
+    await press('Confirm delete assistant items');
+    expect(deleteCalls()).toEqual([['api_delete_meeting_assistant_items', { meetingId: 'm1', ids: ['a', 'b', 'c'] }]]);
+    expect(allText()).toContain('No assistant items were saved for this meeting.');
+    // Nothing is left to select, so focus goes to the panel heading.
+    expect(button('Select assistant items')).toHaveLength(0);
+    expect(focused).toEqual(['input']); // entering select mode focused Select all
+    focused.length = 0;
     const event = { preventDefault: mock(() => {}) };
     closeAutoFocus?.(event);
     expect(event.preventDefault).toHaveBeenCalled();
     expect(focused).toEqual(['h2']);
+  });
+
+  test('Select all ticks and unticks everything; Cancel leaves select mode', async () => {
+    stored = [item('a', 'answer', 10), item('b', 'ask', 20)];
+    await mount();
+    await press('Select assistant items');
+    await tick('Select item: lead a');
+    expect(allText()).toContain('1 of 2 selected');
+    await tick('Select all assistant items');
+    expect(allText()).toContain('All 2 selected');
+    await tick('Select all assistant items');
+    expect(allText()).toContain('Pick items to delete');
+    await press('Leave assistant select mode');
+    expect(box('Select item: lead a')).toHaveLength(0);
+    expect(button('Select assistant items')).toHaveLength(1);
+    expect(deleteCalls()).toHaveLength(0);
+  });
+
+  test('Esc leaves select mode, but not while an event is already handled (the dialog)', async () => {
+    stored = [item('a', 'answer', 10)];
+    await mount();
+    await press('Select assistant items');
+    await tick('Select item: lead a');
+    await act(async () => { keyListeners.forEach((l) => l({ key: 'Escape', defaultPrevented: true })); });
+    expect(box('Select item: lead a')).toHaveLength(1);
+    await act(async () => { keyListeners.forEach((l) => l({ key: 'Escape', defaultPrevented: false })); });
+    expect(box('Select item: lead a')).toHaveLength(0);
+    expect(button('Select assistant items')).toHaveLength(1);
+    expect(deleteCalls()).toHaveLength(0);
+  });
+
+  test('a failed delete keeps the items and shows the alert', async () => {
+    stored = [item('a', 'answer', 10)];
+    await mount();
+    await press('Select assistant items');
+    await tick('Select item: lead a');
+    await press('Delete selected assistant items');
+    invoke.mockImplementationOnce(async () => { throw new Error('disk'); });
+    await press('Confirm delete assistant items');
+    expect(renderer.root.findByProps({ role: 'alert' }).children.join('')).toBe('Could not delete the selected items.');
+    expect(allText()).toContain('lead a');
+  });
+
+  describe('Brief and Filed blocks', () => {
+    const filed = {
+      brief: 'PNC sync with Jim',
+      vaultProject: 'broadcom-pnc-bank',
+      vaultNotePath: '/v/_sources/meetings/2026-10-21-pnc-sync.md',
+      filedAt: '2026-10-21T18:00:00Z',
+    };
+
+    test('shows the brief in full and the filed line, above the ledger, and the confirm names the vault note', async () => {
+      const longBrief = `PNC sync with Jim. ${'Confirm the wave order. '.repeat(40)}`.trim();
+      stored = [item('t1', 'todo', 5, { owner: 'you', source: 'call' }), item('q', 'question', 9)];
+      storedMeta = { ...filed, brief: longBrief };
+      await mount();
+      expect(invoke).toHaveBeenCalledWith('api_get_meeting_assistant_meta', { meetingId: 'm1' });
+      const brief = renderer.root.findByProps({ 'aria-label': 'Brief' });
+      expect(textOf(brief)).toBe(`Brief: ${longBrief}`);
+      expect(brief.findAll((n) => String(n.props.className ?? '').includes('line-clamp'))).toHaveLength(0);
+      const text = allText();
+      expect(text).toContain('Filed to the vault under');
+      expect(text).toContain('broadcom-pnc-bank');
+      expect(text).toContain('2026-10-21-pnc-sync.md');
+      expect(text).not.toContain('/v/_sources');
+      expect(text.indexOf('Filed to the vault')).toBeLessThan(text.indexOf('Brief:'));
+      expect(text.indexOf('Brief:')).toBeLessThan(text.indexOf('from this call'));
+      expect(text.indexOf('from this call')).toBeLessThan(text.indexOf('lead q'));
+
+      await press('Select assistant items');
+      await tick('Select item: lead q');
+      await press('Delete selected assistant items');
+      expect(allText()).toContain('The vault note 2026-10-21-pnc-sync.md in broadcom-pnc-bank is updated too. This can\u2019t be undone.');
+    });
+
+    test('with the meeting already holding the brief, a delete reloads the meta too', async () => {
+      stored = [item('a', 'answer', 10), item('b', 'ask', 20)];
+      storedMeta = filed;
+      await mount();
+      const metaReads = () => invoke.mock.calls.filter((c) => c[0] === 'api_get_meeting_assistant_meta').length;
+      expect(metaReads()).toBe(1);
+      await press('Select assistant items');
+      await tick('Select item: lead a');
+      await press('Delete selected assistant items');
+      await press('Confirm delete assistant items');
+      expect(metaReads()).toBe(2);
+    });
+
+    test('an empty brief and no filing render neither block', async () => {
+      stored = [item('a', 'answer', 10)];
+      await mount();
+      expect(renderer.root.findAllByProps({ 'aria-label': 'Brief' })).toHaveLength(0);
+      expect(allText()).not.toContain('Filed to the vault');
+    });
+
+    test('a meta call that rejects (an older build) still shows the items, with no Brief or Filed block', async () => {
+      stored = [item('a', 'answer', 10)];
+      storedMeta = new Error('command api_get_meeting_assistant_meta not found');
+      await mount();
+      expect(allText()).toContain('lead a');
+      expect(renderer.root.findAllByProps({ 'aria-label': 'Brief' })).toHaveLength(0);
+      expect(allText()).not.toContain('Filed to the vault');
+    });
   });
 });
