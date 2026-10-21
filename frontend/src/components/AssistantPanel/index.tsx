@@ -20,6 +20,7 @@ import { BriefBar } from './BriefBar';
 import { BriefFull } from './BriefFull';
 import { SayLane } from './SayLane';
 import { AskLane } from './AskLane';
+import { TodoDock } from './TodoDock';
 import { ScreenRecordingLine } from './ScreenRecordingLine';
 import {
   PANEL_KEY_STEP,
@@ -175,6 +176,13 @@ export function AssistantPanel() {
   const [lastErrorMessage, setLastErrorMessage] = useState<string | null>(null);
   const clearLastErrorTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // A to-do the backend would not add shows in the same quiet line.
+  const showQuietError = useCallback((message: string) => {
+    setLastErrorMessage(message);
+    if (clearLastErrorTimer.current) clearTimeout(clearLastErrorTimer.current);
+    clearLastErrorTimer.current = setTimeout(() => setLastErrorMessage(null), LAST_ERROR_DISPLAY_MS);
+  }, []);
+
   useEffect(() => {
     if (!status.lastError || status.lastErrorSeq === 0) return;
 
@@ -322,7 +330,7 @@ export function AssistantPanel() {
       />
 
       {/* Body: empty states or the two lanes */}
-      <div className="flex min-h-0 flex-1 flex-col overflow-hidden">
+      <div className="relative flex min-h-0 flex-1 flex-col overflow-hidden">
         {briefOpen && (!status.enabled || !status.claudeOk) ? (
           // The brief stays usable while the assistant is off or Claude is
           // missing; it takes the place of the empty-state message.
@@ -348,22 +356,25 @@ export function AssistantPanel() {
             }
           />
         ) : (
-          <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
-            <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
-              <SayLane />
+          <>
+            <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
+              <div className="flex min-h-0 min-w-0 flex-col overflow-hidden">
+                <SayLane />
+              </div>
+              <div className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-gray-200">
+                {briefOpen ? (
+                  <BriefFull
+                    editing={briefEditing}
+                    onEdit={() => setBriefEditing(true)}
+                    onSaved={() => setBriefEditing(false)}
+                  />
+                ) : (
+                  <AskLane disabled={actionsDisabled} />
+                )}
+              </div>
             </div>
-            <div className="flex min-h-0 min-w-0 flex-col overflow-hidden border-l border-gray-200">
-              {briefOpen ? (
-                <BriefFull
-                  editing={briefEditing}
-                  onEdit={() => setBriefEditing(true)}
-                  onSaved={() => setBriefEditing(false)}
-                />
-              ) : (
-                <AskLane disabled={actionsDisabled} />
-              )}
-            </div>
-          </div>
+            <TodoDock />
+          </>
         )}
       </div>
 
@@ -402,7 +413,7 @@ export function AssistantPanel() {
             <kbd className="rounded border border-gray-200 bg-gray-50 px-1.5 font-sans text-[11px] text-gray-500" aria-hidden="true">⌥C</kbd>
           </Button>
         </div>
-        <AskBox disabled={actionsDisabled} />
+        <AskBox disabled={actionsDisabled} onError={showQuietError} />
       </div>
     </div>
   );

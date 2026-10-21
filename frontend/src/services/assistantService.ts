@@ -90,6 +90,16 @@ export class AssistantService {
     return invoke('assistant_dismiss_ask', { id });
   }
 
+  /** Add a to-do Joseph typed (the text after todo:). Rejects with a message when it cannot. */
+  async addTodo(text: string): Promise<void> {
+    return invoke('assistant_add_todo', { text });
+  }
+
+  /** Dismiss a to-do (open or done) from the live list. */
+  async dismissTodo(id: string): Promise<void> {
+    return invoke('assistant_dismiss_todo', { id });
+  }
+
   /** Joseph answered a For-you question: it moves to the answered list with his answer. */
   async answerAsk(id: string, answer: string): Promise<void> {
     return invoke('assistant_answer_ask', { id, answer });
