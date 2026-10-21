@@ -23,7 +23,7 @@ import { BriefFull } from './BriefFull';
 import { SelectBar } from './SelectBar';
 import { SelectionContext, type SelectionValue } from './selection';
 import { SayLane } from './SayLane';
-import { AskLane } from './AskLane';
+import { AskLane, askLaneIds } from './AskLane';
 import { TodoDock } from './TodoDock';
 import { ScreenRecordingLine } from './ScreenRecordingLine';
 import {
@@ -241,7 +241,7 @@ export function AssistantPanel() {
   const selectButton = useRef<HTMLButtonElement>(null);
 
   const allIds = useMemo(
-    () => [...cards, ...asks.asks, ...asks.forYou, ...asks.answered, ...(asks.todos ?? [])].map(item => item.id),
+    () => [...cards.map(item => item.id), ...askLaneIds(asks), ...(asks.todos ?? []).map(item => item.id)],
     [cards, asks]
   );
   const selectedIds = useMemo(() => allIds.filter(id => picked.has(id)), [allIds, picked]);

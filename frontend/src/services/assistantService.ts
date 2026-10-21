@@ -195,6 +195,16 @@ export class AssistantService {
       callback(event.payload);
     });
   }
+
+  /**
+   * Listen for deletes made on the Assistant tab: the live ids that were removed,
+   * so the live panel drops the same items.
+   */
+  async onItemsDeleted(callback: (payload: { ids: string[] }) => void): Promise<UnlistenFn> {
+    return listen<{ ids: string[] }>('assistant-items-deleted', (event) => {
+      callback(event.payload);
+    });
+  }
 }
 
 // Export singleton instance

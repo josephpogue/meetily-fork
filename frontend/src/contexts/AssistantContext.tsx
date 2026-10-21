@@ -75,7 +75,10 @@ interface AssistantContextType {
   saveNote: (project: string | null) => Promise<void>;
   /** The project the note was last filed under: undefined before a save, null for none. */
   savedNoteProject: string | null | undefined;
-  listVaultProjects: () => Promise<string[]>;
+  /** Why the last Save failed, or null. The note stays ready so Joseph can pick again. */
+  saveNoteError: string | null;
+  /** The vault's project slugs, or null when they could not be read. */
+  listVaultProjects: () => Promise<string[] | null>;
   suggestVaultProject: () => Promise<string | null>;
   discardNote: () => Promise<void>;
   setBrief: (text: string) => Promise<void>;
@@ -103,6 +106,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [voice, setVoice] = useState<AssistantVoice>(DEFAULT_VOICE);
   const [note, setNote] = useState<AssistantNote>(DEFAULT_NOTE);
   const [savedNoteProject, setSavedNoteProject] = useState<string | null | undefined>(undefined);
+  const [saveNoteError, setSaveNoteError] = useState<string | null>(null);
   const [rawAsks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
   const [rawCards, setCards] = useState<AssistantCard[]>(INITIAL_CARDS);
   // Ids Joseph deleted this session. The backend keeps sending some of them (an
@@ -196,6 +200,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
 
         const unlistenNote = await assistantService.onNote((next) => {
           setNote(next);
+          // A new draft is a new note: it shows neither the last note's saved
+          // project nor the last save's error.
+          if (next.state === 'drafting') {
+            setSavedNoteProject(undefined);
+            setSaveNoteError(null);
+          }
         });
         unsubscribers.push(unlistenNote);
 
@@ -203,6 +213,12 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
           setAsks(next);
         });
         unsubscribers.push(unlistenAsks);
+
+        // Deletes made on the Assistant tab: the same live ids leave this panel.
+        const unlistenDeleted = await assistantService.onItemsDeleted(({ ids }) => {
+          setDeletedIds(prev => new Set([...prev, ...ids]));
+        });
+        unsubscribers.push(unlistenDeleted);
 
         console.log('[AssistantContext] Event listeners set up successfully');
       } catch (error) {
@@ -302,11 +318,13 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const saveNote = useCallback(async (project: string | null) => {
+    setSaveNoteError(null);
     try {
       const saved = await assistantService.saveNote(project);
       setSavedNoteProject(saved.project);
     } catch (error) {
       console.error('[AssistantContext] assistant_save_note failed:', error);
+      setSaveNoteError(typeof error === 'string' ? error : error instanceof Error ? error.message : 'Unknown error.');
     }
   }, []);
 
@@ -315,7 +333,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       return await assistantService.listVaultProjects();
     } catch (error) {
       console.error('[AssistantContext] assistant_list_vault_projects failed:', error);
-      return [];
+      return null;
     }
   }, []);
 
@@ -436,6 +454,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     draftNote,
     saveNote,
     savedNoteProject,
+    saveNoteError,
     listVaultProjects,
     suggestVaultProject,
     discardNote,

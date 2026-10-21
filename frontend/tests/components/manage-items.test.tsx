@@ -23,6 +23,7 @@ afterAll(() => {
 let cardListener: ((card: unknown) => void) | undefined;
 let asksListener: ((asks: unknown) => void) | undefined;
 let statusListener: ((status: unknown) => void) | undefined;
+let deletedListener: ((payload: { ids: string[] }) => void) | undefined;
 const deleteItems = mock((_ids: string[]): Promise<number> => Promise.resolve(0));
 mock.module('../../src/services/assistantService', () => ({
   assistantService: {
@@ -32,6 +33,7 @@ mock.module('../../src/services/assistantService', () => ({
     onVoice: async () => () => {},
     onNote: async () => () => {},
     onAsks: async (cb: (asks: unknown) => void) => { asksListener = cb; return () => {}; },
+    onItemsDeleted: async (cb: (p: { ids: string[] }) => void) => { deletedListener = cb; return () => {}; },
     deleteItems,
   },
 }));
@@ -123,7 +125,7 @@ const openDrawer = () => act(async () => { control('Open to-do list').props.onCl
 beforeEach(() => {
   deleteItems.mockClear();
   deleteItems.mockImplementation(() => Promise.resolve(0));
-  cardListener = undefined; asksListener = undefined; statusListener = undefined; keyHandlers.length = 0;
+  cardListener = undefined; asksListener = undefined; statusListener = undefined; deletedListener = undefined; keyHandlers.length = 0;
 });
 afterEach(async () => {
   if (renderer) await act(async () => renderer.unmount());
@@ -281,5 +283,43 @@ describe('Esc', () => {
     // Not selecting any more: Esc now closes the drawer, as before.
     await act(async () => { pressEscape(); });
     expect(control('Close to-do list')).toBeUndefined();
+  });
+});
+
+describe('deletes made elsewhere', () => {
+  test('an assistant-items-deleted event removes those live items from the panel', async () => {
+    await mount();
+    expect(text()).toContain('Who signs off on the DR test?');
+    await act(async () => { deletedListener!({ ids: ['a3', 'c2', 'r1'] }); });
+    const out = text();
+    expect(out).not.toContain('Who signs off on the DR test?');
+    expect(out).not.toContain('12 hosts');
+    expect(out).not.toContain('How many vCenters');
+    expect(out).toContain('Which wave carries');
+    expect(out).toContain('Yes, until the last wave.');
+  });
+});
+
+describe('select all matches what the lanes show', () => {
+  test('questions hidden by "Questions unavailable" are not in Select all or the counts', async () => {
+    await mount({}, asksPayload({ state: 'unavailable' }));
+    expect(text()).toContain('Questions unavailable for this call.');
+    expect(text()).not.toContain('Which wave carries');
+    await press('Select items');
+    await check('Select all items');
+    // 9 items less the 3 hidden open questions.
+    expect(text()).toContain('6 selected');
+    await press('Delete selected items');
+    await press('Confirm delete selected items');
+    expect([...deleteItems.mock.calls[0][0]].sort()).toEqual(['c1', 'c2', 'f1', 'r1', 't1', 't2']);
+  });
+
+  test('the Ask lane Select all leaves the hidden questions out too', async () => {
+    await mount({}, asksPayload({ state: 'unavailable' }));
+    await press('Select items');
+    await check('Select all in Ask');
+    await press('Delete selected items');
+    await press('Confirm delete selected items');
+    expect([...deleteItems.mock.calls[0][0]].sort()).toEqual(['f1', 'r1']);
   });
 });

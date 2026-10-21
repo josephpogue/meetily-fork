@@ -5,7 +5,7 @@ import { Check, CircleHelp, Loader2, RefreshCw, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { useAssistant } from '@/contexts/AssistantContext';
-import { AssistantAnsweredItem, AssistantAskItem } from '@/types';
+import { AssistantAnsweredItem, AssistantAsks, AssistantAskItem } from '@/types';
 import { answeredHowLine, appendBriefAnswer, formatOpenStamp, newAskIds } from '@/lib/ask-next';
 import { cn } from '@/lib/utils';
 import { KindChip, LANE_TONE } from './KindChip';
@@ -28,6 +28,16 @@ const SLOT = 'mt-0.5 grid h-5 w-5 shrink-0 place-items-center';
  * whole; nothing in it is clamped. Refreshes when someone finishes speaking,
  * on the Refresh button, and on Option-Q. The last lists stay after the call.
  */
+/**
+ * The question ids the Ask lane renders, for Select all and the counts. When the
+ * lane says "Questions unavailable" instead of its open list, those open
+ * questions are hidden and so are left out; For you and answered always show.
+ */
+export function askLaneIds(asks: AssistantAsks): string[] {
+  const open = asks.state === 'unavailable' ? [] : asks.asks;
+  return [...open, ...asks.forYou, ...asks.answered].map((item) => item.id);
+}
+
 export function AskLane({ disabled }: { disabled: boolean }) {
   const { status, asks, refreshAsks, deleteItems, answerAsk, setBrief } = useAssistant();
   const [now, setNow] = useState(() => Date.now());
@@ -105,7 +115,7 @@ export function AskLane({ disabled }: { disabled: boolean }) {
         thinking={thinking}
         refreshOff={disabled || asks.state === 'unavailable'}
         onRefresh={refreshAsks}
-        allIds={[...asks.asks, ...asks.forYou, ...asks.answered].map((item) => item.id)}
+        allIds={askLaneIds(asks)}
       />
       <div className="min-h-0 flex-1 overflow-y-auto px-3 pb-3">
         <div className="flex items-center justify-between gap-2 py-2">

@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown, { Components } from 'react-markdown';
 import { Check, ChevronsUpDown, FileText, FolderOpen, Loader2, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
@@ -31,25 +31,46 @@ const markdownComponents: Components = {
  * Save is the only write; nothing else in the panel writes anywhere.
  */
 export function NoteBar() {
-  const { note, draftNote, saveNote, savedNoteProject, listVaultProjects, suggestVaultProject, discardNote } =
-    useAssistant();
+  const {
+    note,
+    draftNote,
+    saveNote,
+    savedNoteProject,
+    saveNoteError,
+    listVaultProjects,
+    suggestVaultProject,
+    discardNote,
+  } = useAssistant();
   const [projects, setProjects] = useState<string[]>([]);
   const [suggested, setSuggested] = useState<string | null>(null);
-  // '' is "No project". Set to the suggestion once it loads, unless Joseph picked first.
+  // '' is "No project". Set to the suggestion when the list loads, unless Joseph
+  // already picked for this note: his pick survives a background redraft (a
+  // delete after Draft note) and resets only when the note goes back to idle.
   const [choice, setChoice] = useState('');
+  const picked = useRef(false);
   const [loaded, setLoaded] = useState(false);
+  const [listFailed, setListFailed] = useState(false);
 
   const ready = note.state === 'ready';
+  const idle = note.state === 'idle';
+  useEffect(() => {
+    if (!idle) return;
+    picked.current = false;
+    setChoice('');
+  }, [idle]);
+
   useEffect(() => {
     if (!ready) return;
     let cancelled = false;
     setLoaded(false);
     Promise.all([listVaultProjects(), suggestVaultProject()]).then(([list, suggestion]) => {
       if (cancelled) return;
-      const pick = suggestion && list.includes(suggestion) ? suggestion : null;
-      setProjects(list);
+      const all = list ?? [];
+      const pick = suggestion && all.includes(suggestion) ? suggestion : null;
+      setProjects(all);
+      setListFailed(list === null);
       setSuggested(pick);
-      setChoice(pick ?? '');
+      setChoice((current) => (picked.current && (current === '' || all.includes(current)) ? current : (pick ?? '')));
       setLoaded(true);
     });
     return () => {
@@ -58,12 +79,15 @@ export function NoteBar() {
   }, [ready, listVaultProjects, suggestVaultProject]);
 
   const others = projects.filter((slug) => slug !== suggested);
-  const hint =
-    choice === ''
-      ? 'Save keeps the note without a project.'
-      : choice === suggested
-        ? 'Suggested from the brief and the call. Save files the note under this project.'
-        : 'Save files the note under this project.';
+  const hint = listFailed
+    ? 'Could not read the vault projects. Save keeps the note without a project.'
+    : loaded && projects.length === 0
+      ? 'No vault projects found. Save keeps the note without a project.'
+      : choice === ''
+        ? 'Save keeps the note without a project.'
+        : choice === suggested
+          ? 'Suggested from the brief and the call. Save files the note under this project.'
+          : 'Save files the note under this project.';
 
   return (
     <div className="border-t border-gray-200 bg-gray-50 p-3">
@@ -100,7 +124,10 @@ export function NoteBar() {
                   id="note-project"
                   aria-label="Vault project"
                   value={choice}
-                  onChange={(e) => setChoice(e.target.value)}
+                  onChange={(e) => {
+                    picked.current = true;
+                    setChoice(e.target.value);
+                  }}
                   className="h-8 w-full min-w-0 cursor-pointer appearance-none rounded-md border border-gray-300 bg-white pl-2.5 pr-8 text-[13px] text-gray-900 hover:border-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
                 >
                   {suggested && (
@@ -140,6 +167,7 @@ export function NoteBar() {
               Discard
             </Button>
           </div>
+          {saveNoteError && <p className="text-sm text-red-600">{`Could not save the note: ${saveNoteError}`}</p>}
         </div>
       )}
 

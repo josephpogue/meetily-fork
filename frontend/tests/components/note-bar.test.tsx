@@ -10,7 +10,9 @@ afterAll(() => {
 let noteListener: ((note: unknown) => void) | undefined;
 let projects: string[] = [];
 let suggestion: string | null = null;
-const saveNote = mock((project: string | null) => Promise.resolve({ notePath: '/v/n.md', project }));
+let listFails = false;
+const saveNote = mock((project: string | null): Promise<{ notePath: string; project: string | null }> =>
+  Promise.resolve({ notePath: '/v/n.md', project }));
 mock.module('../../src/services/assistantService', () => ({
   assistantService: {
     getState: () => new Promise(() => {}),
@@ -19,7 +21,8 @@ mock.module('../../src/services/assistantService', () => ({
     onVoice: async () => () => {},
     onAsks: async () => () => {},
     onNote: async (cb: (note: unknown) => void) => { noteListener = cb; return () => {}; },
-    listVaultProjects: () => Promise.resolve(projects),
+    onItemsDeleted: async () => () => {},
+    listVaultProjects: () => (listFails ? Promise.reject('vault offline') : Promise.resolve(projects)),
     suggestVaultProject: () => Promise.resolve(suggestion),
     saveNote,
   },
@@ -45,6 +48,8 @@ const saveButton = () => renderer.root.findAllByType('button').find((b) => colle
 
 beforeEach(() => {
   saveNote.mockClear();
+  saveNote.mockImplementation((project) => Promise.resolve({ notePath: '/v/n.md', project }));
+  listFails = false;
   noteListener = undefined;
   renderer = undefined as unknown as ReactTestRenderer;
   projects = ['a', 'b', 'broadcom-pnc-bank'];
@@ -92,5 +97,88 @@ describe('NoteBar project picker', () => {
     expect(select().props.value).toBe('');
     expect(optionLabels()).toEqual(['No project', 'a', 'b', 'broadcom-pnc-bank']);
     expect(renderer.root.findAllByType('optgroup').map((g) => g.props.label)).toEqual(['All projects']);
+  });
+
+  test('a redraft keeps the project Joseph picked, and Save sends it', async () => {
+    suggestion = 'bar';
+    projects = ['bar', 'foo'];
+    await showNote('ready');
+    expect(select().props.value).toBe('bar');
+    await act(async () => { select().props.onChange({ target: { value: 'foo' } }); });
+    await showNote('drafting');
+    await showNote('ready');
+    expect(select().props.value).toBe('foo');
+    await act(async () => { saveButton().props.onClick(); });
+    expect(saveNote).toHaveBeenCalledWith('foo');
+  });
+
+  test('the pick resets to the suggestion once the note goes back to idle', async () => {
+    suggestion = 'bar';
+    projects = ['bar', 'foo'];
+    await showNote('ready');
+    await act(async () => { select().props.onChange({ target: { value: 'foo' } }); });
+    await showNote('idle');
+    await showNote('drafting');
+    await showNote('ready');
+    expect(select().props.value).toBe('bar');
+  });
+});
+
+describe('NoteBar save and project list failures', () => {
+  const quiet = async (fn: () => Promise<void>) => {
+    const logged = console.error;
+    console.error = () => {};
+    try { await fn(); } finally { console.error = logged; }
+  };
+
+  test('a failed Save shows the error under the buttons and the note stays ready', async () => {
+    saveNote.mockImplementation(() => Promise.reject('Project page gone'));
+    await showNote('ready');
+    await quiet(async () => { await act(async () => { saveButton().props.onClick(); }); });
+    expect(text()).toContain('Could not save the note: Project page gone');
+    expect(select()).toBeDefined();
+    expect(saveButton().props.disabled).toBeFalsy();
+    // Picking again clears the old error on the next attempt.
+    saveNote.mockImplementation((project) => Promise.resolve({ notePath: '/v/n.md', project }));
+    await act(async () => { saveButton().props.onClick(); });
+    expect(text()).not.toContain('Could not save the note');
+  });
+
+  test('an Error rejection shows its message', async () => {
+    saveNote.mockImplementation(() => Promise.reject(new Error('disk full')));
+    await showNote('ready');
+    await quiet(async () => { await act(async () => { saveButton().props.onClick(); }); });
+    expect(text()).toContain('Could not save the note: disk full');
+  });
+
+  test('a new draft forgets the earlier note\'s saved project', async () => {
+    await showNote('ready');
+    await act(async () => { saveButton().props.onClick(); });
+    await showNote('saved');
+    expect(text()).toContain('Note saved to broadcom-pnc-bank.');
+    await showNote('idle');
+    await showNote('drafting');
+    await showNote('saved');
+    expect(text()).toContain('Note saved.');
+    expect(text()).not.toContain('broadcom-pnc-bank');
+  });
+
+  test('a failed project list keeps Save enabled and says Save files with no project', async () => {
+    listFails = true;
+    await quiet(async () => { await showNote('ready'); });
+    expect(text()).toContain('Could not read the vault projects. Save keeps the note without a project.');
+    expect(text()).not.toContain('Suggested from the brief');
+    expect(saveButton().props.disabled).toBeFalsy();
+    await act(async () => { saveButton().props.onClick(); });
+    expect(saveNote).toHaveBeenCalledWith(null);
+  });
+
+  test('an empty project list gets its own hint', async () => {
+    projects = [];
+    suggestion = null;
+    await showNote('ready');
+    expect(text()).toContain('No vault projects found. Save keeps the note without a project.');
+    expect(text()).not.toContain('Could not read');
+    expect(saveButton().props.disabled).toBeFalsy();
   });
 });
