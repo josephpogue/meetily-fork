@@ -2,6 +2,7 @@
 // Exit codes: 0 done; 1 the text or window never appeared, the app answered too slowly ("app did not answer within Ns"),
 // or it reported an error; 3 nothing is answering (connection refused, reset or closed); 64 usage.
 import net from 'node:net';
+import { pathToFileURL } from 'node:url';
 import { remote } from 'webdriverio';
 
 const [verb, a, b] = process.argv.slice(2);
@@ -77,23 +78,77 @@ async function firstDisplayed(browser, xpath) {
   return null;
 }
 
-// A matching element that exists but is not displayed (a dismiss X that is opacity-0 until its row is hovered) is shown by
-// hovering the closest ancestor that is displayed, nearest first. The pointer does not survive between ui.mjs runs (each
-// opens its own WebDriver session), so `click` does this itself instead of relying on an earlier `hover`.
-// Returns the element once it is displayed, else null. It never presses an element that stays invisible.
-async function reveal(browser, t) {
-  const el = (await browser.$$(xpathExact(t)))[0];
-  if (!el) return null;
-  const ancestors = (await el.$$('./ancestor::*')).reverse();
-  for (const ancestor of ancestors) {
-    if (!(await ancestor.isDisplayed())) continue;
-    await ancestor.moveTo();
-    for (let i = 0; i < 4; i++) { // a hover transition takes a moment to finish
-      if (await el.isDisplayed()) return el;
-      await sleep(250);
-    }
+// A control that only shows while its row is hovered (the dismiss X buttons: opacity-0, group-hover:opacity-100) cannot be
+// shown here: the app's WebDriver pointer actions do not produce a CSS :hover. So `click` presses such a control the way a
+// person hovering the row and clicking would, but only when hover-reveal opacity is the one thing hiding it.
+// `facts` describes the element: `chain` is the element then each ancestor up to the root, each with its computed
+// display, visibility and opacity and whether it is a row (class "group"); then the box, the viewport, the tag, the
+// disabled flags, and whether document.elementFromPoint at the box centre is the element itself or inside it.
+// Pure, so a test feeds it fake values. It is also stringified into the page by revealScript, so it must use nothing outside itself.
+export function hoverRevealDecision(facts) {
+  const no = (why) => ({ ok: false, why });
+  const { chain, rect, viewport } = facts ?? {};
+  if (!Array.isArray(chain) || chain.length === 0 || !rect || !viewport) return no('no facts');
+  if (chain.some((c) => c.display === 'none')) return no('display none');
+  if (chain.some((c) => c.visibility !== 'visible')) return no('visibility not visible');
+  // The row is the nearest ancestor with class "group". Opacity 0 on the element or between it and the row is the hover
+  // reveal; the row and everything above it must be visible, or the whole row is hidden for another reason.
+  const row = chain.findIndex((c, i) => i > 0 && c.isRow);
+  if (row < 0) return no('no hover row');
+  if (!chain.slice(0, row).some((c) => Number(c.opacity) === 0)) return no('not hidden by opacity');
+  if (chain.slice(row).some((c) => Number(c.opacity) === 0)) return no('row hidden');
+  if (!(rect.width > 0 && rect.height > 0)) return no('no box');
+  if (rect.left < 0 || rect.top < 0 || rect.right > viewport.width || rect.bottom > viewport.height) return no('outside viewport');
+  const link = facts.tag === 'a' && facts.hasHref;
+  if (facts.tag !== 'button' && !link) return no('not a button or link');
+  if (facts.disabled || facts.ariaDisabled === 'true') return no('disabled');
+  if (!facts.hitSelf) return no('covered by another element');
+  return { ok: true, why: 'hover-revealed' };
+}
+
+// Reads the facts from the page (see hoverRevealDecision) for the element passed as the script argument.
+function collectRevealFacts(el) {
+  const chain = [];
+  for (let n = el; n && n.nodeType === 1; n = n.parentElement) {
+    const cs = getComputedStyle(n);
+    chain.push({ display: cs.display, visibility: cs.visibility, opacity: cs.opacity, isRow: n.classList.contains('group') });
   }
-  return null;
+  const r = el.getBoundingClientRect();
+  const hit = document.elementFromPoint(r.left + r.width / 2, r.top + r.height / 2);
+  return {
+    chain,
+    rect: { left: r.left, top: r.top, right: r.right, bottom: r.bottom, width: r.width, height: r.height },
+    viewport: { width: window.innerWidth, height: window.innerHeight },
+    tag: el.tagName.toLowerCase(),
+    hasHref: el.hasAttribute('href'),
+    disabled: el.disabled === true,
+    ariaDisabled: el.getAttribute('aria-disabled'),
+    hitSelf: !!hit && (hit === el || el.contains(hit)),
+  };
+}
+
+// One page script decides (and, with `press`, clicks in the page). The marker comments tell the test stub which script it is.
+const revealScript = (press) => `/* hover-reveal */ const decide = ${hoverRevealDecision.toString()}; const collect = ${collectRevealFacts.toString()};
+  const el = arguments[0]; const d = decide(collect(el)); ${press ? '/* hover-press */ if (d.ok) el.click();' : ''} return d;`;
+
+// Try every exact match that is not displayed. The first that passes the decision is pressed: a WebDriver click if the
+// plugin allows it on an element it thinks is invisible, else HTMLElement.click() in the page. Returns true once pressed.
+async function pressHoverRevealed(browser, t) {
+  for (const el of await browser.$$(xpathExact(t))) {
+    if (await el.isDisplayed()) continue; // the plain path handles a displayed match
+    const d = await browser.execute(revealScript(false), el);
+    if (!d?.ok) continue;
+    try {
+      await el.click();
+    } catch (e) {
+      if (isConnectionError(e) || isTimeout(e)) throw e;
+      const p = await browser.execute(revealScript(true), el); // the plugin refused the click: press it in the page
+      if (!p?.ok) continue;
+    }
+    console.log(`pressed as a hover-revealed control: ${t}`);
+    return true;
+  }
+  return false;
 }
 
 // Poll until the text is displayed or `ms` run out. A dead app (connection error) propagates at once; any other
@@ -141,9 +196,9 @@ async function readScreen(browser) {
 }
 
 async function run() {
-  if (!['wait', 'click', 'hover', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|hover|type|read'); return 64; }
+  if (!['wait', 'click', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|type|read'); return 64; }
   // A missing argument is the caller's mistake (64), not a screen that lacks the text (1).
-  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', hover: 'hover <text>', type: 'type <field> <text>', read: 'read' };
+  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', type: 'type <field> <text>', read: 'read' };
   const badArgs = (verb !== 'read' && !a?.trim()) || (verb === 'type' && b === undefined)
     || (verb === 'wait' && b !== undefined && !(Number(b) > 0));
   if (badArgs) { console.error(`usage: ui.mjs ${USAGE[verb]}`); return 64; }
@@ -156,13 +211,21 @@ async function run() {
         if (!(await find(browser, a, deadline - Date.now(), { retryTimeouts: true, contains: true }))) { console.error(`not found after ${secs}s: ${a}`); return 1; }
         break;
       case 'click': {
-        // Look 1.5 s for a displayed match, then try the hover reveal, then keep looking for the rest of the 10 s (a slow screen).
-        const el = (await find(browser, a, 1500)) ?? (await reveal(browser, a)) ?? (await find(browser, a, 8500));
+        // Look 1.5 s for a displayed match. If none, keep looking until 10 s, trying the hover-revealed press between looks
+        // (a slow screen may draw the control late). An error in the press attempt never cuts the remaining wait short,
+        // except a dead app, which the next look reports.
+        const end = Date.now() + 10000;
+        let el = await find(browser, a, 1500);
+        while (!el) {
+          try { if (await pressHoverRevealed(browser, a)) return 0; } catch { /* the next look raises a dead app's error */ }
+          const left = end - Date.now();
+          if (left <= 0) break;
+          el = await find(browser, a, Math.min(1000, left));
+        }
         if (!el) { console.error(`nothing to click: ${a}`); return 1; }
         await el.click();
         break;
       }
-      case 'hover': { const el = await find(browser, a, 10000); if (!el) { console.error(`nothing to hover: ${a}`); return 1; } await el.moveTo(); break; }
       case 'type': { const el = await find(browser, a, 10000); if (!el) { console.error(`no field: ${a}`); return 1; } await el.setValue(b); break; }
       case 'read': console.log(await readScreen(browser)); break;
     }
@@ -178,5 +241,5 @@ async function run() {
   }
 }
 
-// exitCode, not process.exit(): exit would cut off piped stdout at 64 KB.
-process.exitCode = await run();
+// exitCode, not process.exit(): exit would cut off piped stdout at 64 KB. A test imports hoverRevealDecision without running.
+if (process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href) process.exitCode = await run();
