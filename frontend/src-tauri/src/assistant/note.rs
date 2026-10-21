@@ -84,6 +84,23 @@ pub fn with_answered(markdown: &str, items: &[AnsweredItem]) -> String {
     }
 }
 
+/// The model's slug made safe for a file name and a commit message: lowercase
+/// `a-z0-9-`, other runs become one `-`, trimmed, at most 60 characters,
+/// `meeting` when nothing is left.
+fn sanitize_slug(slug: &str) -> String {
+    let mut out = String::new();
+    for c in slug.chars().flat_map(char::to_lowercase) {
+        if c.is_ascii_lowercase() || c.is_ascii_digit() {
+            out.push(c);
+        } else if !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    out.truncate(60);
+    let out = out.trim_matches('-');
+    if out.is_empty() { "meeting".to_string() } else { out.to_string() }
+}
+
 /// "team-standup" -> "Team standup".
 fn title_from_slug(slug: &str) -> String {
     let spaced = slug.replace('-', " ");
@@ -124,24 +141,62 @@ pub fn list_projects(vault_root: &Path) -> Vec<String> {
     out
 }
 
-/// The project the meeting is about: the title and Brief first, then the
-/// transcript. Only a slug that is both linked from `Wiki/index.md` and a page
-/// in `Wiki/Projects/` counts.
+/// Lowercase alphanumeric words of `text`.
+fn words(text: &str) -> std::collections::HashSet<String> {
+    text.split(|c: char| !c.is_alphanumeric())
+        .filter(|w| !w.is_empty())
+        .map(str::to_lowercase)
+        .collect()
+}
+
+/// The words of the first `# ` line of a project page; empty when unreadable.
+fn page_h1_words(vault_root: &Path, slug: &str) -> std::collections::HashSet<String> {
+    let Ok(text) = fs::read_to_string(projects_dir(vault_root).join(format!("{slug}.md"))) else {
+        return Default::default();
+    };
+    text.lines().find_map(|l| l.strip_prefix("# ")).map(words).unwrap_or_default()
+}
+
+/// The project the meeting is about, scored over the `Wiki/Projects` pages.
+/// A slug's tokens are its `-` parts (3+ characters, or a word of the page's
+/// H1) plus the H1's 3+ character words. A token found in 3+ slugs is common
+/// and scores 1, any other 3. Title and Brief weigh 2, the transcript 1; a
+/// token scores once per place it appears. Best total wins, ties go to the slug
+/// with fewer `-` parts then the alphabet, and under 3 gives None.
 pub fn suggest_project(vault_root: &Path, title: &str, brief: &str, transcript: &str) -> Option<String> {
-    let projects = list_projects(vault_root);
-    let index = fs::read_to_string(vault_root.join("Wiki").join("index.md")).ok()?;
-    // The matcher sees only the linked slugs that have a page, in index order,
-    // so a better-matching slug with no page never hides one that has.
-    let usable: String = super::startup_context::candidates(&index)
+    let head = words(&format!("{title} {brief}"));
+    let body = words(transcript);
+    let slugs: Vec<(String, usize, std::collections::HashSet<String>)> = list_projects(vault_root)
         .into_iter()
-        .filter(|slug| projects.contains(slug))
-        .map(|slug| format!("[[Projects/{slug}]]\n"))
+        .map(|slug| {
+            let h1 = page_h1_words(vault_root, &slug);
+            let parts: Vec<&str> = slug.split('-').filter(|p| !p.is_empty()).collect();
+            let mut tokens: std::collections::HashSet<String> = parts
+                .iter()
+                .filter(|p| p.len() >= 3 || h1.contains(**p))
+                .map(|p| p.to_string())
+                .collect();
+            tokens.extend(h1.into_iter().filter(|w| w.chars().count() >= 3));
+            let n = parts.len();
+            (slug, n, tokens)
+        })
         .collect();
-    if usable.is_empty() {
-        return None;
+    let owners = |token: &str| slugs.iter().filter(|(_, _, t)| t.contains(token)).count();
+    let mut best: Option<(u32, usize, &String)> = None;
+    for (slug, parts, tokens) in &slugs {
+        let score: u32 = tokens
+            .iter()
+            .map(|t| {
+                let value = if owners(t) >= 3 { 1 } else { 3 };
+                value * (2 * head.contains(t) as u32 + body.contains(t) as u32)
+            })
+            .sum();
+        // Higher score, then fewer parts, then alphabetical (the list is sorted, so first wins).
+        if best.map_or(true, |(s, n, _)| score > s || (score == s && *parts < n)) {
+            best = Some((score, *parts, slug));
+        }
     }
-    super::startup_context::resolve_project(&usable, &format!("{title} {brief}"))
-        .or_else(|| super::startup_context::resolve_project(&usable, transcript))
+    best.filter(|(score, _, _)| *score >= 3).map(|(_, _, slug)| slug.clone())
 }
 
 pub fn check_project(vault_root: &Path, project: Option<&str>) -> Result<(), String> {
@@ -302,7 +357,8 @@ fn with_meeting_link(page: &str, date: &str, title: &str, stem: &str) -> Option<
 pub fn save_note(input: SaveInput) -> Result<Filed, String> {
     check_project(input.vault_root, input.project)?;
     let meetings_dir = input.vault_root.join("_sources").join("meetings");
-    let stem = free_stem(&meetings_dir, input.date, &input.draft.slug);
+    let slug = sanitize_slug(&input.draft.slug);
+    let stem = free_stem(&meetings_dir, input.date, &slug);
     let note_path = meetings_dir.join(format!("{stem}.md"));
     let transcript_path = meetings_dir.join(format!("{stem}_transcript.md"));
     let filed = Filed {
@@ -318,7 +374,7 @@ pub fn save_note(input: SaveInput) -> Result<Filed, String> {
         .title
         .map(super::ask_list::collapse)
         .filter(|t| !t.is_empty())
-        .unwrap_or_else(|| title_from_slug(&input.draft.slug));
+        .unwrap_or_else(|| title_from_slug(&slug));
     // Read the page first: an unreadable page stops the save before any write.
     let page = match input.project {
         Some(p) => {
@@ -343,7 +399,7 @@ pub fn save_note(input: SaveInput) -> Result<Filed, String> {
             paths.push(path);
         }
     }
-    commit_paths(input.vault_root, &paths, &format!("Meeting note: {}", input.draft.slug))?;
+    commit_paths(input.vault_root, &paths, &format!("Meeting note: {}", slug))?;
     Ok(filed)
 }
 
@@ -351,51 +407,78 @@ pub fn save_note(input: SaveInput) -> Result<Filed, String> {
 // Refiling after a delete
 // ---------------------------------------------------------------------
 
-/// The note text with its code-built sections rebuilt from `remaining` (they
-/// run from the first Answered questions or Q&A log heading to the end), and
-/// the `## Open questions` bullets that are one of `deleted_questions` gone.
+/// The note text with its two code-built sections (`## Answered questions`,
+/// `## Q&A log`) rebuilt from `remaining` in place, each only up to the next
+/// heading, so every other section stays byte for byte; and the
+/// `## Open questions` bullets that are one of `deleted_questions` gone. A
+/// code section the note lacks but the rows need goes at the end.
 fn refiled_text(text: &str, remaining: &[AssistantItem], deleted_questions: &[String]) -> String {
     let lines: Vec<&str> = text.split('\n').collect();
-    let cut = lines
-        .iter()
-        .position(|l| matches!(l.trim_end(), ANSWERED_HEADING | QA_HEADING))
-        .unwrap_or(lines.len());
+    let is_heading = |l: &str| l.starts_with("# ") || l.starts_with("## ");
+    let answered = answered_section(&answered_from_rows(remaining));
+    let log = qa_log_from_rows(remaining);
+    let log = if log.is_empty() { String::new() } else { format!("{}\n\n{}", QA_HEADING, log) };
     let gone: Vec<String> = deleted_questions.iter().map(|q| super::history::normalize_question(q)).collect();
-    let mut kept: Vec<&str> = Vec::new();
+    let mut kept: Vec<String> = Vec::new();
+    let (mut placed_answered, mut placed_log) = (false, false);
     let mut in_open = false;
     let mut open_start = 0usize;
     let mut removed_in_open = false;
     // An Open questions section left with no content loses its heading.
-    fn close_open(kept: &mut Vec<&str>, start: usize, removed: bool) {
+    fn close_open(kept: &mut Vec<String>, start: usize, removed: bool) {
         if removed && kept[start + 1..].iter().all(|l| l.trim().is_empty()) {
             kept.truncate(start);
         }
     }
-    for line in &lines[..cut] {
-        if line.starts_with("# ") || line.starts_with("## ") {
+    let mut i = 0;
+    while i < lines.len() {
+        let line = lines[i];
+        if is_heading(line) {
             if in_open {
                 close_open(&mut kept, open_start, removed_in_open);
             }
-            in_open = line.trim_end() == "## Open questions";
+            in_open = false;
+            let heading = line.trim_end();
+            if heading == ANSWERED_HEADING || heading == QA_HEADING {
+                let end = lines[i + 1..].iter().position(|l| is_heading(l)).map_or(lines.len(), |p| i + 1 + p);
+                // Blank lines closing the section stay as the gap before what follows.
+                let blanks = lines[i..end].iter().rev().take_while(|l| l.trim().is_empty()).count();
+                let (section, placed) = if heading == ANSWERED_HEADING {
+                    (&answered, &mut placed_answered)
+                } else {
+                    (&log, &mut placed_log)
+                };
+                *placed = true;
+                if !section.is_empty() {
+                    kept.extend(section.split('\n').map(str::to_string));
+                    kept.extend(lines[end - blanks..end].iter().map(|l| l.to_string()));
+                }
+                i = end;
+                continue;
+            }
+            in_open = heading == "## Open questions";
             open_start = kept.len();
             removed_in_open = false;
         } else if in_open {
             if let Some(bullet) = line.strip_prefix("- ") {
                 if gone.contains(&super::history::normalize_question(bullet)) {
                     removed_in_open = true;
+                    i += 1;
                     continue;
                 }
             }
         }
-        kept.push(line);
+        kept.push(line.to_string());
+        i += 1;
     }
     if in_open {
         close_open(&mut kept, open_start, removed_in_open);
     }
     let mut out = kept.join("\n").trim_end().to_string();
-    let sections = code_sections(remaining);
-    if !sections.is_empty() {
-        out.push_str(&format!("\n\n{}", sections));
+    for (placed, section) in [(placed_answered, &answered), (placed_log, &log)] {
+        if !placed && !section.is_empty() {
+            out.push_str(&format!("\n\n{}", section));
+        }
     }
     out.push('\n');
     out
@@ -663,9 +746,110 @@ mod tests {
         // Linked in the index but with no page: never suggested.
         fs::remove_file(root.join("Wiki/Projects/broadcom-pnc-bank.md")).unwrap();
         assert_eq!(suggest_project(root, "Broadcom PNC Bank sync", "", ""), None);
-        // No index at all.
-        fs::remove_file(root.join("Wiki/index.md")).unwrap();
-        assert_eq!(suggest_project(root, "Broadcom PNC Bank sync", "", ""), None);
+    }
+
+    /// The seven-project vault from the brief, each page with its own H1.
+    fn scored_vault() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("Wiki/Projects");
+        fs::create_dir_all(&projects).unwrap();
+        for (slug, h1) in [
+            ("broadcom", "Broadcom"),
+            ("broadcom-pnc-bank", "PNC Bank"),
+            ("broadcom-cleveland-clinic", "Cleveland Clinic"),
+            ("broadcom-principal-financial-group", "Principal Financial Group"),
+            ("mission-control", "Mission Control"),
+            ("homelab", "Homelab"),
+            ("homelab-facts", "Homelab facts"),
+        ] {
+            fs::write(projects.join(format!("{slug}.md")), format!("---\ntags: x\n---\n# {h1}\n\nBody.\n")).unwrap();
+        }
+        dir
+    }
+
+    #[test]
+    fn suggestion_scores_realistic_titles_over_the_project_list() {
+        let dir = scored_vault();
+        let root = dir.path();
+        // A distinctive token (pnc) in the title beats the common one (broadcom).
+        assert_eq!(suggest_project(root, "PNC sync with Jim", "", "").as_deref(), Some("broadcom-pnc-bank"));
+        // Only a common token in the title: 1 x 2 = 2, below the bar.
+        assert_eq!(suggest_project(root, "Broadcom sync", "", ""), None);
+        // Common token in title (2) and transcript (1) reaches 3; ties go to the fewest tokens.
+        assert_eq!(suggest_project(root, "Broadcom weekly", "", "the broadcom team").as_deref(), Some("broadcom"));
+        // Transcript only, two distinctive tokens at weight 1 each.
+        assert_eq!(
+            suggest_project(root, "Weekly", "", "we met Cleveland Clinic. Cleveland Clinic again").as_deref(),
+            Some("broadcom-cleveland-clinic")
+        );
+        assert_eq!(suggest_project(root, "Mission Control perf", "", "").as_deref(), Some("mission-control"));
+        assert_eq!(suggest_project(root, "Dentist", "", "lunch plans").as_deref(), None);
+        // Whole words only, any case.
+        assert_eq!(suggest_project(root, "pncx syncing", "", ""), None);
+        assert_eq!(suggest_project(root, "MISSION CONTROL", "", "").as_deref(), Some("mission-control"));
+    }
+
+    #[test]
+    fn a_short_slug_token_counts_only_when_the_page_h1_has_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("Wiki/Projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(projects.join("q3-planning.md"), "# Q3 planning\n").unwrap();
+        fs::write(projects.join("x1-garden.md"), "# Garden\n").unwrap();
+        // q3 is in the H1 as a word, so it counts (3 x 2); x1 is not, so it does not.
+        assert_eq!(suggest_project(dir.path(), "Q3 review", "", "").as_deref(), Some("q3-planning"));
+        assert_eq!(suggest_project(dir.path(), "x1 review", "", ""), None);
+    }
+
+    #[test]
+    fn page_h1_words_count_as_extra_tokens_of_the_slug() {
+        let dir = tempfile::tempdir().unwrap();
+        let projects = dir.path().join("Wiki/Projects");
+        fs::create_dir_all(&projects).unwrap();
+        fs::write(projects.join("acme-rollout.md"), "# Acme Rollout Bluebird\n").unwrap();
+        fs::write(projects.join("other.md"), "# Other\n").unwrap();
+        assert_eq!(suggest_project(dir.path(), "Bluebird kickoff", "", "").as_deref(), Some("acme-rollout"));
+    }
+
+    #[test]
+    fn a_refile_replaces_only_the_two_code_sections() {
+        let text = "# T\n\n## Summary\n\nx\n\n## Answered questions\n\n- **What storage?** NetApp. (On the call)\n\n## Q&A log\n\nQ: Where is the DR site?\nA: Charlotte.\n\n## Follow-up\n\n- call Jim\n- send diagram\n";
+        let kept = card_row("c1", "Where is the DR site?", "Charlotte.");
+        // The answered row was deleted: its section goes, Follow-up stays byte for byte.
+        let out = refiled_text(text, std::slice::from_ref(&kept), &[]);
+        assert_eq!(
+            out,
+            "# T\n\n## Summary\n\nx\n\n## Q&A log\n\nQ: Where is the DR site?\nA: Charlotte.\n\n## Follow-up\n\n- call Jim\n- send diagram\n"
+        );
+        // Nothing deleted: the whole file is unchanged.
+        let rows = vec![answered_row("a1", "What storage?", "NetApp.", 5.0), kept];
+        assert_eq!(refiled_text(text, &rows, &[]), text);
+        // Both sections gone: only they go.
+        let out = refiled_text(text, &[], &[]);
+        assert_eq!(out, "# T\n\n## Summary\n\nx\n\n## Follow-up\n\n- call Jim\n- send diagram\n");
+    }
+
+    #[test]
+    fn the_models_slug_is_cleaned_before_any_path_or_commit_message() {
+        assert_eq!(sanitize_slug("../Evil/Slug\nx"), "evil-slug-x");
+        assert_eq!(sanitize_slug("///"), "meeting");
+        assert_eq!(sanitize_slug(""), "meeting");
+        assert_eq!(sanitize_slug("-A  b_c-"), "a-b-c");
+        let long = sanitize_slug(&format!("{}-tail", "a".repeat(59)));
+        assert_eq!(long, "a".repeat(59));
+
+        let dir = vault();
+        let root = dir.path();
+        let (mut draft, rows) = (pnc_draft(), pnc_rows());
+        draft.slug = "../Evil/Slug\nx".into();
+        let filed = save_note(input(root, &draft, &rows, None, false)).unwrap();
+        assert_eq!(filed.note_path, root.join("_sources/meetings/2026-10-21-evil-slug-x.md"));
+        assert!(filed.transcript_path.ends_with("_sources/meetings/2026-10-21-evil-slug-x_transcript.md"));
+        assert!(filed.note_path.exists());
+        assert_eq!(git(root, &["log", "-1", "--format=%s"]).trim(), "Meeting note: evil-slug-x");
+        draft.slug = "///".into();
+        let filed = save_note(input(root, &draft, &rows, None, true)).unwrap();
+        assert_eq!(filed.note_path, root.join("_sources/meetings/2026-10-21-meeting.md"));
     }
 
     #[test]
