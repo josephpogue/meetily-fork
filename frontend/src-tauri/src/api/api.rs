@@ -776,6 +776,26 @@ pub async fn api_delete_meeting_assistant(
     crate::assistant::history::delete_for_meeting(state.db_manager.pool(), &meeting_id).await
 }
 
+/// Deletes saved assistant items of one meeting by row id (as
+/// `api_get_meeting_assistant` returns them). Also drops them from the live
+/// collector when it holds this meeting, so a later save does not bring them
+/// back. Returns the rows deleted.
+#[tauri::command]
+pub async fn api_delete_meeting_assistant_items(
+    state: tauri::State<'_, AppState>,
+    history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
+    meeting_id: String,
+    ids: Vec<String>,
+) -> Result<u32, String> {
+    {
+        let mut collector = history.lock().unwrap();
+        if collector.saved_meeting_id().as_deref() == Some(meeting_id.as_str()) {
+            collector.delete_saved(&ids);
+        }
+    }
+    crate::assistant::history::delete_saved_items(state.db_manager.pool(), &meeting_id, &ids).await
+}
+
 #[tauri::command]
 pub async fn api_delete_meeting<R: Runtime>(
     _app: AppHandle<R>,

@@ -31,6 +31,9 @@ fn now_ms() -> i64 {
 /// An item as collected, before call times are known.
 #[derive(Debug, Clone)]
 struct Entry {
+    /// The id the saved row gets, made when the entry is created, so saving
+    /// twice gives the same row ids and a later delete can find the row.
+    saved_id: String,
     /// Ids this item has been seen under (an Ask next question can change id).
     ids: Vec<String>,
     is_card: bool,
@@ -58,6 +61,7 @@ struct Entry {
 impl Entry {
     fn blank(kind: &str, is_card: bool, id: &str, shown_ms: i64) -> Self {
         Entry {
+            saved_id: Uuid::new_v4().to_string(),
             ids: vec![id.to_string()],
             is_card,
             kind: kind.to_string(),
@@ -87,6 +91,11 @@ pub struct HistoryCollector {
     opened_ms: i64,
     /// First-seen order, which breaks call-time ties.
     entries: Vec<Entry>,
+    /// Live ids Joseph deleted this session. No observe path brings one back.
+    deleted: Vec<String>,
+    /// The meeting these entries were last saved for, so a delete after the
+    /// save can reach the saved rows.
+    saved_meeting_id: Option<String>,
 }
 
 fn card_kind(kind: CardKind) -> &'static str {
@@ -118,6 +127,59 @@ impl HistoryCollector {
     pub fn reset(&mut self, opened_ms: i64) {
         self.opened_ms = opened_ms;
         self.entries.clear();
+        self.deleted.clear();
+        self.saved_meeting_id = None;
+    }
+
+    /// Deletes every entry that was seen under one of `ids` and remembers all
+    /// the ids it was seen under (and `ids` themselves), so a card still
+    /// drafting, or a question or to-do re-sent under the same id, does not
+    /// come back. Returns the removed entries' `saved_id`s.
+    pub fn delete(&mut self, ids: &[String]) -> Vec<String> {
+        let mut saved = Vec::new();
+        let mut gone: Vec<String> = Vec::new();
+        self.entries.retain(|e| {
+            if e.ids.iter().any(|x| ids.contains(x)) {
+                saved.push(e.saved_id.clone());
+                gone.extend(e.ids.iter().cloned());
+                false
+            } else {
+                true
+            }
+        });
+        for id in gone.into_iter().chain(ids.iter().cloned()) {
+            if !self.deleted.contains(&id) {
+                self.deleted.push(id);
+            }
+        }
+        saved
+    }
+
+    pub fn is_deleted(&self, id: &str) -> bool {
+        self.deleted.iter().any(|d| d == id)
+    }
+
+    /// Every live id deleted this session.
+    pub fn deleted_ids(&self) -> Vec<String> {
+        self.deleted.clone()
+    }
+
+    /// The meeting the collected items were saved for, if they were.
+    pub fn saved_meeting_id(&self) -> Option<String> {
+        self.saved_meeting_id.clone()
+    }
+
+    /// Deletes the entries that were saved under these row ids, with every
+    /// live id they were seen under. For a row deleted from a past meeting's
+    /// Assistant tab while its collector is still live.
+    pub fn delete_saved(&mut self, saved_ids: &[String]) {
+        let ids: Vec<String> = self
+            .entries
+            .iter()
+            .filter(|e| saved_ids.contains(&e.saved_id))
+            .flat_map(|e| e.ids.iter().cloned())
+            .collect();
+        self.delete(&ids);
     }
 
     pub fn is_empty(&self) -> bool {
@@ -127,6 +189,9 @@ impl HistoryCollector {
     /// One card emit. The first emit for an id sets when it was shown; every
     /// emit replaces the content, so the last state wins.
     pub fn observe_card(&mut self, card: &CardOut) {
+        if self.is_deleted(&card.id) {
+            return;
+        }
         let idx = match self.entries.iter().position(|e| e.is_card && e.ids[0] == card.id) {
             Some(i) => i,
             None => {
@@ -167,7 +232,8 @@ impl HistoryCollector {
     /// entry (keeping when it was first said) instead of adding a second.
     fn observe_todos(&mut self, todos: &[TodoItem], dismissed: &[String]) {
         self.entries.retain(|e| !(e.kind == "todo" && e.ids.iter().any(|x| dismissed.contains(x))));
-        for t in todos.iter().filter(|t| !dismissed.contains(&t.id)) {
+        let deleted = self.deleted.clone();
+        for t in todos.iter().filter(|t| !dismissed.contains(&t.id) && !deleted.contains(&t.id)) {
             let owner = match t.owner {
                 TodoOwner::You => "you",
                 TodoOwner::Them => "them",
@@ -246,6 +312,9 @@ impl HistoryCollector {
     }
 
     fn observe_open(&mut self, item: &AskItem, kind: &str, now_ms: i64) {
+        if self.is_deleted(&item.id) {
+            return;
+        }
         let idx = match self.find_question(&item.id, &item.question, kind) {
             Some(i) => i,
             None => {
@@ -263,6 +332,9 @@ impl HistoryCollector {
     }
 
     fn observe_answered(&mut self, done: &AnsweredItem) {
+        if self.is_deleted(&done.id) {
+            return;
+        }
         let kind = if matches!(done.how, AnswerHow::You) { "for_you" } else { "question" };
         let idx = match self.find_question(&done.id, &done.question, kind) {
             Some(i) => i,
@@ -274,6 +346,9 @@ impl HistoryCollector {
             }
         };
         let e = &mut self.entries[idx];
+        if !e.ids.contains(&done.id) {
+            e.ids.push(done.id.clone());
+        }
         e.answer = done.answer.clone();
         e.answered_how = how_label(done.how).to_string();
         e.answered_ms = Some(done.at);
@@ -281,7 +356,8 @@ impl HistoryCollector {
 
     /// The items to save: call times against `start_ms`, in call-time order
     /// (ties keep first-seen order), cards with an empty lead dropped. Each
-    /// item gets a fresh id, because ids must be unique across meetings.
+    /// item's id is its entry's `saved_id`, a uuid made when the entry was
+    /// created: stable across saves and unique across meetings.
     pub fn finalize(&self, start_ms: i64) -> Vec<AssistantItem> {
         let secs = |ms: i64| ((ms - start_ms).max(0) as f64) / 1000.0;
         let mut kept: Vec<&Entry> = self
@@ -296,7 +372,7 @@ impl HistoryCollector {
         kept.sort_by(|a, b| call_time(a).total_cmp(&call_time(b)).then(a.shown_ms.cmp(&b.shown_ms)));
         kept.into_iter()
             .map(|e| AssistantItem {
-                id: Uuid::new_v4().to_string(),
+                id: e.saved_id.clone(),
                 kind: e.kind.clone(),
                 call_time: call_time(e),
                 shown_at: Utc
@@ -406,6 +482,7 @@ pub async fn save_for_meeting(
     let count = AssistantItemsRepository::replace_for_meeting(pool, meeting_id, &items)
         .await
         .map_err(|e| e.to_string())?;
+    history.lock().unwrap().saved_meeting_id = Some(meeting_id.to_string());
     if let Some(folder) = folder.filter(|f| f.is_dir()) {
         if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &items) {
             log::warn!("assistant: could not write assistant.json for {}: {}", meeting_id, e);
@@ -426,6 +503,78 @@ pub async fn delete_for_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<u
     Ok(n)
 }
 
+/// The one step every delete goes through once its rows are gone from the
+/// database (the vault update joins here later). `deleted` are the rows that
+/// were removed; the meeting's remaining rows are what `assistant.json` keeps:
+/// the file is rewritten from them with its old `recordingStartedAt`, and
+/// removed when none remain. A meeting with no folder on disk has no file.
+pub async fn after_items_deleted(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    deleted: &[AssistantItem],
+) -> Result<(), String> {
+    if deleted.is_empty() {
+        return Ok(());
+    }
+    let remaining = AssistantItemsRepository::list_for_meeting(pool, meeting_id)
+        .await
+        .map_err(|e| e.to_string())?;
+    let Some(folder) = folder_path_of(pool, meeting_id).await.map(std::path::PathBuf::from) else {
+        return Ok(());
+    };
+    if !folder.is_dir() {
+        return Ok(());
+    }
+    if remaining.is_empty() {
+        remove_folder_file(&folder);
+        return Ok(());
+    }
+    let start_ms = recording_start_ms_from_file(&folder)
+        .or_else(|| recording_start_from_folder(&folder).map(|d| d.timestamp_millis()))
+        .or_else(|| {
+            // No file, no metadata: the first remaining item's show time less
+            // its call time is the start it was saved against.
+            let first = &remaining[0];
+            DateTime::parse_from_rfc3339(&first.shown_at)
+                .ok()
+                .map(|d| d.timestamp_millis() - (first.call_time * 1000.0).round() as i64)
+        })
+        .unwrap_or_else(now_ms);
+    if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &remaining) {
+        log::warn!("assistant: could not rewrite assistant.json for {}: {}", meeting_id, e);
+    }
+    Ok(())
+}
+
+/// `recordingStartedAt` of an existing `<folder>/assistant.json`, in epoch ms.
+fn recording_start_ms_from_file(folder: &Path) -> Option<i64> {
+    let raw = std::fs::read_to_string(folder_file(folder)).ok()?;
+    let value: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let started = value.get("recordingStartedAt")?.as_str()?;
+    DateTime::parse_from_rfc3339(started).ok().map(|d| d.timestamp_millis())
+}
+
+/// Deletes the saved rows of `meeting_id` with these ids, then runs the shared
+/// after-delete step. Returns how many rows went; ids of other meetings or
+/// unknown ids are ignored.
+pub async fn delete_saved_items(
+    pool: &SqlitePool,
+    meeting_id: &str,
+    ids: &[String],
+) -> Result<u32, String> {
+    let gone: Vec<AssistantItem> = AssistantItemsRepository::list_for_meeting(pool, meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .into_iter()
+        .filter(|i| ids.contains(&i.id))
+        .collect();
+    let n = AssistantItemsRepository::delete_items(pool, meeting_id, ids)
+        .await
+        .map_err(|e| e.to_string())?;
+    after_items_deleted(pool, meeting_id, &gone).await?;
+    Ok(n)
+}
+
 /// Removes `<folder>/assistant.json` and nothing else in the folder. A
 /// missing file is fine; a failure is logged.
 pub fn remove_folder_file(folder: &Path) {
@@ -439,7 +588,12 @@ pub fn remove_folder_file(folder: &Path) {
 
 impl HistoryCollector {
     fn clone_entries(&self) -> HistoryCollector {
-        HistoryCollector { opened_ms: self.opened_ms, entries: self.entries.clone() }
+        HistoryCollector {
+            opened_ms: self.opened_ms,
+            entries: self.entries.clone(),
+            deleted: self.deleted.clone(),
+            saved_meeting_id: self.saved_meeting_id.clone(),
+        }
     }
 }
 
@@ -726,7 +880,8 @@ mod tests {
         assert_eq!(AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap().len(), 1);
         // And no folder at all.
         add_meeting(&pool, "m2", None).await;
-        assert_eq!(save_for_meeting(&pool, &h, "m2").await.unwrap(), 1);
+        // Row ids are unique across meetings, so a second meeting is a second collector.
+        assert_eq!(save_for_meeting(&pool, &seeded(), "m2").await.unwrap(), 1);
     }
 
     #[tokio::test]
@@ -863,5 +1018,178 @@ mod tests {
         assert_eq!(file["items"][0]["owner"], "them");
         assert_eq!(file["items"][0]["ownerName"], "Marcus");
         assert_eq!(file["items"][0]["due"], "Monday");
+    }
+
+    fn open_two() -> HistoryCollector {
+        let mut c = HistoryCollector::default();
+        c.observe_asks(&asks_out(vec![ask("a1", "One?")], vec![ask("f1", "Two?")], vec![]), 1_000);
+        c
+    }
+
+    #[test]
+    fn a_deleted_question_is_gone_and_stays_gone_when_sent_again() {
+        let mut c = open_two();
+        let removed = c.delete(&["a1".to_string()]);
+        assert_eq!(removed.len(), 1);
+        let questions: Vec<_> = c.finalize(0).into_iter().map(|i| i.question).collect();
+        assert_eq!(questions, vec!["Two?"]);
+        c.observe_asks(&asks_out(vec![ask("a1", "One?")], vec![ask("f1", "Two?")], vec![]), 2_000);
+        let questions: Vec<_> = c.finalize(0).into_iter().map(|i| i.question).collect();
+        assert_eq!(questions, vec!["Two?"]);
+    }
+
+    #[test]
+    fn a_deleted_answered_question_does_not_come_back_answered() {
+        let mut c = open_two();
+        c.delete(&["a1".to_string()]);
+        let done = AnsweredItem {
+            id: "a1".into(),
+            question: "One?".into(),
+            answer: "Yes".into(),
+            how: AnswerHow::Call,
+            at: 5_000,
+        };
+        c.observe_asks(&asks_out(vec![], vec![], vec![done]), 6_000);
+        assert_eq!(c.finalize(0).len(), 1);
+    }
+
+    #[test]
+    fn a_card_deleted_while_drafting_does_not_return_when_checked() {
+        let mut c = HistoryCollector::default();
+        c.observe_card(&card("c1", "drafting", "rough", 10_000));
+        assert_eq!(c.delete(&["c1".to_string()]).len(), 1);
+        c.observe_card(&card("c1", "checked", "final", 30_000));
+        assert!(c.finalize(0).is_empty());
+    }
+
+    #[test]
+    fn a_deleted_todo_does_not_return_when_emitted_again() {
+        let mut c = HistoryCollector::default();
+        let t = todo("t1", TodoOwner::You, "Send the design doc", "", "", 10.0, 10_000);
+        c.observe_asks(&with_todos(vec![t.clone()], vec![]), 11_000);
+        assert_eq!(c.finalize(0).len(), 1);
+        c.delete(&["t1".to_string()]);
+        assert!(c.finalize(0).is_empty());
+        c.observe_asks(&with_todos(vec![t], vec![]), 12_000);
+        assert!(c.finalize(0).is_empty());
+    }
+
+    #[test]
+    fn delete_remembers_every_id_an_item_was_seen_under() {
+        let mut c = HistoryCollector::default();
+        c.observe_asks(&asks_out(vec![ask("a1", "What is the budget?")], vec![], vec![]), 1_000);
+        c.observe_asks(&asks_out(vec![ask("a2", "what is the budget")], vec![], vec![]), 2_000);
+        c.delete(&["a2".to_string()]);
+        c.observe_asks(&asks_out(vec![ask("a1", "What is the budget?")], vec![], vec![]), 3_000);
+        assert!(c.finalize(0).is_empty());
+    }
+
+    #[test]
+    fn finalizing_twice_gives_the_same_ids_which_are_the_saved_ids() {
+        let mut c = open_two();
+        let first: Vec<_> = c.finalize(0).into_iter().map(|i| i.id).collect();
+        let second: Vec<_> = c.finalize(0).into_iter().map(|i| i.id).collect();
+        assert_eq!(first, second);
+        let removed = c.delete(&["f1".to_string()]);
+        assert_eq!(removed.len(), 1);
+        assert!(first.contains(&removed[0]), "delete returns the saved id the row has");
+        let other = open_two();
+        assert_ne!(other.finalize(0)[0].id, first[0], "ids differ across collectors");
+    }
+
+    #[test]
+    fn a_reset_forgets_deleted_ids_and_the_saved_meeting() {
+        let mut c = open_two();
+        c.delete(&["a1".to_string()]);
+        c.saved_meeting_id = Some("m1".into());
+        c.reset(5);
+        assert!(c.deleted_ids().is_empty());
+        assert_eq!(c.saved_meeting_id(), None);
+        c.observe_asks(&asks_out(vec![ask("a1", "One?")], vec![], vec![]), 6_000);
+        assert_eq!(c.finalize(0).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn saving_records_the_meeting_and_a_saved_row_delete_reaches_the_collector() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        record_asks(&h, &asks_out(vec![ask("a1", "One?")], vec![ask("f1", "Two?")], vec![]));
+        assert_eq!(h.lock().unwrap().saved_meeting_id(), None);
+        save_for_meeting(&pool, &h, "m1").await.unwrap();
+        assert_eq!(h.lock().unwrap().saved_meeting_id(), Some("m1".to_string()));
+        let rows = AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap();
+        let one = rows.iter().find(|r| r.question == "One?").unwrap().id.clone();
+
+        // Delete the saved row, and the live collector forgets it too.
+        assert_eq!(delete_saved_items(&pool, "m1", &[one]).await.unwrap(), 1);
+        h.lock().unwrap().delete_saved(&[rows.iter().find(|r| r.question == "One?").unwrap().id.clone()]);
+        record_asks(&h, &asks_out(vec![ask("a1", "One?")], vec![ask("f1", "Two?")], vec![]));
+        save_for_meeting(&pool, &h, "m1").await.unwrap();
+        let after: Vec<_> =
+            AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap().into_iter().map(|i| i.question).collect();
+        assert_eq!(after, vec!["Two?"]);
+    }
+
+    fn row(id: &str, call_time: f64) -> AssistantItem {
+        AssistantItem {
+            id: id.into(),
+            kind: "answer".into(),
+            call_time,
+            shown_at: "2026-10-20T17:34:21.030Z".into(),
+            question: "Q?".into(),
+            lead: format!("lead {id}"),
+            bullets: vec![],
+            why: String::new(),
+            source: String::new(),
+            phase: "checked".into(),
+            changed_lines: vec![],
+            answer: String::new(),
+            answered_how: String::new(),
+            answered_call_time: None,
+            owner: String::new(),
+            owner_name: String::new(),
+            due: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn after_deleting_rows_assistant_json_lists_the_rest_and_goes_when_none_remain() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let items = vec![row("x", 1.0), row("y", 2.0)];
+        AssistantItemsRepository::replace_for_meeting(&pool, "m1", &items).await.unwrap();
+        // The file's start differs from metadata.json: the file's wins.
+        std::fs::write(dir.path().join("metadata.json"), "{\"created_at\":\"2020-01-01T00:00:00.000Z\"}").unwrap();
+        write_folder_file(dir.path(), "m1", ms(START), &items).unwrap();
+
+        assert_eq!(delete_saved_items(&pool, "m1", &["x".to_string()]).await.unwrap(), 1);
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
+        assert_eq!(file["recordingStartedAt"], START);
+        assert_eq!(file["items"].as_array().unwrap().len(), 1);
+        assert_eq!(file["items"][0]["id"], "y");
+        assert!(!dir.path().join("assistant.json.tmp").exists());
+
+        assert_eq!(delete_saved_items(&pool, "m1", &["y".to_string()]).await.unwrap(), 1);
+        assert!(!dir.path().join("assistant.json").exists());
+        assert!(dir.path().join("metadata.json").exists());
+    }
+
+    #[tokio::test]
+    async fn after_deleting_with_no_file_the_start_comes_from_metadata() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        std::fs::write(dir.path().join("metadata.json"), format!("{{\"created_at\":\"{}\"}}", START)).unwrap();
+        AssistantItemsRepository::replace_for_meeting(&pool, "m1", &[row("x", 1.0), row("y", 2.0)]).await.unwrap();
+        delete_saved_items(&pool, "m1", &["x".to_string()]).await.unwrap();
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
+        assert_eq!(file["recordingStartedAt"], START);
+        assert_eq!(file["items"][0]["id"], "y");
     }
 }

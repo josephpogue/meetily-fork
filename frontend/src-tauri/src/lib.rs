@@ -828,6 +828,7 @@ pub fn run() {
             api::api_save_meeting_assistant,
             api::api_get_meeting_assistant,
             api::api_delete_meeting_assistant,
+            api::api_delete_meeting_assistant_items,
             api::api_get_meeting,
             api::api_get_meeting_metadata,
             api::api_get_meeting_transcripts,
@@ -955,6 +956,7 @@ pub fn run() {
             assistant::commands::assistant_answer_ask,
             assistant::commands::assistant_add_todo,
             assistant::commands::assistant_dismiss_todo,
+            assistant::commands::assistant_delete_items,
             assistant::commands::assistant_screen_recording_allowed,
             assistant::commands::assistant_open_screen_recording_settings,
         ])

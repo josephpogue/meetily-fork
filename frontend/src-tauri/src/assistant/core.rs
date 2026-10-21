@@ -15,6 +15,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use serde::Serialize;
+use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::audio::TranscriptUpdate;
@@ -111,7 +112,9 @@ pub struct AssistantCore {
     /// Built once in `install`; every settled card reaches the panel and,
     /// for an answer or a direct ask, appends to `qa_log` for the note.
     card_emit: super::lanes::EmitFn,
-    qa_log: Arc<StdMutex<Vec<String>>>,
+    /// (card id, "Q: ...\nA: ...") per settled card, so a deleted card's entry
+    /// can be removed before the note is drafted.
+    qa_log: QaLog,
     /// What the assistant showed this session, kept for the meeting save.
     /// Reset when a session opens.
     history: super::history::HistoryHandle,
@@ -337,7 +340,7 @@ fn resolve_deep_read_dirs(raw: &str) -> Vec<PathBuf> {
 /// catch-up does not. `forward` then passes the card on (to the panel).
 fn make_card_emit(
     handle: AssistantHandle,
-    qa_log: Arc<StdMutex<Vec<String>>>,
+    qa_log: QaLog,
     chat_log: ChatLog,
     history: super::history::HistoryHandle,
     forward: super::lanes::EmitFn,
@@ -361,6 +364,23 @@ fn make_card_emit(
     })
 }
 
+type QaLog = Arc<StdMutex<Vec<(String, String)>>>;
+
+/// The Q&A log's texts, joined for the note.
+fn qa_log_text(qa_log: &StdMutex<Vec<(String, String)>>) -> String {
+    qa_log.lock().unwrap().iter().map(|(_, t)| t.as_str()).collect::<Vec<_>>().join("\n\n")
+}
+
+/// The answered questions the lane holds, less the ones Joseph deleted.
+fn answered_kept(lane: &AskLane, deleted: &[String]) -> Vec<super::ask_list::AnsweredItem> {
+    lane.answered_items().into_iter().filter(|a| !deleted.contains(&a.id)).collect()
+}
+
+/// The open questions on the lane's list, less the ones Joseph deleted.
+fn open_asks_kept(lane: &AskLane, deleted: &[String]) -> Vec<String> {
+    lane.snapshot().asks.into_iter().filter(|a| !deleted.contains(&a.id)).map(|a| a.question).collect()
+}
+
 fn is_settled_ask(card: &CardOut) -> bool {
     matches!(card.kind, CardKind::Ask) && (card.phase == "checked" || card.phase == "corrected")
 }
@@ -368,7 +388,7 @@ fn is_settled_ask(card: &CardOut) -> bool {
 /// What a settled card leaves behind. An answer or an Ask card goes to the
 /// note's Q&A log; an Ask card (Joseph's own question) also goes to the chat
 /// log, so Ask next can hear it and mark a list question answered.
-fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<String>>, chat_log: &StdMutex<Vec<ChatExchange>>) {
+fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<(String, String)>>, chat_log: &StdMutex<Vec<ChatExchange>>) {
     let settled = card.phase == "checked" || card.phase == "corrected";
     if !settled {
         return;
@@ -377,7 +397,7 @@ fn record_card(card: &CardOut, qa_log: &StdMutex<Vec<String>>, chat_log: &StdMut
         qa_log
             .lock()
             .unwrap()
-            .push(format!("Q: {}\nA: {}", card.question, card.lead));
+            .push((card.id.clone(), format!("Q: {}\nA: {}", card.question, card.lead)));
     }
     if matches!(card.kind, CardKind::Ask) {
         let mut answer = card.lead.clone();
@@ -611,9 +631,57 @@ pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
     if !core.session_open || !core.ask_lane.dismiss(&id) {
         return;
     }
+    // A question Joseph dismissed is not saved with the meeting. One the model
+    // merely dropped from a later list stays, because it was shown.
+    core.history.lock().unwrap().delete(&[id]);
     if core.session_open && core.enabled {
         core.ask_lane.request(&core.transcript, false);
     }
+}
+
+/// Deletes assistant items by their live ids (a card's id, a question's id, a
+/// to-do's id), during the call or after Stop. They leave the collector, so
+/// the meeting save never has them, and the note's Q&A log. With the session
+/// open the ask lane also forgets them for good (same as the x); with it
+/// closed the lane is not touched (see `dismiss_ask`). When the meeting was
+/// already saved at Stop, its saved rows and `assistant.json` lose them too,
+/// and a ready note draft is made again without them. Returns how many items
+/// were removed.
+pub async fn delete_items(handle: &AssistantHandle, pool: &SqlitePool, ids: Vec<String>) -> Result<u32, String> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    let (saved_ids, saved_meeting, note_ready) = {
+        let core = handle.0.lock().await;
+        let (saved_ids, saved_meeting) = {
+            let mut history = core.history.lock().unwrap();
+            let saved_ids = history.delete(&ids);
+            (saved_ids, history.saved_meeting_id())
+        };
+        core.qa_log.lock().unwrap().retain(|(id, _)| !ids.contains(id));
+        if core.session_open {
+            let mut dismissed = false;
+            for id in &ids {
+                dismissed |= core.ask_lane.dismiss(id) || core.ask_lane.dismiss_todo(id);
+            }
+            if dismissed && core.enabled {
+                core.ask_lane.request(&core.transcript, false);
+            }
+        }
+        (saved_ids, saved_meeting, matches!(core.note_state, NoteState::Ready))
+    };
+    if let Some(meeting_id) = saved_meeting {
+        if !saved_ids.is_empty() {
+            super::history::delete_saved_items(pool, &meeting_id, &saved_ids).await?;
+        }
+    }
+    if note_ready {
+        let handle = handle.clone();
+        tauri::async_runtime::spawn(async move {
+            let _ = draft_note(&handle).await;
+        });
+    }
+    Ok(saved_ids.len() as u32)
 }
 
 /// Joseph typed the answer to a list question. The item moves to the
@@ -783,10 +851,12 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
         core.note_error = None;
         core.emit_note();
         let transcript_text = core.transcript.all();
-        let qa_log_text = core.qa_log.lock().unwrap().join("\n\n");
-        let open_asks = core.ask_lane.open_asks();
+        let qa_log_text = qa_log_text(&core.qa_log);
+        // After Stop the lane still holds what Joseph deleted: leave it out.
+        let deleted = core.history.lock().unwrap().deleted_ids();
+        let open_asks = open_asks_kept(&core.ask_lane, &deleted);
         let mut draft_input = qa_log_text;
-        let answered = core.ask_lane.answered_items();
+        let answered = answered_kept(&core.ask_lane, &deleted);
         if !answered.is_empty() {
             let list = answered
                 .iter()
@@ -818,7 +888,8 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
             Ok(mut draft) => {
                 // Built in code, not by the model: the answered list as it
                 // stood, in the preview and in the saved file alike.
-                draft.markdown = note::with_answered(&draft.markdown, &core.ask_lane.answered_items());
+                let deleted = core.history.lock().unwrap().deleted_ids();
+                draft.markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
                 core.note_markdown = draft.markdown.clone();
                 core.note_draft = Some(draft);
                 core.note_state = NoteState::Ready;
@@ -849,7 +920,7 @@ pub async fn save_note(handle: &AssistantHandle) {
     let vault_root = resolve_vault_root(&core.settings.vault_root);
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let dry_run = std::env::var("ASSISTANT_DRY_RUN").ok().as_deref() == Some("1");
-    let qa_log_text = core.qa_log.lock().unwrap().join("\n\n");
+    let qa_log_text = qa_log_text(&core.qa_log);
     let transcript_text = core.session_transcript.clone();
 
     match note::save_note(&vault_root, &date, &draft, &transcript_text, &qa_log_text, dry_run) {
@@ -2425,5 +2496,184 @@ mod tests {
         let core = handle.0.lock().await;
         assert!(!core.note_markdown.contains("Answered questions"));
         assert!(core.note_markdown.ends_with("- Who owns backups?"));
+    }
+
+    // ---- deleting items ----
+
+    use crate::database::repositories::assistant_items::tests::{add_meeting, test_pool};
+    use crate::database::repositories::assistant_items::AssistantItemsRepository;
+
+    /// Wires the ask hook the way the app does, so every snapshot is collected.
+    async fn collect_asks(handle: &AssistantHandle) -> super::super::history::HistoryHandle {
+        let history = handle.0.lock().await.history_handle_for_test();
+        let sink = history.clone();
+        handle.0.lock().await.ask_hooks.emit = Arc::new(move |out| super::super::history::record_asks(&sink, &out));
+        history.lock().unwrap().reset(0);
+        history
+    }
+
+    async fn saved_questions(pool: &SqlitePool, meeting: &str) -> Vec<String> {
+        AssistantItemsRepository::list_for_meeting(pool, meeting)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|i| i.question)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_question_is_not_saved_but_an_undismissed_one_is() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        add_meeting(&pool, "m2", None).await;
+        for (meeting, dismiss) in [("m1", true), ("m2", false)] {
+            let handle = AssistantHandle::new();
+            let history = collect_asks(&handle).await;
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+            refresh_asks(&handle).await;
+            settle().await;
+            let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+            if dismiss {
+                dismiss_ask(&handle, id).await;
+                settle().await;
+            }
+            close_session(&handle).await;
+            super::super::history::save_for_meeting(&pool, &history, meeting).await.unwrap();
+            let saved = saved_questions(&pool, meeting).await;
+            if dismiss {
+                assert!(saved.is_empty(), "dismissed question was saved: {:?}", saved);
+            } else {
+                assert_eq!(saved, vec!["What are your fees?"]);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn deleting_an_open_question_during_the_call_removes_it_for_good() {
+        let pool = test_pool().await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+
+        assert_eq!(delete_items(&handle, &pool, vec![id.clone()]).await, Ok(1));
+        settle().await;
+        assert!(handle.0.lock().await.ask_lane.snapshot().asks.is_empty());
+        assert!(history.lock().unwrap().finalize(0).is_empty());
+        assert!(ask_turns(&calls).len() >= 2, "the lane was told it was dismissed");
+        assert_eq!(delete_items(&handle, &pool, vec![id]).await, Ok(0), "already gone");
+        assert_eq!(delete_items(&handle, &pool, vec![]).await, Ok(0));
+    }
+
+    #[tokio::test]
+    async fn deleting_a_todo_during_the_call_dismisses_it_on_the_lane() {
+        let pool = test_pool().await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        add_todo(&handle, "Send Dana the runbook".to_string()).await.unwrap();
+        let id = handle.0.lock().await.ask_lane.snapshot().todos[0].id.clone();
+        assert_eq!(history.lock().unwrap().finalize(0).len(), 1);
+
+        assert_eq!(delete_items(&handle, &pool, vec![id.clone()]).await, Ok(1));
+        let out = handle.0.lock().await.ask_lane.snapshot();
+        assert!(out.todos.is_empty());
+        assert_eq!(out.dismissed_todos, vec![id]);
+        assert!(history.lock().unwrap().finalize(0).is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleting_after_stop_updates_the_saved_meeting_and_leaves_the_lane_alone() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let answered_id = handle.0.lock().await.ask_lane.snapshot().answered[0].id.clone();
+        close_session(&handle).await;
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        assert_eq!(saved_questions(&pool, "m1").await.len(), 1);
+        assert!(dir.path().join("assistant.json").exists());
+        let turns_before = calls.lock().unwrap().len();
+
+        assert_eq!(delete_items(&handle, &pool, vec![answered_id]).await, Ok(1));
+        assert!(saved_questions(&pool, "m1").await.is_empty());
+        assert!(!dir.path().join("assistant.json").exists(), "no rows left, no file");
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1, "a closed session's lane is not touched");
+        settle().await;
+        assert_eq!(calls.lock().unwrap().len(), turns_before, "no turn ran");
+    }
+
+    fn settled_card(id: &str, question: &str) -> CardOut {
+        CardOut {
+            id: id.to_string(),
+            kind: CardKind::Answer,
+            question: question.to_string(),
+            lead: "Building two.".to_string(),
+            bullets: vec![],
+            source: "deep".to_string(),
+            phase: "checked".to_string(),
+            changed_lines: Vec::new(),
+            ts: 1,
+        }
+    }
+
+    fn last_note_prompt(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> String {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|t| t.prompt.starts_with("TRANSCRIPT:"))
+            .map(|t| t.prompt.clone())
+            .expect("a note turn ran")
+    }
+
+    #[tokio::test]
+    async fn a_deleted_card_and_answered_question_stay_out_of_the_draft_and_a_ready_note_is_redrafted() {
+        let pool = test_pool().await;
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls.clone())).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let answered_id = {
+            let core = handle.0.lock().await;
+            let (qa, chats) = (core.qa_log.clone(), core.chat_log.clone());
+            record_card(&settled_card("c1", "Where is the data center?"), &qa, &chats);
+            record_card(&settled_card("c2", "Who owns backups?"), &qa, &chats);
+            core.ask_lane.snapshot().answered[0].id.clone()
+        };
+        close_session(&handle).await;
+        assert!(draft_note(&handle).await.is_ok());
+        let first = last_note_prompt(&calls);
+        assert!(first.contains("Where is the data center?") && first.contains("What are your fees?"), "{first}");
+        assert!(handle.0.lock().await.note_markdown.contains("Answered questions"));
+
+        // The note is Ready, so the delete drafts it again without them.
+        assert_eq!(delete_items(&handle, &pool, vec!["c1".to_string(), answered_id]).await, Ok(0));
+        settle().await;
+        settle().await;
+        let again = last_note_prompt(&calls);
+        assert!(!again.contains("Where is the data center?"), "{again}");
+        assert!(!again.contains("What are your fees?"), "{again}");
+        assert!(again.contains("Who owns backups?"), "other cards stay: {again}");
+        let core = handle.0.lock().await;
+        assert!(!core.note_markdown.contains("Answered questions"), "{}", core.note_markdown);
+        assert_eq!(core.qa_log.lock().unwrap().len(), 1);
     }
 }

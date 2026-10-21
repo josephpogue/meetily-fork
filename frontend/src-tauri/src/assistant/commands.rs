@@ -6,6 +6,8 @@
 
 use tauri::State;
 
+use crate::state::AppState;
+
 use super::core::{self, StatusOut};
 use super::lanes::CardKind;
 use super::AssistantHandle;
@@ -135,6 +137,17 @@ pub async fn assistant_add_todo(handle: State<'_, AssistantHandle>, text: String
 pub async fn assistant_dismiss_todo(handle: State<'_, AssistantHandle>, id: String) -> Result<(), String> {
     core::dismiss_todo(handle.inner(), id).await;
     Ok(())
+}
+
+/// Deletes assistant items by live id (a card's, a question's or a to-do's),
+/// during the call or after Stop. Returns how many items were removed.
+#[tauri::command]
+pub async fn assistant_delete_items(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+    ids: Vec<String>,
+) -> Result<u32, String> {
+    core::delete_items(handle.inner(), state.db_manager.pool(), ids).await
 }
 
 #[tauri::command]
