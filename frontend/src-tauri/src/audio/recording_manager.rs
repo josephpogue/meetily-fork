@@ -514,6 +514,14 @@ impl RecordingManager {
         self.recording_saver.set_meeting_name(name);
     }
 
+    /// See `RecordingSaver::rename_from_window_titles`.
+    pub fn rename_from_window_titles(
+        &mut self,
+        titles: &[(crate::assistant::vision::CallApp, String)],
+    ) -> Option<String> {
+        self.recording_saver.rename_from_window_titles(titles)
+    }
+
     /// Add a structured transcript segment to be saved later
     pub fn add_transcript_segment(&self, segment: super::recording_saver::TranscriptSegment) {
         self.recording_saver.add_transcript_segment(segment);

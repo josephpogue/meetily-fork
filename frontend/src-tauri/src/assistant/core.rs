@@ -29,7 +29,7 @@ use super::settings::{self, AssistantSettings};
 use super::transcript::{AssemblerOut, Speaker, TranscriptLog};
 use super::trigger::{TriggerEngine, TriggerMode};
 use super::vision::capture::{self, CaptureConfig, CaptureHandle};
-use super::vision::FrameStore;
+use super::vision::{CallApp, FrameStore};
 use super::voice_ask::{VoiceAsk, VoiceState};
 use super::AssistantHandle;
 
@@ -464,6 +464,14 @@ fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle, history: super::
             });
         }),
     }
+}
+
+/// The Zoom or Teams window titles the capture grabbed in the recording that
+/// is ending, first-seen order. Empty when the assistant or "See the Zoom
+/// window" is off. Read at Stop, before the next open drops the store.
+pub async fn window_titles(handle: &AssistantHandle) -> Vec<(CallApp, String)> {
+    let core = handle.0.lock().await;
+    core.frames.as_ref().map(|f| f.window_titles()).unwrap_or_default()
 }
 
 pub async fn get_state(handle: &AssistantHandle) -> StatusOut {
@@ -2063,6 +2071,30 @@ mod tests {
         set_enabled(&handle, false).await;
         assert!(handle.0.lock().await.frames.is_none());
         assert_eq!(store.latest_seq(), 0, "switch off means an empty store");
+    }
+
+    #[tokio::test]
+    async fn window_titles_are_this_recordings_and_empty_without_sight() {
+        let handle = AssistantHandle::new();
+        assert!(window_titles(&handle).await.is_empty(), "no store, no titles");
+
+        let store = FrameStore::new();
+        store.record_title(CallApp::Teams, "Storage roadmap review | Microsoft Teams");
+        {
+            let mut core = handle.0.lock().await;
+            core.frames = Some(store.clone());
+            core.session_open = true;
+        }
+        close_session(&handle).await;
+        assert_eq!(
+            window_titles(&handle).await,
+            vec![(CallApp::Teams, "Storage roadmap review | Microsoft Teams".to_string())],
+            "readable after the recording-stopped close, as Stop needs"
+        );
+
+        // The next recording opens with no store, so it cannot see these.
+        set_enabled(&handle, false).await;
+        assert!(window_titles(&handle).await.is_empty());
     }
 
     #[tokio::test]
