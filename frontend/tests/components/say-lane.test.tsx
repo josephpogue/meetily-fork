@@ -17,6 +17,7 @@ mock.module('../../src/services/assistantService', () => ({
     onVoice: async () => () => {},
     onNote: async () => () => {},
     onAsks: async () => () => {},
+    onItemsDeleted: async () => () => {},
   },
 }));
 const { AssistantProvider } = await import('../../src/contexts/AssistantContext');

@@ -27,6 +27,7 @@ mock.module('../../src/services/assistantService', () => ({
     onVoice: async (cb: (voice: unknown) => void) => { voiceListener = cb; return () => {}; },
     onNote: async () => () => {},
     onAsks: async (cb: (asks: unknown) => void) => { asksListener = cb; return () => {}; },
+    onItemsDeleted: async () => () => {},
     deleteItems,
     addTodo,
     ask: askQuestion,
