@@ -35,18 +35,24 @@ export function SavedTotals({ totals, meetingCount }: { totals?: string; meeting
   return <p className="px-6 pb-1 text-xs text-gray-500">{totals}</p>;
 }
 
-/** Title, Brief and the "What was saved" line at the top of a meeting page. */
-export function MeetingSavedHeader({ meetingId, title }: { meetingId: string; title: string }) {
-  const [saved, setSaved] = useState<MeetingSaved | null>(null);
+/**
+ * Title, Brief and the "What was saved" line at the top of a meeting page.
+ * `reloadKey` changes when the meeting list reloads (the provider's `saved`), so a page
+ * opened right after Stop picks up the finished numbers.
+ */
+export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId: string; title: string; reloadKey?: unknown }) {
+  const [loaded, setLoaded] = useState<{ id: string; saved: MeetingSaved | null } | null>(null);
 
   useEffect(() => {
     let cancelled = false;
-    setSaved(null);
     invoke<MeetingSaved | null>('api_get_meeting_saved', { meetingId })
-      .then((s) => { if (!cancelled) setSaved(s ?? null); })
+      .then((s) => { if (!cancelled) setLoaded({ id: meetingId, saved: s ?? null }); })
       .catch((error) => console.error('Failed to load what was saved:', error));
     return () => { cancelled = true; };
-  }, [meetingId]);
+  }, [meetingId, reloadKey]);
+
+  // Another meeting's numbers are never shown; the same meeting keeps its line while reloading.
+  const saved = loaded?.id === meetingId ? loaded.saved : null;
 
   return (
     <div className="flex-shrink-0 min-w-0 border-b border-gray-200 bg-white px-4 py-2">

@@ -89,6 +89,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [isSearching, setIsSearching] = useState(false);
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
+  const savedRequestRef = React.useRef(0);
   const summaryPollsRef = React.useRef(new Map<string, SummaryPoll>());
 
   // Use recording state from RecordingStateContext (single source of truth)
@@ -108,8 +109,11 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         }));
         setMeetings(transformedMeetings);
         // Extra numbers for the list; the list itself must not depend on them.
+        // Replies can land out of order (a slow scan from Stop vs a newer one after a delete):
+        // only the latest request may set the numbers.
+        const request = ++savedRequestRef.current;
         invoke<SavedOverview>('api_get_meetings_saved')
-          .then(setSaved)
+          .then((overview) => { if (request === savedRequestRef.current) setSaved(overview); })
           .catch((error) => console.error('Error fetching what was saved:', error));
         Analytics.trackBackendConnection(true);
       } catch (error) {

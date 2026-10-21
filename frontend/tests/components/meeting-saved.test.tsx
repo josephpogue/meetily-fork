@@ -99,3 +99,15 @@ describe('BriefLine', () => {
     expect(create(<BriefLine />).toJSON()).toBeNull();
   });
 });
+
+describe('MeetingSavedHeader reload', () => {
+  test('a changed reloadKey reloads the line and keeps the old one meanwhile', async () => {
+    reply = { brief: null, line: '10:04, 0 pictures, under 1 MB', durationSeconds: 0, pictures: 0, bytes: 0 };
+    await act(async () => { renderer = create(<MeetingSavedHeader meetingId="m1" title="T" reloadKey="a" />); });
+    expect(pageText(renderer)).toContain('10:04, 0 pictures');
+    reply = { brief: 'Now filed', line: '10:04 to 10:47, 43 min, 181 pictures, 165 MB', durationSeconds: 0, pictures: 0, bytes: 0 };
+    await act(async () => renderer.update(<MeetingSavedHeader meetingId="m1" title="T" reloadKey="b" />));
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(pageText(renderer)).toBe('T|Now filed|What was saved: 10:04 to 10:47, 43 min, 181 pictures, 165 MB');
+  });
+});

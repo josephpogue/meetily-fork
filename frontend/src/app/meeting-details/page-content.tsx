@@ -70,7 +70,7 @@ export default function PageContent({
   const autoGenerationStartedMeetingIdRef = useRef<string | null>(null);
 
   // Sidebar context
-  const { serverAddress } = useSidebar();
+  const { serverAddress, saved } = useSidebar();
 
   // Get model config from ConfigContext
   const { modelConfig, setModelConfig, isModelConfigLoading } = useConfig();
@@ -194,7 +194,7 @@ export default function PageContent({
       transition={{ duration: 0.3, ease: 'easeOut' }}
       className="flex flex-col h-screen min-w-0 bg-gray-50"
     >
-      <MeetingSavedHeader meetingId={meeting.id} title={meetingData.meetingTitle} />
+      <MeetingSavedHeader meetingId={meeting.id} title={meetingData.meetingTitle} reloadKey={saved} />
       <div className="flex flex-1 min-w-0 overflow-hidden">
         <MeetingDetailsSplitView
           activeTab={activeTab}
