@@ -1,6 +1,6 @@
 'use client';
 
-import React, { createContext, useContext, useState, useEffect, useCallback } from 'react';
+import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AssistantCard, AssistantStatus, AssistantVoice, AssistantNote, AssistantAsks } from '@/types';
 import { assistantService } from '@/services/assistantService';
 import { reconcileBrief, type BriefState } from '@/lib/ask-next';
@@ -22,6 +22,9 @@ const DEFAULT_STATUS: AssistantStatus = {
   lastError: null,
   lastErrorSeq: 0,
 };
+
+const NO_IDS: ReadonlySet<string> = new Set();
+const INITIAL_CARDS: AssistantCard[] = [];
 
 const DEFAULT_VOICE: AssistantVoice = { state: 'off', heard: '' };
 const DEFAULT_NOTE: AssistantNote = { state: 'idle', markdown: '', error: null };
@@ -50,6 +53,12 @@ interface AssistantContextType {
   /** Add a typed to-do. Resolves with null on success, or the command's error message. */
   addTodo: (text: string) => Promise<string | null>;
   dismissTodo: (id: string) => Promise<void>;
+  /**
+   * Delete items by their live ids. They leave every list at once and stay out
+   * for the session, whatever the backend keeps sending. Resolves true when the
+   * backend deleted them; on failure the items come back and it resolves false.
+   */
+  deleteItems: (ids: string[]) => Promise<boolean>;
   /** Joseph's answer to a For-you question; the backend moves it to the answered list. */
   answerAsk: (id: string, answer: string) => Promise<void>;
   ask: (text: string) => Promise<void>;
@@ -86,19 +95,53 @@ export const useAssistant = () => {
 
 export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AssistantStatus>(DEFAULT_STATUS);
-  const [cards, setCards] = useState<AssistantCard[]>([]);
   const [voice, setVoice] = useState<AssistantVoice>(DEFAULT_VOICE);
   const [note, setNote] = useState<AssistantNote>(DEFAULT_NOTE);
-  const [asks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
+  const [rawAsks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
+  const [rawCards, setCards] = useState<AssistantCard[]>(INITIAL_CARDS);
+  // Ids Joseph deleted this session. The backend keeps sending some of them (an
+  // answered question stays in the lane's snapshots, a drafting card is emitted
+  // again when checked), so every list is filtered through this set.
+  const [deletedIds, setDeletedIds] = useState<ReadonlySet<string>>(NO_IDS);
   const [brief, setBriefState] = useState<BriefState>({ draft: DEFAULT_ASKS.brief, saved: DEFAULT_ASKS.brief });
   const [backendBrief, setBackendBrief] = useState(DEFAULT_ASKS.brief);
 
   // Take the backend's latest copy of the brief as the saved baseline; the
   // draft adopts it, or absorbs an appended For-you answer, per reconcileBrief.
-  if (asks.brief !== backendBrief) {
-    setBackendBrief(asks.brief);
-    setBriefState(reconcileBrief(brief, asks.brief));
+  if (rawAsks.brief !== backendBrief) {
+    setBackendBrief(rawAsks.brief);
+    setBriefState(reconcileBrief(brief, rawAsks.brief));
   }
+
+  const cards = useMemo(
+    () => (deletedIds.size === 0 ? rawCards : rawCards.filter(c => !deletedIds.has(c.id))),
+    [rawCards, deletedIds]
+  );
+  const asks = useMemo<AssistantAsks>(() => {
+    if (deletedIds.size === 0) return rawAsks;
+    const keep = <T extends { id: string }>(list: T[]) => list.filter(item => !deletedIds.has(item.id));
+    return {
+      ...rawAsks,
+      asks: keep(rawAsks.asks),
+      forYou: keep(rawAsks.forYou),
+      answered: keep(rawAsks.answered),
+      // An older payload has no todos field: leave it as it came.
+      todos: rawAsks.todos ? keep(rawAsks.todos) : rawAsks.todos,
+    };
+  }, [rawAsks, deletedIds]);
+
+  // A new recording starts a new session with new ids: the deleted cards leave
+  // for good and the deleted set resets.
+  const wasSessionOpen = useRef(false);
+  const deletedNow = useRef(deletedIds);
+  deletedNow.current = deletedIds;
+  useEffect(() => {
+    if (status.sessionOpen && !wasSessionOpen.current) {
+      setCards(prev => prev.filter(c => !deletedNow.current.has(c.id)));
+      setDeletedIds(NO_IDS);
+    }
+    wasSessionOpen.current = status.sessionOpen;
+  }, [status.sessionOpen]);
 
   // Initial state fetch. A missing backend command (Rust module not built yet,
   // or the assistant disabled) leaves status at its off-by-default value.
@@ -322,6 +365,20 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const deleteItems = useCallback(async (ids: string[]): Promise<boolean> => {
+    if (ids.length === 0) return true;
+    // Gone at once; a failed command brings them back below.
+    setDeletedIds(prev => new Set([...prev, ...ids]));
+    try {
+      await assistantService.deleteItems(ids);
+      return true;
+    } catch (error) {
+      console.error('[AssistantContext] assistant_delete_items failed:', error);
+      setDeletedIds(prev => new Set([...prev].filter(id => !ids.includes(id))));
+      return false;
+    }
+  }, []);
+
   const answerAsk = useCallback(async (id: string, answer: string) => {
     try {
       await assistantService.answerAsk(id, answer);
@@ -340,6 +397,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     dismissAsk,
     addTodo,
     dismissTodo,
+    deleteItems,
     answerAsk,
     ask,
     explain,

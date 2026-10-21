@@ -100,6 +100,14 @@ export class AssistantService {
     return invoke('assistant_dismiss_todo', { id });
   }
 
+  /**
+   * Delete items by their live ids (cards, Ask, For-you and answered questions,
+   * to-dos), during the call and after Stop. Resolves with how many were deleted.
+   */
+  async deleteItems(ids: string[]): Promise<number> {
+    return invoke<number>('assistant_delete_items', { ids });
+  }
+
   /** Joseph answered a For-you question: it moves to the answered list with his answer. */
   async answerAsk(id: string, answer: string): Promise<void> {
     return invoke('assistant_answer_ask', { id, answer });

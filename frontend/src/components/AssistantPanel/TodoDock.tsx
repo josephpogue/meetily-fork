@@ -11,10 +11,10 @@ import { TodoDrawerColumns } from './TodoDrawer';
  * a drawer covers the lower part of both lanes and the strip underneath is kept
  * for its height only, so the lanes never resize. Esc closes the drawer and
  * focus returns to the strip's button. Esc cancels voice capture first when it is listening. "New" means arrived since the drawer was
- * last closed. `disabled` turns the dismiss buttons off (the session is closed).
+ * last closed. Deleting a to-do works with the session closed.
  */
-export function TodoDock({ disabled = false }: { disabled?: boolean }) {
-  const { asks, dismissTodo, voice } = useAssistant();
+export function TodoDock() {
+  const { asks, deleteItems, voice } = useAssistant();
   const listening = voice.state === 'listening';
   const todos = asks.todos ?? [];
   const [open, setOpen] = useState(false);
@@ -68,8 +68,7 @@ export function TodoDock({ disabled = false }: { disabled?: boolean }) {
           <TodoDrawerColumns
             todos={todos}
             lastClosedAt={lastClosedAt}
-            onDismiss={(id) => void dismissTodo(id)}
-            disabled={disabled}
+            onDismiss={(id) => void deleteItems([id])}
             focusClose={() => closeButton.current?.focus?.()}
           />
         </div>

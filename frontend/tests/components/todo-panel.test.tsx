@@ -16,7 +16,7 @@ afterAll(() => {
 let asksListener: ((asks: unknown) => void) | undefined;
 let statusListener: ((status: unknown) => void) | undefined;
 let voiceListener: ((voice: unknown) => void) | undefined;
-const dismissTodo = mock((_id: string) => Promise.resolve());
+const deleteItems = mock((_ids: string[]) => Promise.resolve(0));
 const addTodo = mock((_text: string): Promise<void> => Promise.resolve());
 const askQuestion = mock((_text: string) => Promise.resolve());
 mock.module('../../src/services/assistantService', () => ({
@@ -27,7 +27,7 @@ mock.module('../../src/services/assistantService', () => ({
     onVoice: async (cb: (voice: unknown) => void) => { voiceListener = cb; return () => {}; },
     onNote: async () => () => {},
     onAsks: async (cb: (asks: unknown) => void) => { asksListener = cb; return () => {}; },
-    dismissTodo,
+    deleteItems,
     addTodo,
     ask: askQuestion,
   },
@@ -105,7 +105,7 @@ const open = () => act(async () => { byLabel('Open to-do list').props.onClick({ 
 const type = (value: string) => act(async () => { inputEl().props.onChange({ target: { value } }); });
 
 beforeEach(() => {
-  dismissTodo.mockClear(); addTodo.mockClear(); askQuestion.mockClear();
+  deleteItems.mockClear(); addTodo.mockClear(); askQuestion.mockClear();
   asksListener = undefined; statusListener = undefined; voiceListener = undefined; keyHandlers.clear();
   focused = []; doc.activeElement = null; doc.dialogOpen = false;
 });
@@ -178,12 +178,12 @@ describe('To do drawer', () => {
     expect(textOf(column('They owe you'))).toContain('Nothing owed yet');
   });
 
-  test('dismiss X calls dismissTodo with the item id', async () => {
+  test('dismiss X deletes the item by its id', async () => {
     await mount();
     await open();
     const x = byLabel('Dismiss to-do: Send the host inventory export');
     await act(async () => { x.props.onClick(); });
-    expect(dismissTodo).toHaveBeenCalledWith('t4');
+    expect(deleteItems).toHaveBeenCalledWith(['t4']);
     expect(byLabel('Dismiss to-do: Check the licence count')).toBeDefined();
   });
 
@@ -228,26 +228,28 @@ describe('To do drawer', () => {
     expect(focused.at(-1)).toBe('Close to-do list');
   });
 
-  test('a dismiss that leaves the item in the list never steals focus later, even after a reset', async () => {
+  test('a delete moves focus once, and a backend that keeps sending the item never steals it later', async () => {
     await mount([todos[0]]);
     await open();
     focused = [];
     await act(async () => { byLabel('Dismiss to-do: Send Dana the runbook template').props.onClick(); });
-    // The core ignored it: the same list comes back, then a new meeting resets it.
+    // The item is gone at once and focus goes to Close; the same list coming back, then a reset, moves nothing more.
+    expect(focused).toEqual(['Close to-do list']);
     await act(async () => { asksListener!(payload([todos[0]])); });
     await act(async () => { asksListener!(payload([])); });
-    expect(focused).toEqual([]);
+    expect(focused).toEqual(['Close to-do list']);
   });
 
-  test('the drawer dismiss buttons are disabled while the session is closed', async () => {
+  test('the drawer x stays enabled and deletes after Stop (session closed)', async () => {
     await act(async () => {
-      renderer = create(<AssistantProvider><TodoDock disabled /></AssistantProvider>, { createNodeMock });
+      renderer = create(<AssistantProvider><TodoDock /></AssistantProvider>, { createNodeMock });
     });
-    await act(async () => { asksListener!(payload(todos)); });
+    await act(async () => { asksListener!(payload(todos)); statusListener!({ ...status(true), sessionOpen: false }); });
     await open();
-    expect(byLabel('Dismiss to-do: Send Dana the runbook template').props.disabled).toBe(true);
-    await act(async () => { renderer.update(<AssistantProvider><TodoDock disabled={false} /></AssistantProvider>); });
-    expect(byLabel('Dismiss to-do: Send Dana the runbook template').props.disabled).toBe(false);
+    const x = byLabel('Dismiss to-do: Send Dana the runbook template');
+    expect(x.props.disabled).toBeUndefined();
+    await act(async () => { x.props.onClick(); });
+    expect(deleteItems).toHaveBeenCalledWith(['t5']);
   });
 
   test('New marks items that arrived since the drawer was last closed', async () => {

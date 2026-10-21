@@ -5,6 +5,7 @@ import { ChevronDown, ChevronUp, ClipboardList } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AssistantTodo, AssistantTodoOwner } from '@/types';
 import { capitalise, isNewTodo, newestOpen, splitByOwner } from '@/lib/todos';
+import { TriCheckbox, useGroupState, useSelection } from './selection';
 
 /**
  * You is Joseph's own promise (solid rose); Them is what the other side owes
@@ -49,9 +50,17 @@ export function TodoStrip({ todos, lastClosedAt, open, onToggle, buttonRef, cove
   const newest = newestOpen(todos);
   const label = open ? 'Close to-do list' : 'Open to-do list';
   const Chevron = open ? ChevronDown : ChevronUp;
+  const { selecting, setMany } = useSelection();
+  const ids = todos.map((t) => t.id);
+  const group = useGroupState(ids);
 
   let summary: React.ReactNode;
-  if (open) {
+  if (selecting) {
+    // Selections hidden in a closed drawer stay visible here.
+    summary = (
+      <span className="text-[12.5px] font-semibold text-slate-700">{`${group.count} of ${ids.length} selected`}</span>
+    );
+  } else if (open) {
     summary = 'Newest first';
   } else if (!newest) {
     summary = todos.length === 0 ? 'Nothing yet' : 'Nothing open';
@@ -87,6 +96,15 @@ export function TodoStrip({ todos, lastClosedAt, open, onToggle, buttonRef, cove
         <OwnerPill owner="them" />
         <span className="text-xs font-semibold tabular-nums text-gray-700">{split.them.open.length}</span>
       </span>
+      {selecting && open && (
+        <TriCheckbox
+          checked={group.all}
+          indeterminate={group.some}
+          disabled={ids.length === 0}
+          onChange={() => setMany(ids, !group.all)}
+          label="Select all to-dos"
+        />
+      )}
       <span className="min-w-0 flex-1 break-words pl-1 text-xs leading-snug text-gray-600">{summary}</span>
       <button
         type="button"

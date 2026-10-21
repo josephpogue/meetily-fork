@@ -1,10 +1,12 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { Check } from 'lucide-react';
+import { Check, X } from 'lucide-react';
 import { AssistantCard as AssistantCardData } from '@/types';
 import { cn } from '@/lib/utils';
+import { useAssistant } from '@/contexts/AssistantContext';
 import { KindChip, type ChipKind } from './KindChip';
+import { ItemCheckbox, SELECTED_CARD, useSelection } from './selection';
 
 interface AssistantCardProps {
   card: AssistantCardData;
@@ -102,20 +104,58 @@ const REPLY_LABEL: Record<'ask' | 'explain' | 'catchup', string> = {
   catchup: 'Option-C at',
 };
 
+/** What names a card to a screen reader: its lead, or the question when it has none. */
+function cardName(card: AssistantCardData): string {
+  return card.lead || card.question;
+}
+
+/** The x at the end of a card's header row: deletes the card at once. Not shown while selecting. */
+function DismissCard({ card }: { card: AssistantCardData }) {
+  const { deleteItems } = useAssistant();
+  return (
+    <button
+      type="button"
+      onClick={() => void deleteItems([card.id])}
+      title="Dismiss"
+      aria-label={`Dismiss card: ${cardName(card)}`}
+      className="-mr-1 shrink-0 rounded p-0.5 text-gray-300 opacity-0 hover:text-gray-500 focus-visible:opacity-100 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-400 group-hover:opacity-100"
+    >
+      <X className="h-3.5 w-3.5" aria-hidden="true" />
+    </button>
+  );
+}
+
+/** What a card does in select mode: the whole card toggles, and the header makes room for the checkbox. */
+function useCardSelection(card: AssistantCardData) {
+  const { selecting, isSelected, toggle } = useSelection();
+  return {
+    selecting,
+    articleProps: selecting ? { onClick: () => toggle(card.id) } : {},
+    articleClass: cn('group', selecting && 'cursor-pointer', selecting && isSelected(card.id) && SELECTED_CARD),
+    headerClass: cn('mb-1.5 flex items-center gap-2', selecting && 'flex-wrap gap-y-1'),
+    timeClass: cn('text-xs tabular-nums text-gray-500', selecting ? 'flex-1 whitespace-nowrap' : 'min-w-0 flex-1'),
+  };
+}
+
 /** A suggested answer to a question Joseph was asked. */
 function AnswerCard({ card, pinned }: { card: AssistantCardData; pinned: boolean }) {
   const highlight = useChangedHighlight(card);
+  const sel = useCardSelection(card);
   return (
     <article
+      {...sel.articleProps}
       className={cn(
+        sel.articleClass,
         'rounded-xl border px-3.5 py-3',
         pinned ? 'border-blue-200 bg-blue-50 shadow-md shadow-blue-900/5' : 'border-gray-200 bg-white'
       )}
     >
-      <div className="mb-1.5 flex items-center gap-2">
+      <div className={sel.headerClass}>
+        {sel.selecting && <ItemCheckbox id={card.id} label={`Select card: ${cardName(card)}`} />}
         <KindChip kind="answer" />
-        <span className="min-w-0 flex-1 text-xs tabular-nums text-gray-500">Asked at {formatTime(card.ts)}</span>
+        <span className={sel.timeClass}>Asked at {formatTime(card.ts)}</span>
         <Phase phase={card.phase} />
+        {!sel.selecting && <DismissCard card={card} />}
       </div>
       {card.question && (
         <p className="mb-1.5 break-words text-[13.5px] italic text-gray-600">&ldquo;{card.question}&rdquo;</p>
@@ -134,15 +174,21 @@ function AnswerCard({ card, pinned }: { card: AssistantCardData; pinned: boolean
 /** Joseph's own chat, Explain or Catch up result. */
 function ReplyCard({ card }: { card: AssistantCardData }) {
   const highlight = useChangedHighlight(card);
+  const sel = useCardSelection(card);
   const kind = card.kind === 'ask' || card.kind === 'catchup' ? card.kind : 'explain';
   return (
-    <article className="rounded-xl border border-gray-200 bg-white px-3.5 py-3">
-      <div className="mb-1.5 flex items-center gap-2">
+    <article
+      {...sel.articleProps}
+      className={cn(sel.articleClass, 'rounded-xl border border-gray-200 bg-white px-3.5 py-3')}
+    >
+      <div className={sel.headerClass}>
+        {sel.selecting && <ItemCheckbox id={card.id} label={`Select card: ${cardName(card)}`} />}
         <KindChip kind={REPLY_CHIP[kind]} />
-        <span className="min-w-0 flex-1 text-xs tabular-nums text-gray-500">
+        <span className={sel.timeClass}>
           {REPLY_LABEL[kind]} {formatTime(card.ts)}
         </span>
         {card.phase === 'drafting' && <Drafting />}
+        {!sel.selecting && <DismissCard card={card} />}
       </div>
       {kind === 'ask' && card.question && (
         <p className="mb-2 inline-block max-w-full break-words rounded-lg rounded-bl-sm bg-slate-100 px-2.5 py-1 text-[13.5px] text-slate-700">
