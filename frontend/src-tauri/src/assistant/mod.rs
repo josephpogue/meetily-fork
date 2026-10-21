@@ -17,6 +17,7 @@ pub mod note;
 pub mod settings;
 pub mod startup_context;
 pub mod transcript;
+pub mod todo_list;
 pub mod trigger;
 pub mod vision;
 pub mod voice_ask;

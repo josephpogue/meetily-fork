@@ -35,6 +35,8 @@ const DEFAULT_ASKS: AssistantAsks = {
   checked: false,
   checking: false,
   changed: [],
+  todos: [],
+  dismissedTodos: [],
 };
 
 interface AssistantContextType {

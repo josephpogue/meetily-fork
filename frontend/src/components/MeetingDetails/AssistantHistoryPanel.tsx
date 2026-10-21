@@ -21,6 +21,7 @@ const KIND_LABEL: Record<MeetingAssistantKind, string> = {
   catchup: 'Catch-up',
   question: 'Question to ask',
   for_you: 'For you',
+  todo: 'To do',
 };
 
 // Same hues as the live panel: blue to say, violet to ask, slate for Joseph's own chat.
@@ -31,6 +32,7 @@ const KIND_TONE: Record<MeetingAssistantKind, string> = {
   catchup: 'bg-slate-100 text-slate-700 ring-slate-200',
   question: 'bg-violet-50 text-violet-700 ring-violet-200',
   for_you: 'bg-violet-50 text-violet-700 ring-violet-200',
+  todo: 'bg-rose-50 text-rose-700 ring-rose-200',
 };
 
 const ANSWERED_HOW: Record<string, string> = {

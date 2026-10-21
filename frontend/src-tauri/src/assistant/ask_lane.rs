@@ -22,6 +22,7 @@ use super::claude_cli::{
     ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS, READ_ONLY_TOOLS, WRITE_TOOLS,
 };
 use super::lanes::{run_with_retry, DeltaCb, FrameBatch, FrameFeed, FrameMode, RegisterCb, Runner};
+use super::todo_list::TodoItem;
 use super::transcript::TranscriptLog;
 
 pub const ASK_PROMPT: &str = include_str!("prompts/ask.md");
@@ -56,6 +57,11 @@ pub struct AsksOut {
     /// Ids of the items the last deep result added or reworded relative to
     /// the list it replaced. Empty for a quick result.
     pub changed: Vec<String>,
+    /// Every to-do this session that Joseph has not dismissed, open and
+    /// done, newest first (by `at`).
+    pub todos: Vec<TodoItem>,
+    /// Ids of the to-dos Joseph dismissed this session.
+    pub dismissed_todos: Vec<String>,
 }
 
 /// One private exchange Joseph had with the assistant in Ask (an Ask card),
@@ -239,6 +245,8 @@ impl AskState {
             checked: self.shown_by == Shown::Deep,
             checking: self.sub(Which::Deep).in_flight && self.shown_by != Shown::Deep,
             changed: self.changed.clone(),
+            todos: Vec::new(),
+            dismissed_todos: Vec::new(),
         }
     }
 }

@@ -395,6 +395,8 @@ mod tests {
             checked: true,
             checking: false,
             changed: vec![],
+            todos: vec![],
+            dismissed_todos: vec![],
         }
     }
 
