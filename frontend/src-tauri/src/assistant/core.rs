@@ -137,8 +137,8 @@ pub struct AssistantCore {
     listening: bool,
 
     /// Typed in the panel while no session is open; seeds the next session
-    /// and is cleared once used. A closing session puts its brief back here,
-    /// because the panel's box still shows it.
+    /// and is cleared once used. Stop clears it: the call's own brief does
+    /// not carry over, only one typed after Stop.
     pending_brief: Option<String>,
     /// Set by a `set_brief` made while no session is open, cleared when an
     /// open takes the brief. `open_lanes_with` reads it to tell "cleared in
@@ -1311,6 +1311,14 @@ async fn open_lanes_with(
     }
 }
 
+/// The brief the next session opens with: what was typed while no session
+/// was open, taken once. `None` when nothing was typed since the last call.
+async fn take_pending_brief(handle: &AssistantHandle) -> Option<String> {
+    let mut core = handle.0.lock().await;
+    core.brief_edited = false;
+    core.pending_brief.take()
+}
+
 /// Bound to `recording-started`. Reloads settings fresh (so a save made
 /// before this meeting takes effect), resets the session, and opens both
 /// lanes if the assistant is enabled and claude resolves.
@@ -1423,11 +1431,7 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
 
     // Take the brief only now that the session is sure to open: an early
     // return above leaves it pending, so the next attempt still has it.
-    let brief = {
-        let mut core = handle.0.lock().await;
-        core.brief_edited = false;
-        core.pending_brief.take()
-    };
+    let brief = take_pending_brief(handle).await;
 
     let cfg = LaneConfig {
         cwd: session_dir,
@@ -1566,13 +1570,17 @@ async fn start_capture(handle: &AssistantHandle, app: Option<&AppHandle<Wry>>) {
 async fn close_session(handle: &AssistantHandle) {
     let mut core = handle.0.lock().await;
     core.stop_capture();
+    // The call is over, so its brief is not the next call's: whatever a
+    // mid-call switch-off left pending goes too. A brief typed after this
+    // lands in `pending_brief` again and opens the next session.
+    core.pending_brief = None;
+    core.brief_edited = false;
     if !core.session_open {
         return;
     }
     core.session_open = false;
     core.lanes.close();
     core.ask_lane.close();
-    core.pending_brief = Some(core.brief.clone()).filter(|b| !b.trim().is_empty());
     core.emit_status();
 }
 
@@ -2194,13 +2202,62 @@ mod tests {
         let _ = std::fs::remove_dir_all(&home);
     }
 
+    /// The closing call's own brief does not open the next call.
     #[tokio::test]
-    async fn closing_the_session_carries_the_brief_into_the_next_one() {
+    async fn the_next_session_does_not_inherit_the_closing_calls_brief() {
+        let handle = AssistantHandle::new();
+        let emitted = Arc::new(StdMutex::new(Vec::new()));
+        let recorded = emitted.clone();
+        let hooks = AskHooks {
+            emit: Arc::new(move |out| recorded.lock().unwrap().push(out)),
+            ..Default::default()
+        };
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        {
+            let mut core = handle.0.lock().await;
+            core.ask_hooks = hooks;
+        }
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls.clone())).await;
+        close_session(&handle).await;
+        assert_eq!(handle.0.lock().await.pending_brief, None);
+
+        let brief = take_pending_brief(&handle).await.unwrap_or_default();
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), brief, ask_runner(calls)).await;
+        let core = handle.0.lock().await;
+        assert_eq!(core.brief, "");
+        assert_eq!(core.ask_lane.snapshot().brief, "");
+        assert_eq!(core.history.lock().unwrap().brief(), "");
+        assert_eq!(emitted.lock().unwrap().last().unwrap().brief, "");
+    }
+
+    /// A brief typed after the previous call's Stop is the new call's brief.
+    #[tokio::test]
+    async fn a_brief_typed_between_calls_is_the_next_calls_brief() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls.clone())).await;
+        close_session(&handle).await;
+        set_brief(&handle, "goal B".to_string()).await;
+
+        let brief = take_pending_brief(&handle).await.unwrap_or_default();
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), brief, ask_runner(calls)).await;
+        let core = handle.0.lock().await;
+        assert_eq!(core.brief, "goal B");
+        assert_eq!(core.ask_lane.snapshot().brief, "goal B");
+        assert_eq!(core.history.lock().unwrap().brief(), "goal B");
+    }
+
+    /// Switching the assistant off in a call and closing it at Stop leaves
+    /// nothing for the next call either.
+    #[tokio::test]
+    async fn stop_after_a_mid_call_switch_off_leaves_no_brief_for_the_next_call() {
         let handle = AssistantHandle::new();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), "goal A".to_string(), ask_runner(calls)).await;
+        set_enabled(&handle, false).await;
+        assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"), "off and on again in one call keeps the brief");
         close_session(&handle).await;
-        assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("goal A"));
+        assert_eq!(handle.0.lock().await.pending_brief, None);
     }
 
     /// A brief cleared while the lanes open wins over the one the open path

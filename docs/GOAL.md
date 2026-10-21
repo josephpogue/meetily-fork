@@ -32,7 +32,7 @@ Decisions Joseph has made for this version. Every feature follows them.
 - Output is text only, with no spoken replies.
 - The app runs on macOS on Apple Silicon.
 - The app is a normal window. It is not hidden from screen share, and is never described as hidden.
-- The meeting brief is optional and editable during the call. The assistant also works out the point of the call from the conversation.
+- The meeting brief is optional and editable during the call. A new recording starts clean: nothing from the previous call (brief, cards, questions, to-dos) carries over, except a brief typed after Stop and before the new recording. The assistant also works out the point of the call from the conversation.
 - Gaps are the assistant's own judgment from the context it has. There is no preset question list or checklist.
 - Once a question Joseph asks or the assistant suggests is answered, either on the call or by Joseph and the assistant working it out, the assistant moves it off the open list and keeps it with its answer. Joseph does not tick questions off; removing one is his choice, by deleting it.
 - The assistant panel keeps what to say and what to ask apart: a Say lane and an Ask lane, one label, icon and colour per kind of content, and nothing in the panel cut short. The panel width is Joseph's to drag, and it is remembered.

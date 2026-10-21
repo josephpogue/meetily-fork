@@ -140,18 +140,20 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     };
   }, [rawAsks, deletedIds]);
 
-  // A new recording starts a new session with new ids: the deleted cards leave
-  // for good and the deleted set resets.
-  const wasSessionOpen = useRef(false);
-  const deletedNow = useRef(deletedIds);
-  deletedNow.current = deletedIds;
-  useEffect(() => {
-    if (status.sessionOpen && !wasSessionOpen.current) {
-      setCards(prev => prev.filter(c => !deletedNow.current.has(c.id)));
-      setDeletedIds(NO_IDS);
-    }
-    wasSessionOpen.current = status.sessionOpen;
-  }, [status.sessionOpen]);
+  // A new recording starts a new session with new ids, and nothing from the
+  // last call comes with it: its cards, questions and to-dos leave, and the
+  // deleted set resets. After Stop they stay (Joseph deletes and drafts the
+  // note then); only the next session's start clears them. Done in the status
+  // handler, not an effect, so an event that follows the status in the same
+  // batch lands on the cleared lists. The brief is not reset here: the backend
+  // sends the new call's brief (empty unless one was typed after Stop) and the
+  // draft follows it.
+  const sessionWasOpen = useRef(false);
+  const startNewSession = useCallback(() => {
+    setCards(INITIAL_CARDS);
+    setAsks(prev => ({ ...DEFAULT_ASKS, brief: prev.brief }));
+    setDeletedIds(NO_IDS);
+  }, []);
 
   // Initial state fetch. A missing backend command (Rust module not built yet,
   // or the assistant disabled) leaves status at its off-by-default value.
@@ -159,6 +161,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     const loadInitialState = async () => {
       try {
         const initial = await assistantService.getState();
+        sessionWasOpen.current = initial.sessionOpen;
         setStatus(initial);
       } catch (error) {
         console.warn('[AssistantContext] assistant_get_state unavailable, using defaults:', error);
@@ -189,6 +192,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
         unsubscribers.push(unlistenCard);
 
         const unlistenStatus = await assistantService.onStatus((next) => {
+          if (next.sessionOpen && !sessionWasOpen.current) startNewSession();
+          sessionWasOpen.current = next.sessionOpen;
           setStatus(next);
         });
         unsubscribers.push(unlistenStatus);
@@ -232,7 +237,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
       console.log('[AssistantContext] Cleaning up event listeners');
       unsubscribers.forEach(unsub => unsub());
     };
-  }, []);
+  }, [startNewSession]);
 
   const ask = useCallback(async (text: string) => {
     try {

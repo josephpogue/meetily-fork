@@ -84,7 +84,8 @@ async function mount(list: unknown[] = todos) {
   await act(async () => {
     renderer = create(<AssistantProvider><TodoDock /><AskBox disabled={false} /></AssistantProvider>, { createNodeMock });
   });
-  await act(async () => { asksListener!(payload(list)); statusListener!(status(true)); });
+  // The session opens first: a session's start clears the last call's lists.
+  await act(async () => { statusListener!(status(true)); asksListener!(payload(list)); });
 }
 // Rendered text of one node, with a bar between block-ish elements so adjacent pieces stay apart.
 function collect(node: unknown): string {
