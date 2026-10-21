@@ -621,7 +621,8 @@ pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
 /// unknown id or an empty answer.
 pub async fn answer_ask(handle: &AssistantHandle, id: String, answer: String) -> bool {
     let core = handle.0.lock().await;
-    if !core.ask_lane.answer(&id, &answer) {
+    // No open session on the current lane (see `dismiss_ask`): change nothing.
+    if !core.session_open || !core.ask_lane.answer(&id, &answer) {
         return false;
     }
     if core.session_open && core.enabled {
@@ -635,15 +636,18 @@ pub async fn answer_ask(handle: &AssistantHandle, id: String, answer: String) ->
 /// lists it as typed so the model never adds it again. The error text goes
 /// to the Ask box, so nothing is set on the status.
 pub async fn add_todo(handle: &AssistantHandle, text: String) -> Result<(), String> {
-    add_todo_at(handle, text, chrono::Utc::now().timestamp_millis()).await
+    // The recording's active seconds (pauses left out), the same scale as the
+    // transcript's audio times. None when no recording is reachable.
+    let active = crate::audio::recording_commands::get_recording_state().await["active_duration"].as_f64();
+    add_todo_at(handle, text, active).await
 }
 
-/// `add_todo` with the clock passed in (epoch ms), so a test can set it. The
-/// to-do's call time is the recording clock now: seconds since the recording
-/// started (the collector's `opened_ms`, set on `recording-started`), never
-/// earlier than the newest utterance's start, and just that start when the
-/// recording start is unknown.
-async fn add_todo_at(handle: &AssistantHandle, text: String, now_ms: i64) -> Result<(), String> {
+/// `add_todo` with the recording's active seconds passed in, so a test can
+/// set them. The to-do's call time is that recording clock, never earlier
+/// than the newest utterance's start, and just that start when the active
+/// time is unknown. Wall clock would run ahead after a pause: transcript
+/// times come from audio samples, which stop while the recording is paused.
+async fn add_todo_at(handle: &AssistantHandle, text: String, active_secs: Option<f64>) -> Result<(), String> {
     let text = super::ask_list::collapse(&text);
     if text.is_empty() {
         return Err("Type the to-do after todo:".to_string());
@@ -653,8 +657,7 @@ async fn add_todo_at(handle: &AssistantHandle, text: String, now_ms: i64) -> Res
         return Err("Start a recording with the assistant on to add a to-do.".to_string());
     }
     let latest = core.transcript.latest_start();
-    let opened_ms = core.history.lock().unwrap().opened_ms();
-    let call_time = if opened_ms > 0 { latest.max((now_ms - opened_ms) as f64 / 1000.0) } else { latest };
+    let call_time = active_secs.filter(|s| s.is_finite()).map_or(latest, |s| latest.max(s));
     core.ask_lane.add_todo(&text, call_time);
     Ok(())
 }
@@ -1951,9 +1954,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_typed_todo_is_stamped_with_the_recording_clock_not_the_last_utterance() {
+    async fn a_typed_todo_is_stamped_with_the_active_recording_time_not_wall_clock() {
         let handle = AssistantHandle::new();
-        let history = handle.0.lock().await.history_handle_for_test();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
         handle.0.lock().await.transcript.ingest(&tu("mic", "ok", 18.0, 19.0));
@@ -1961,20 +1963,42 @@ mod tests {
             h.0.try_lock().unwrap().ask_lane.snapshot().todos.iter().find(|t| t.text == text).unwrap().call_time
         };
 
-        // No known recording start: the newest utterance's start.
-        history.lock().unwrap().reset(0);
-        add_todo_at(&handle, "No start known".to_string(), 5_000_000).await.unwrap();
-        assert_eq!(at(&handle, "No start known"), 18.0);
+        // Recording state not reachable: the newest utterance's start.
+        add_todo_at(&handle, "No state".to_string(), None).await.unwrap();
+        assert_eq!(at(&handle, "No state"), 18.0);
 
-        // Recording started at 1_000_000 ms; now is 150.5 s later.
-        history.lock().unwrap().reset(1_000_000);
-        add_todo_at(&handle, "Send Dana the runbook".to_string(), 1_150_500).await.unwrap();
-        assert_eq!(at(&handle, "Send Dana the runbook"), 150.5);
+        // 10 min recorded, 15 min paused, 1 min more: active time is 11:00
+        // (660 s) where wall clock would read 26:00 (1560 s).
+        add_todo_at(&handle, "Send Dana the runbook".to_string(), Some(660.0)).await.unwrap();
+        assert_eq!(at(&handle, "Send Dana the runbook"), 660.0);
 
-        // A clock behind the newest utterance never goes earlier than it.
-        handle.0.lock().await.transcript.ingest(&tu("system", "late", 200.0, 201.0));
-        add_todo_at(&handle, "Book the venue".to_string(), 1_100_000).await.unwrap();
-        assert_eq!(at(&handle, "Book the venue"), 200.0);
+        // Active time behind the newest utterance never goes earlier than it.
+        handle.0.lock().await.transcript.ingest(&tu("system", "late", 700.0, 701.0));
+        add_todo_at(&handle, "Book the venue".to_string(), Some(660.0)).await.unwrap();
+        assert_eq!(at(&handle, "Book the venue"), 700.0);
+    }
+
+    #[tokio::test]
+    async fn answering_between_recording_started_and_the_new_lane_leaks_nothing() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        {
+            let sink = history.clone();
+            handle.0.lock().await.ask_hooks.emit =
+                Arc::new(move |out| super::super::history::record_asks(&sink, &out));
+        }
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        history.lock().unwrap().reset(1_000); // meeting 1: recording-started
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let id = handle.0.lock().await.ask_lane.snapshot().asks[0].id.clone();
+        close_session(&handle).await; // meeting 1: recording-stopped
+
+        history.lock().unwrap().reset(50_000); // meeting 2: recording-started
+        assert!(!answer_ask(&handle, id, "Ten percent".to_string()).await);
+        assert!(history.lock().unwrap().is_empty(), "the fresh collector holds nothing from the old lane");
+        assert!(handle.0.lock().await.ask_lane.snapshot().answered.is_empty());
     }
 
     #[tokio::test]
