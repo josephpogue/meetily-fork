@@ -967,7 +967,7 @@ impl AnswerLanes {
         let mut prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
         if has_frames {
             prompt.push_str(
-                "\n\nPictures of the Zoom window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
+                "\n\nPictures of the Zoom or Teams window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
             );
         }
         let turn = build_turn(LaneCall {
@@ -1505,7 +1505,7 @@ mod tests {
         let mut off = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
         let _ = off.draft_note("t".to_string(), "qa".to_string()).await;
         let calls = calls.lock().unwrap();
-        assert!(calls[0].images.is_empty() && !calls[0].prompt.contains("Pictures of the Zoom"));
+        assert!(calls[0].images.is_empty() && !calls[0].prompt.contains("Pictures of the Zoom or Teams"));
     }
 
     #[tokio::test]

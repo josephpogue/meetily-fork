@@ -22,7 +22,7 @@ pub struct AssistantSettings {
     pub names: String,
     pub vault_root: String,
     pub deep_read_dirs: String,
-    /// "See the Zoom window": capture the Zoom meeting window and send
+    /// "See the Zoom or Teams window": capture the Zoom (else Teams) meeting window and send
     /// changed frames to the lanes. On by default.
     pub see_zoom_window: bool,
 }

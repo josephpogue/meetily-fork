@@ -37,7 +37,7 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 - Open the stand-in Zoom window: `testenv exec <id> -- open -a "Zoom Stand-in"`
 - Opening it puts Zoom in front. Bring Meetily back before you click anything: `testenv exec <id> -- open -a meetily-fork`
-- "See the Zoom window" is on by default, so you do not need to turn it on in the app's settings.
+- "See the Zoom or Teams window" is on by default, so you do not need to turn it on in the app's settings.
 - During a recording, run `testenv exec <id> -- bash -c 'ls /Users/admin/Movies/meetily-recordings/*/zoom-frames/ 2>/dev/null | head'`. It must list picture files.
 - The app saves the frames in `zoom-frames` inside the meeting folder (default `~/Movies/meetily-recordings/<meeting>/`). See `frames_dirs` in `frontend/src-tauri/src/assistant/core.rs`. You do not read that file; this is only where the pictures land.
 

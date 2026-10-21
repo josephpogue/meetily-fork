@@ -467,7 +467,7 @@ fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle, history: super::
 }
 
 /// The Zoom or Teams window titles the capture grabbed in the recording that
-/// is ending, first-seen order. Empty when the assistant or "See the Zoom
+/// is ending, first-seen order. Empty when the assistant or "See the Zoom or Teams
 /// window" is off. Taken at Stop, so a quick next recording cannot be named
 /// from them again.
 pub async fn take_window_titles(handle: &AssistantHandle) -> Vec<(CallApp, String)> {
