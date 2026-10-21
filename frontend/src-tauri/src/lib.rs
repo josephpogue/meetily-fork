@@ -40,6 +40,7 @@ pub mod api;
 pub mod assistant;
 pub mod audio;
 pub mod config;
+pub mod meeting_saved;
 pub mod console_utils;
 pub mod database;
 pub mod notifications;
@@ -812,6 +813,8 @@ pub fn run() {
             anthropic::anthropic::get_anthropic_models,
             groq::groq::get_groq_models,
             api::api_get_meetings,
+            meeting_saved::api_get_meetings_saved,
+            meeting_saved::api_get_meeting_saved,
             api::api_search_transcripts,
             api::api_get_profile,
             api::api_save_profile,

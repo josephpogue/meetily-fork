@@ -31,6 +31,7 @@ import Info from '../Info';
 import { ComplianceNotification } from '../ComplianceNotification';
 import { Input } from '../ui/input';
 import { InputGroup, InputGroupAddon, InputGroupButton, InputGroupInput } from '../ui/input-group';
+import { BriefLine, SavedTotals } from '../MeetingSaved';
 
 interface SidebarItem {
   id: string;
@@ -54,7 +55,9 @@ const Sidebar: React.FC = () => {
     isSearching,
     meetings,
     setMeetings,
-    serverAddress
+    refetchMeetings,
+    serverAddress,
+    saved
   } = useSidebar();
 
   // Get recording state from RecordingStateContext (single source of truth)
@@ -332,6 +335,7 @@ const Sidebar: React.FC = () => {
       console.log('Meeting deleted successfully');
       const updatedMeetings = meetings.filter((m: CurrentMeeting) => m.id !== itemId);
       setMeetings(updatedMeetings);
+      void refetchMeetings(); // totals change when a meeting goes
 
       // Track meeting deletion
       Analytics.trackMeetingDeleted(itemId);
@@ -617,7 +621,10 @@ const Sidebar: React.FC = () => {
                     <Plus className="w-3.5 h-3.5 text-blue-600" />
                   </div>
                 )}
-                <span className="flex-1 break-words">{item.title}</span>
+                <div className="flex-1 min-w-0">
+                  <span className="break-words">{item.title}</span>
+                  {isMeetingItem && <BriefLine brief={saved?.meetings[item.id]?.brief} color={isActive ? 'text-gray-700' : 'text-gray-500'} />}
+                </div>
                 {isMeetingItem && (
                   <div className="flex items-center gap-1 opacity-0 group-hover:opacity-100 transition-opacity duration-150">
                     <button
@@ -754,6 +761,7 @@ const Sidebar: React.FC = () => {
                     </div>
                   </div>
                 ))}
+                <SavedTotals totals={saved?.totals} meetingCount={saved?.meetingCount ?? 0} />
               </div>
             )}
 
