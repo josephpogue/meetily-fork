@@ -35,6 +35,8 @@ const DEFAULT_ASKS: AssistantAsks = {
   checked: false,
   checking: false,
   changed: [],
+  todos: [],
+  dismissedTodos: [],
 };
 
 interface AssistantContextType {
@@ -45,6 +47,9 @@ interface AssistantContextType {
   asks: AssistantAsks;
   refreshAsks: () => Promise<void>;
   dismissAsk: (id: string) => Promise<void>;
+  /** Add a typed to-do. Resolves with null on success, or the command's error message. */
+  addTodo: (text: string) => Promise<string | null>;
+  dismissTodo: (id: string) => Promise<void>;
   /** Joseph's answer to a For-you question; the backend moves it to the answered list. */
   answerAsk: (id: string, answer: string) => Promise<void>;
   ask: (text: string) => Promise<void>;
@@ -298,6 +303,25 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
+  const addTodo = useCallback(async (text: string): Promise<string | null> => {
+    try {
+      await assistantService.addTodo(text);
+      return null;
+    } catch (error) {
+      console.error('[AssistantContext] assistant_add_todo failed:', error);
+      if (typeof error === 'string') return error;
+      return error instanceof Error ? error.message : "Couldn't add that to-do.";
+    }
+  }, []);
+
+  const dismissTodo = useCallback(async (id: string) => {
+    try {
+      await assistantService.dismissTodo(id);
+    } catch (error) {
+      console.error('[AssistantContext] assistant_dismiss_todo failed:', error);
+    }
+  }, []);
+
   const answerAsk = useCallback(async (id: string, answer: string) => {
     try {
       await assistantService.answerAsk(id, answer);
@@ -314,6 +338,8 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     asks,
     refreshAsks,
     dismissAsk,
+    addTodo,
+    dismissTodo,
     answerAsk,
     ask,
     explain,

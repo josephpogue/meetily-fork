@@ -225,6 +225,43 @@ export interface AssistantAsks {
   checking: boolean;
   // Ids of the items the last deep check added or reworded.
   changed: string[];
+  // Every to-do this session that Joseph has not dismissed, open and done,
+  // newest first (by `at`).
+  todos: AssistantTodo[];
+  // Ids of the to-dos Joseph dismissed this session.
+  dismissedTodos: string[];
+}
+
+// 'you': Joseph promised it, or agreed when the other side asked him.
+// 'them': someone on the other side promised it to Joseph.
+export type AssistantTodoOwner = 'you' | 'them';
+
+// The call showed the to-do is finished. Joseph never ticks it off.
+export interface AssistantTodoDone {
+  // A few words on how the call showed it, e.g. "said it was sent".
+  how: string;
+  // Seconds from recording start (transcript audio_start_time scale).
+  callTime: number;
+  // Epoch milliseconds.
+  at: number;
+}
+
+export interface AssistantTodo {
+  id: string;
+  // The to-do in a few plain words, e.g. "Send the design doc".
+  text: string;
+  owner: AssistantTodoOwner;
+  // For a Them to-do, the person's name when the call says it; else ''.
+  who: string;
+  // When it is due, as the call said it ("By Friday", "Monday"); else ''.
+  due: string;
+  // 'call': picked up from the transcript. 'typed': Joseph typed it after todo:.
+  origin: 'call' | 'typed';
+  // Seconds from recording start (transcript audio_start_time scale).
+  callTime: number;
+  // Epoch milliseconds it was added.
+  at: number;
+  done: AssistantTodoDone | null;
 }
 
 export interface AssistantSettings {
@@ -249,7 +286,7 @@ export interface AssistantClaudeProbe {
 }
 
 /** One saved assistant item of a past meeting (api_get_meeting_assistant). */
-export type MeetingAssistantKind = 'answer' | 'ask' | 'explain' | 'catchup' | 'question' | 'for_you';
+export type MeetingAssistantKind = 'answer' | 'ask' | 'explain' | 'catchup' | 'question' | 'for_you' | 'todo';
 
 export interface MeetingAssistantItem {
   id: string;
@@ -267,4 +304,13 @@ export interface MeetingAssistantItem {
   answer: string;
   answeredHow: 'call' | 'chat' | 'you' | '';
   answeredCallTime: number | null;
+  // To-do items only ('' on every other kind). A 'todo' item keeps its text in
+  // `lead`, where it came from ('call' | 'typed') in `source`, and once the
+  // call showed it finished: `answer` = how, `answeredHow` = 'call',
+  // `answeredCallTime` = when.
+  owner: AssistantTodoOwner | '';
+  // For a Them to-do, the person's name when the call said it.
+  ownerName: string;
+  // When it is due, as the call said it.
+  due: string;
 }

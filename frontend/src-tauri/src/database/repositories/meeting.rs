@@ -309,6 +309,9 @@ mod tests {
             answer: String::new(),
             answered_how: String::new(),
             answered_call_time: None,
+            owner: String::new(),
+            owner_name: String::new(),
+            due: String::new(),
         };
         AssistantItemsRepository::replace_for_meeting(&pool, "m1", &[item]).await.unwrap();
         assert!(MeetingsRepository::delete_meeting(&pool, "m1").await.unwrap());

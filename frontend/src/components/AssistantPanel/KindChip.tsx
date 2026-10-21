@@ -1,13 +1,13 @@
-import { Check, CircleHelp, CornerDownRight, History, MessageCircleQuestion, MessageSquare, type LucideIcon } from 'lucide-react';
+import { Check, CircleHelp, ClipboardList, CornerDownRight, History, MessageCircleQuestion, MessageSquare, type LucideIcon } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 /**
  * One label, icon and colour per kind of content in the assistant panel, so a
  * glance tells what an item is by colour and by word: blue for what to say,
  * violet for what to ask, green for what got answered, slate for Joseph's own
- * chat, Catch up and Explain. Amber is kept for the status line under the header.
+ * chat, Catch up and Explain, rose for to-dos. Amber is kept for the status line under the header.
  */
-export type ChipKind = 'answer' | 'toAsk' | 'answered' | 'youAsked' | 'catchup' | 'explain';
+export type ChipKind = 'answer' | 'toAsk' | 'answered' | 'youAsked' | 'catchup' | 'explain' | 'todo';
 
 const CHIPS: Record<ChipKind, { label: string; icon: LucideIcon; tone: string }> = {
   answer: { label: 'Answer', icon: CornerDownRight, tone: 'bg-blue-50 text-blue-700 ring-blue-200' },
@@ -15,6 +15,7 @@ const CHIPS: Record<ChipKind, { label: string; icon: LucideIcon; tone: string }>
   answered: { label: 'Answered', icon: Check, tone: 'bg-emerald-50 text-emerald-700 ring-emerald-200' },
   youAsked: { label: 'You asked', icon: MessageSquare, tone: 'bg-slate-100 text-slate-700 ring-slate-200' },
   catchup: { label: 'Catch up', icon: History, tone: 'bg-slate-100 text-slate-700 ring-slate-200' },
+  todo: { label: 'To do', icon: ClipboardList, tone: 'bg-rose-50 text-rose-700 ring-rose-200' },
   explain: { label: 'Explain', icon: MessageCircleQuestion, tone: 'bg-slate-100 text-slate-700 ring-slate-200' },
 };
 
