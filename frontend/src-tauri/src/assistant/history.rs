@@ -17,6 +17,7 @@ use super::ask_list::{AnswerHow, AnsweredItem, AskItem};
 use super::lanes::{CardKind, CardOut};
 use super::todo_list::{TodoItem, TodoOrigin, TodoOwner};
 use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
+use crate::database::repositories::assistant_meta::AssistantMetaRepository;
 
 pub type HistoryHandle = Arc<StdMutex<HistoryCollector>>;
 
@@ -96,6 +97,9 @@ pub struct HistoryCollector {
     /// The meeting these entries were last saved for, so a delete after the
     /// save can reach the saved rows.
     saved_meeting_id: Option<String>,
+    /// The Brief as it last stood this session (from the asks snapshots and
+    /// from `set_brief`); saved with the meeting.
+    brief: String,
 }
 
 fn card_kind(kind: CardKind) -> &'static str {
@@ -129,6 +133,16 @@ impl HistoryCollector {
         self.entries.clear();
         self.deleted.clear();
         self.saved_meeting_id = None;
+        self.brief.clear();
+    }
+
+    /// The Brief changed (or was found at session start): the latest wins.
+    pub fn set_brief(&mut self, brief: &str) {
+        self.brief = brief.to_string();
+    }
+
+    pub fn brief(&self) -> &str {
+        &self.brief
     }
 
     /// Deletes every entry that was seen under one of `ids` and remembers all
@@ -211,6 +225,7 @@ impl HistoryCollector {
 
     /// One Ask next snapshot: every open item, then everything answered.
     pub fn observe_asks(&mut self, out: &AsksOut, now_ms: i64) {
+        self.brief = out.brief.clone();
         for item in &out.asks {
             self.observe_open(item, "question", now_ms);
         }
@@ -425,6 +440,7 @@ pub fn write_folder_file(
     meeting_id: &str,
     recording_started_ms: i64,
     items: &[AssistantItem],
+    brief: &str,
 ) -> std::io::Result<()> {
     let started = Utc
         .timestamp_millis_opt(recording_started_ms)
@@ -435,6 +451,7 @@ pub fn write_folder_file(
         "version": 1,
         "meetingId": meeting_id,
         "recordingStartedAt": started,
+        "brief": brief,
         "items": items,
     });
     let text = serde_json::to_string_pretty(&doc).map_err(std::io::Error::other)?;
@@ -466,6 +483,17 @@ pub async fn save_for_meeting(
         let c = history.lock().unwrap();
         (c.opened_ms(), c.clone_entries())
     };
+    // The brief goes in first: it is kept even when no item was shown.
+    let brief = snapshot.brief().to_string();
+    let has_row = AssistantMetaRepository::get(pool, meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .is_some();
+    if has_row || !brief.is_empty() {
+        AssistantMetaRepository::set_brief(pool, meeting_id, &brief)
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     if snapshot.is_empty() {
         return Ok(0);
     }
@@ -484,7 +512,7 @@ pub async fn save_for_meeting(
         .map_err(|e| e.to_string())?;
     history.lock().unwrap().saved_meeting_id = Some(meeting_id.to_string());
     if let Some(folder) = folder.filter(|f| f.is_dir()) {
-        if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &items) {
+        if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &items, &brief) {
             log::warn!("assistant: could not write assistant.json for {}: {}", meeting_id, e);
         }
     }
@@ -540,7 +568,12 @@ pub async fn after_items_deleted(
                 .map(|d| d.timestamp_millis() - (first.call_time * 1000.0).round() as i64)
         })
         .unwrap_or_else(now_ms);
-    if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &remaining) {
+    let brief = AssistantMetaRepository::get(pool, meeting_id)
+        .await
+        .map_err(|e| e.to_string())?
+        .map(|m| m.brief)
+        .unwrap_or_default();
+    if let Err(e) = write_folder_file(&folder, meeting_id, start_ms, &remaining, &brief) {
         log::warn!("assistant: could not rewrite assistant.json for {}: {}", meeting_id, e);
     }
     Ok(())
@@ -593,6 +626,7 @@ impl HistoryCollector {
             entries: self.entries.clone(),
             deleted: self.deleted.clone(),
             saved_meeting_id: self.saved_meeting_id.clone(),
+            brief: self.brief.clone(),
         }
     }
 }
@@ -643,6 +677,97 @@ mod tests {
             todos: vec![],
             dismissed_todos: vec![],
         }
+    }
+
+    fn asks_with_brief(brief: &str, asks: Vec<AskItem>) -> AsksOut {
+        let mut out = asks_out(asks, vec![], vec![]);
+        out.brief = brief.into();
+        out
+    }
+
+    #[tokio::test]
+    async fn latest_brief_is_saved_to_the_row_and_the_file() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        record_asks(&h, &asks_with_brief("PNC sync", vec![ask("a1", "One?")]));
+        record_asks(&h, &asks_with_brief("PNC sync with Jim", vec![ask("a1", "One?")]));
+        assert_eq!(save_for_meeting(&pool, &h, "m1").await.unwrap(), 1);
+        let meta = AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(meta.brief, "PNC sync with Jim");
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
+        assert_eq!(doc["brief"], "PNC sync with Jim");
+        assert_eq!(doc["version"], 1);
+    }
+
+    #[tokio::test]
+    async fn a_brief_with_no_items_is_still_saved() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        h.lock().unwrap().set_brief("PNC sync");
+        assert_eq!(save_for_meeting(&pool, &h, "m1").await.unwrap(), 0);
+        assert_eq!(AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap().brief, "PNC sync");
+    }
+
+    #[tokio::test]
+    async fn empty_brief_and_no_items_makes_no_row() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        assert_eq!(save_for_meeting(&pool, &h, "m1").await.unwrap(), 0);
+        assert_eq!(AssistantMetaRepository::get(&pool, "m1").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn resaving_updates_the_brief_and_keeps_the_vault_columns() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        h.lock().unwrap().set_brief("first");
+        save_for_meeting(&pool, &h, "m1").await.unwrap();
+        AssistantMetaRepository::set_filed(&pool, "m1", Some("broadcom-pnc-bank"), "/v/n.md", "/v/t.md", "2026-10-21T15:00:00Z")
+            .await
+            .unwrap();
+        h.lock().unwrap().set_brief("second");
+        save_for_meeting(&pool, &h, "m1").await.unwrap();
+        let m = AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(m.brief, "second");
+        assert_eq!(m.vault_project.as_deref(), Some("broadcom-pnc-bank"));
+        assert_eq!(m.vault_note_path.as_deref(), Some("/v/n.md"));
+        assert_eq!(m.vault_transcript_path.as_deref(), Some("/v/t.md"));
+        assert_eq!(m.filed_at.as_deref(), Some("2026-10-21T15:00:00Z"));
+    }
+
+    #[tokio::test]
+    async fn a_delete_rewrite_keeps_the_brief_in_the_file() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(0);
+        record_asks(&h, &asks_with_brief("PNC sync", vec![ask("a1", "One?"), ask("a2", "Two?")]));
+        save_for_meeting(&pool, &h, "m1").await.unwrap();
+        let rows = AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap();
+        delete_saved_items(&pool, "m1", &[rows[0].id.clone()]).await.unwrap();
+        let doc: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
+        assert_eq!(doc["brief"], "PNC sync");
+        assert_eq!(doc["items"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn reset_clears_the_brief() {
+        let mut c = HistoryCollector::default();
+        c.set_brief("x");
+        c.reset(0);
+        assert_eq!(c.brief(), "");
     }
 
     const START: &str = "2026-10-20T17:32:32.557Z";
@@ -1164,7 +1289,7 @@ mod tests {
         AssistantItemsRepository::replace_for_meeting(&pool, "m1", &items).await.unwrap();
         // The file's start differs from metadata.json: the file's wins.
         std::fs::write(dir.path().join("metadata.json"), "{\"created_at\":\"2020-01-01T00:00:00.000Z\"}").unwrap();
-        write_folder_file(dir.path(), "m1", ms(START), &items).unwrap();
+        write_folder_file(dir.path(), "m1", ms(START), &items, "").unwrap();
 
         assert_eq!(delete_saved_items(&pool, "m1", &["x".to_string()]).await.unwrap(), 1);
         let file: serde_json::Value =

@@ -559,6 +559,9 @@ pub async fn set_listening(handle: &AssistantHandle, listening: bool) {
 /// brief everywhere at once and asks for a fresh list.
 pub async fn set_brief(handle: &AssistantHandle, text: String) {
     let mut core = handle.0.lock().await;
+    // The meeting saves the brief as it stood at Stop, so every edit lands in
+    // the history at once, whether or not a session is open.
+    core.history.lock().unwrap().set_brief(&text);
     if !core.session_open {
         // Keep the panel's copy current before and after a recording too.
         core.ask_lane.set_brief(text.clone());
@@ -1040,6 +1043,7 @@ async fn open_lanes_with(
     core.ask_lane.set_chat_log(core.chat_log.clone());
     core.ask_lane.set_frames(feed);
     core.brief = brief.clone();
+    core.history.lock().unwrap().set_brief(&brief);
     let trunk = core.lanes.trunk_id();
     let ask_cfg = AskConfig {
         cwd: cfg.cwd.clone(),
@@ -1442,7 +1446,15 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
             // Only here: a mid-call off/on reopens the session without this.
             history.lock().unwrap().reset(chrono::Utc::now().timestamp_millis());
             let handle = handle.clone();
+            let history = history.clone();
             tauri::async_runtime::spawn(async move {
+                // A brief typed before recording waits in `pending_brief`; the
+                // reset above cleared the history's copy, so put it back even
+                // when the assistant is off and no session will take it.
+                let pending = handle.0.lock().await.pending_brief.clone();
+                if let Some(brief) = pending {
+                    history.lock().unwrap().set_brief(&brief);
+                }
                 open_session(&handle, None).await;
             });
         });
@@ -1847,6 +1859,19 @@ mod tests {
         let handle = AssistantHandle::new();
         set_brief(&handle, "intro call".to_string()).await;
         assert_eq!(handle.0.lock().await.pending_brief.as_deref(), Some("intro call"));
+    }
+
+    #[tokio::test]
+    async fn every_brief_edit_reaches_the_history_with_or_without_a_session() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        set_brief(&handle, "before".to_string()).await;
+        assert_eq!(history.lock().unwrap().brief(), "before");
+        handle.0.lock().await.session_open = true;
+        set_brief(&handle, "during".to_string()).await;
+        assert_eq!(history.lock().unwrap().brief(), "during");
+        set_brief(&handle, String::new()).await;
+        assert_eq!(history.lock().unwrap().brief(), "");
     }
 
     #[tokio::test]

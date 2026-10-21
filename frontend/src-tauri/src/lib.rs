@@ -827,6 +827,7 @@ pub fn run() {
             api::api_delete_meeting,
             api::api_save_meeting_assistant,
             api::api_get_meeting_assistant,
+            api::api_get_meeting_assistant_meta,
             api::api_delete_meeting_assistant,
             api::api_delete_meeting_assistant_items,
             api::api_get_meeting,

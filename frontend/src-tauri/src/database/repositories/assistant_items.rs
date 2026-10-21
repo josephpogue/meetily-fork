@@ -182,6 +182,7 @@ pub(crate) mod tests {
         for migration in [
             include_str!("../../../migrations/20261020120000_meeting_assistant_items.sql"),
             include_str!("../../../migrations/20261021120000_meeting_assistant_todo_fields.sql"),
+            include_str!("../../../migrations/20261022120000_meeting_assistant_meta.sql"),
         ] {
             for stmt in migration.split(';').map(str::trim).filter(|s| !s.is_empty()) {
                 sqlx::query(stmt).execute(&pool).await.unwrap();
