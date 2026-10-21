@@ -90,15 +90,15 @@ where
     t.with_timezone(tz).format("%H:%M").to_string()
 }
 
-/// The recording length in seconds: `duration_seconds`, else end minus start.
-/// None without a `completed_at`. The page line and the list totals both use this.
+/// The recording length in seconds: completed_at minus start, so it always agrees
+/// with the "HH:MM to HH:MM" shown. None without a `completed_at`. The page line and
+/// the list totals both use this. `duration_seconds` is not used: the saver falls back
+/// to the last transcript segment end when it has no recording duration, which can be
+/// far shorter than the real recording.
 fn length_seconds(scan: &FolderScan, meeting_created: DateTime<Utc>) -> Option<f64> {
     let end = scan.completed_at?;
     let start = scan.created_at.unwrap_or(meeting_created);
-    Some(
-        scan.duration_seconds
-            .unwrap_or_else(|| (end - start).num_milliseconds().max(0) as f64 / 1000.0),
-    )
+    Some((end - start).num_milliseconds().max(0) as f64 / 1000.0)
 }
 
 /// The page line (without the "What was saved: " lead) for one meeting.
@@ -373,6 +373,29 @@ mod tests {
             format_line(&scan, utc("2026-10-21T14:04:31+00:00"), &est()),
             "10:04 to 10:47, 43 min, 181 pictures, 165 MB"
         );
+    }
+
+    #[test]
+    fn length_ignores_a_fallback_duration_seconds() {
+        // Test Mac: ~85 s recorded, but duration_seconds held the last transcript end (14.17).
+        let scan = FolderScan {
+            created_at: Some(utc("2026-10-21T14:00:00+00:00")),
+            completed_at: Some(utc("2026-10-21T14:01:25+00:00")),
+            duration_seconds: Some(14.17),
+            ..Default::default()
+        };
+        assert_eq!(
+            format_line(&scan, utc("2026-10-21T14:00:00+00:00"), &est()),
+            "10:00 to 10:01, 1 min, 0 pictures, under 1 MB"
+        );
+        let a = tempfile::tempdir().unwrap();
+        fs::write(
+            a.path().join("metadata.json"),
+            r#"{"created_at":"2026-10-21T14:00:00+00:00","completed_at":"2026-10-21T14:01:25+00:00","duration_seconds":14.17}"#,
+        )
+        .unwrap();
+        let out = build(rows_for(&[("a", Some(a.path()), None)]), &est());
+        assert_eq!(out.meetings["a"].duration_seconds, 85.0);
     }
 
     #[test]
