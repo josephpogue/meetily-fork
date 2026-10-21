@@ -125,6 +125,9 @@ function TodoColumn({
         <OwnerPill owner={owner} />
         <h3 className="text-xs font-semibold text-gray-700">{title}</h3>
       </div>
+      {todos.length === 0 && (
+        <p className="py-1.5 text-xs text-gray-600">{owner === 'you' ? 'Nothing promised' : 'Nothing owed'}</p>
+      )}
       <ul className="flex list-none flex-col p-0">
         {open.map((t) => (
           <li key={t.id} className="border-t border-gray-100 py-1.5 first:border-t-0">

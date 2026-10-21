@@ -124,6 +124,21 @@ describe('AssistantHistoryPanel', () => {
     expect(allText().indexOf('3 from this call')).toBeLessThan(allText().indexOf('lead q'));
   });
 
+  test('an empty ledger column says Nothing promised or Nothing owed', async () => {
+    stored = [item('t2', 'todo', 2430, { lead: 'Send the export', owner: 'them', ownerName: 'Marcus', source: 'call' })];
+    await mount();
+    const columns = () => renderer.root.findByProps({ 'aria-label': 'To do' })
+      .findAll((n) => n.type === 'div' && String(n.props.className ?? '').startsWith('min-w-0 px-3'));
+    let [left, right] = columns();
+    expect(textOf(left)).toContain('Nothing promised');
+    expect(textOf(right)).not.toContain('Nothing owed');
+    stored = [item('t1', 'todo', 2405, { lead: 'Send the design doc', owner: 'you', source: 'call' })];
+    await mount();
+    [left, right] = columns();
+    expect(textOf(right)).toContain('Nothing owed');
+    expect(textOf(left)).not.toContain('Nothing promised');
+  });
+
   test('a meeting with no todos shows no ledger', async () => {
     stored = [item('q', 'question', 600)];
     await mount();

@@ -1,5 +1,6 @@
 'use client';
 
+import { useEffect, useRef } from 'react';
 import { X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import type { AssistantTodo, AssistantTodoOwner } from '@/types';
@@ -10,6 +11,8 @@ interface TodoDrawerColumnsProps {
   todos: AssistantTodo[];
   lastClosedAt: number;
   onDismiss: (id: string) => void;
+  /** Where focus goes when a dismiss empties the column it was in. */
+  focusClose: () => void;
 }
 
 /**
@@ -17,17 +20,18 @@ interface TodoDrawerColumnsProps {
  * sits under the Say lane and "They owe you" under the Ask lane. Each column
  * scrolls on its own.
  */
-export function TodoDrawerColumns({ todos, lastClosedAt, onDismiss }: TodoDrawerColumnsProps) {
+export function TodoDrawerColumns({ todos, lastClosedAt, onDismiss, focusClose }: TodoDrawerColumnsProps) {
   const split = splitByOwner(todos);
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
-      <Column owner="you" title="You promised" group={split.you} lastClosedAt={lastClosedAt} onDismiss={onDismiss} />
+      <Column owner="you" title="You promised" group={split.you} lastClosedAt={lastClosedAt} onDismiss={onDismiss} focusClose={focusClose} />
       <Column
         owner="them"
         title="They owe you"
         group={split.them}
         lastClosedAt={lastClosedAt}
         onDismiss={onDismiss}
+        focusClose={focusClose}
         className="border-l border-gray-200"
       />
     </div>
@@ -40,10 +44,35 @@ interface ColumnProps {
   group: { open: AssistantTodo[]; done: AssistantTodo[] };
   lastClosedAt: number;
   onDismiss: (id: string) => void;
+  focusClose: () => void;
   className?: string;
 }
 
-function Column({ owner, title, group, lastClosedAt, onDismiss, className }: ColumnProps) {
+function Column({ owner, title, group, lastClosedAt, onDismiss, focusClose, className }: ColumnProps) {
+  // After a dismiss the row is gone and focus would fall to the page. Once the
+  // item has left the list, focus goes to the next row's dismiss button, else
+  // the previous one, else the drawer's Close button.
+  const buttons = useRef(new Map<string, HTMLButtonElement | null>());
+  const pending = useRef<{ id: string; target: string | null } | null>(null);
+  const order = [...group.open, ...group.done].map((t) => t.id);
+  const dismiss = (id: string) => {
+    const at = order.indexOf(id);
+    pending.current = { id, target: order[at + 1] ?? order[at - 1] ?? null };
+    onDismiss(id);
+  };
+  const orderKey = order.join('|');
+  useEffect(() => {
+    const p = pending.current;
+    if (!p || order.includes(p.id)) return;
+    pending.current = null;
+    if (p.target === null) focusClose();
+    else buttons.current.get(p.target)?.focus?.();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [orderKey]);
+  const setButton = (id: string) => (el: HTMLButtonElement | null) => {
+    if (el) buttons.current.set(id, el);
+    else buttons.current.delete(id);
+  };
   const empty = owner === 'you' ? 'Nothing promised yet' : 'Nothing owed yet';
   return (
     <section aria-label={title} className={cn('min-h-0 min-w-0 overflow-y-auto px-3 pb-3', className)}>
@@ -60,7 +89,7 @@ function Column({ owner, title, group, lastClosedAt, onDismiss, className }: Col
       ) : (
         <ul className="flex flex-col">
           {group.open.map((t) => (
-            <TodoRow key={t.id} todo={t} fresh={isNewTodo(t, lastClosedAt)} onDismiss={onDismiss} />
+            <TodoRow key={t.id} todo={t} fresh={isNewTodo(t, lastClosedAt)} onDismiss={dismiss} buttonRef={setButton(t.id)} />
           ))}
         </ul>
       )}
@@ -72,7 +101,7 @@ function Column({ owner, title, group, lastClosedAt, onDismiss, className }: Col
           </div>
           <ul className="flex flex-col">
             {group.done.map((t) => (
-              <TodoRow key={t.id} todo={t} fresh={false} onDismiss={onDismiss} />
+              <TodoRow key={t.id} todo={t} fresh={false} onDismiss={dismiss} buttonRef={setButton(t.id)} />
             ))}
           </ul>
         </>
@@ -81,7 +110,17 @@ function Column({ owner, title, group, lastClosedAt, onDismiss, className }: Col
   );
 }
 
-function TodoRow({ todo, fresh, onDismiss }: { todo: AssistantTodo; fresh: boolean; onDismiss: (id: string) => void }) {
+function TodoRow({
+  todo,
+  fresh,
+  onDismiss,
+  buttonRef,
+}: {
+  todo: AssistantTodo;
+  fresh: boolean;
+  onDismiss: (id: string) => void;
+  buttonRef: (el: HTMLButtonElement | null) => void;
+}) {
   const done = todo.done;
   const origin = `${todo.origin === 'typed' ? 'You added at' : 'Said at'} ${callStamp(todo.callTime)}`;
   return (
@@ -109,6 +148,7 @@ function TodoRow({ todo, fresh, onDismiss }: { todo: AssistantTodo; fresh: boole
         </p>
       </div>
       <button
+        ref={buttonRef}
         type="button"
         onClick={() => onDismiss(todo.id)}
         title="Dismiss"

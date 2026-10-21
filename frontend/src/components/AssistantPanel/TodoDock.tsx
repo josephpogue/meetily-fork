@@ -10,11 +10,12 @@ import { TodoDrawerColumns } from './TodoDrawer';
  * nearest positioned ancestor). Closed, the strip is one line in the flow; open,
  * a drawer covers the lower part of both lanes and the strip underneath is kept
  * for its height only, so the lanes never resize. Esc closes the drawer and
- * focus returns to the strip's button. "New" means arrived since the drawer was
+ * focus returns to the strip's button. Esc cancels voice capture first when it is listening. "New" means arrived since the drawer was
  * last closed.
  */
 export function TodoDock() {
-  const { asks, dismissTodo } = useAssistant();
+  const { asks, dismissTodo, voice } = useAssistant();
+  const listening = voice.state === 'listening';
   const todos = asks.todos ?? [];
   const [open, setOpen] = useState(false);
   const [lastClosedAt, setLastClosedAt] = useState(0);
@@ -34,7 +35,9 @@ export function TodoDock() {
   }, [open]);
 
   useEffect(() => {
-    if (!open) return;
+    // While voice capture is listening, Esc belongs to the capture (the panel's own
+    // listener cancels it), so the drawer stays open until a second Esc.
+    if (!open || listening) return;
     const onKeyDown = (e: KeyboardEvent) => {
       if (e.key !== 'Escape' || e.defaultPrevented) return;
       e.preventDefault();
@@ -43,7 +46,7 @@ export function TodoDock() {
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, [open]);
+  }, [open, listening]);
 
   return (
     <>
@@ -62,7 +65,12 @@ export function TodoDock() {
           className="absolute inset-x-0 bottom-0 z-10 flex h-[60%] flex-col overflow-hidden rounded-t-xl border-t border-rose-200 bg-white shadow-[0_-10px_28px_-14px_rgba(76,5,25,0.22)] duration-200 animate-in slide-in-from-bottom-4 motion-reduce:animate-none"
         >
           <TodoStrip todos={todos} lastClosedAt={lastClosedAt} open onToggle={toggle} buttonRef={closeButton} />
-          <TodoDrawerColumns todos={todos} lastClosedAt={lastClosedAt} onDismiss={(id) => void dismissTodo(id)} />
+          <TodoDrawerColumns
+            todos={todos}
+            lastClosedAt={lastClosedAt}
+            onDismiss={(id) => void dismissTodo(id)}
+            focusClose={() => closeButton.current?.focus?.()}
+          />
         </div>
       )}
     </>

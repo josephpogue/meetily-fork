@@ -4,14 +4,18 @@ import { act, create, type ReactTestRenderer, type ReactTestInstance } from 'rea
 const originalService = { ...await import('../../src/services/assistantService') };
 const g = globalThis as Record<string, unknown>;
 const hadWindow = g.window;
+const hadDocument = g.document;
 // Module mocks and browser stubs are process-wide in bun: put them back so other test files are unaffected.
 afterAll(() => {
   mock.module('../../src/services/assistantService', () => originalService);
   if (hadWindow === undefined) delete g.window; else g.window = hadWindow;
+  if (hadDocument === undefined) delete g.document; else g.document = hadDocument;
 });
 
 // The real AssistantProvider runs; only the Tauri-facing service is replaced.
 let asksListener: ((asks: unknown) => void) | undefined;
+let statusListener: ((status: unknown) => void) | undefined;
+let voiceListener: ((voice: unknown) => void) | undefined;
 const dismissTodo = mock((_id: string) => Promise.resolve());
 const addTodo = mock((_text: string): Promise<void> => Promise.resolve());
 const askQuestion = mock((_text: string) => Promise.resolve());
@@ -19,8 +23,8 @@ mock.module('../../src/services/assistantService', () => ({
   assistantService: {
     getState: () => new Promise(() => {}),
     onCard: async () => () => {},
-    onStatus: async () => () => {},
-    onVoice: async () => () => {},
+    onStatus: async (cb: (status: unknown) => void) => { statusListener = cb; return () => {}; },
+    onVoice: async (cb: (voice: unknown) => void) => { voiceListener = cb; return () => {}; },
     onNote: async () => () => {},
     onAsks: async (cb: (asks: unknown) => void) => { asksListener = cb; return () => {}; },
     dismissTodo,
@@ -36,6 +40,12 @@ g.window = {
   addEventListener: (type: string, h: KeyHandler) => { if (type === 'keydown') keyHandlers.add(h); },
   removeEventListener: (type: string, h: KeyHandler) => { if (type === 'keydown') keyHandlers.delete(h); },
 };
+// A minimal document: what has focus, and whether a modal dialog is open.
+const doc = { activeElement: null as unknown, dialogOpen: false };
+g.document = {
+  get activeElement() { return doc.activeElement; },
+  querySelector: (selector: string) => (doc.dialogOpen && selector.includes('role="dialog"') ? {} : null),
+};
 const pressKey = (e: Record<string, unknown>) => {
   const event = { defaultPrevented: false, preventDefault: mock(() => {}), ...e };
   for (const h of [...keyHandlers]) h(event);
@@ -47,7 +57,7 @@ const { TodoDock } = await import('../../src/components/AssistantPanel/TodoDock'
 const { AskBox } = await import('../../src/components/AssistantPanel/AskBox');
 
 const done = { how: 'said it was checked', callTime: 2530, at: 6 };
-const todo = (o: Record<string, unknown>) => ({ who: '', due: '', done: null, ...o });
+const todo = (o: Record<string, unknown>) => ({ id: '', who: '', due: '', done: null, ...o });
 const todos = [
   todo({ id: 't5', text: 'Send Dana the runbook template', owner: 'you', origin: 'typed', callTime: 2480, at: 5 }),
   todo({ id: 't4', text: 'Send the host inventory export', owner: 'them', who: 'Marcus', due: 'Monday', origin: 'call', callTime: 2430, at: 4 }),
@@ -61,11 +71,19 @@ const payload = (list: unknown[]) => ({
 });
 
 let renderer: ReactTestRenderer;
+// Buttons get a stand-in element that records which one was focused.
+let focused: string[] = [];
+const inputNode = { focus: () => {} };
+const createNodeMock = (element: { type: unknown; props: Record<string, unknown> }) =>
+  element.type === 'input' ? inputNode : element.type === 'button' ? { focus: () => { focused.push(String(element.props['aria-label'])); } } : null;
+const status = (enabled: boolean) => ({
+  enabled, sessionOpen: true, lanesReady: true, mode: 'manual', listening: false, claudeOk: true, lastError: null, lastErrorSeq: 0,
+});
 async function mount(list: unknown[] = todos) {
   await act(async () => {
-    renderer = create(<AssistantProvider><TodoDock /><AskBox disabled={false} /></AssistantProvider>);
+    renderer = create(<AssistantProvider><TodoDock /><AskBox disabled={false} /></AssistantProvider>, { createNodeMock });
   });
-  await act(async () => { asksListener!(payload(list)); });
+  await act(async () => { asksListener!(payload(list)); statusListener!(status(true)); });
 }
 // Rendered text of one node, with a bar between block-ish elements so adjacent pieces stay apart.
 function collect(node: unknown): string {
@@ -88,7 +106,8 @@ const type = (value: string) => act(async () => { inputEl().props.onChange({ tar
 
 beforeEach(() => {
   dismissTodo.mockClear(); addTodo.mockClear(); askQuestion.mockClear();
-  asksListener = undefined; keyHandlers.clear();
+  asksListener = undefined; statusListener = undefined; voiceListener = undefined; keyHandlers.clear();
+  focused = []; doc.activeElement = null; doc.dialogOpen = false;
 });
 
 describe('To do strip', () => {
@@ -176,6 +195,39 @@ describe('To do drawer', () => {
     expect(byLabel('Close to-do list')).toBeUndefined();
   });
 
+  test('Esc while voice capture is listening cancels the capture only: the drawer stays open', async () => {
+    await mount();
+    await open();
+    await act(async () => { voiceListener!({ state: 'listening', heard: '' }); });
+    const event = pressKey({ key: 'Escape' });
+    expect(event.preventDefault).not.toHaveBeenCalled();
+    expect(byLabel('Close to-do list')).toBeDefined();
+    await act(async () => { voiceListener!({ state: 'off', heard: '' }); });
+    await act(async () => { pressKey({ key: 'Escape' }); });
+    expect(byLabel('Close to-do list')).toBeUndefined();
+  });
+
+  test('dismissing moves focus to the next item in the column, else the previous, else Close', async () => {
+    await mount();
+    await open();
+    // "You promised" holds t5, t2 (open) then t1 (done). Dismiss the middle one.
+    const dismiss = (label: string) => act(async () => { byLabel(label).props.onClick(); });
+    const without = async (gone: string[]) => {
+      await act(async () => { asksListener!(payload(todos.filter((t) => !gone.includes(t.id)))); });
+    };
+    await dismiss('Dismiss to-do: Send the design doc with the domain layout');
+    await without(['t2']);
+    expect(focused.at(-1)).toBe('Dismiss to-do: Check the licence count');
+    // The last item of the column: focus goes to the previous one.
+    await dismiss('Dismiss to-do: Check the licence count');
+    await without(['t2', 't1']);
+    expect(focused.at(-1)).toBe('Dismiss to-do: Send Dana the runbook template');
+    // The only item left in the column: focus goes to Close.
+    await dismiss('Dismiss to-do: Send Dana the runbook template');
+    await without(['t2', 't1', 't5']);
+    expect(focused.at(-1)).toBe('Close to-do list');
+  });
+
   test('New marks items that arrived since the drawer was last closed', async () => {
     await mount();
     await open();
@@ -240,5 +292,33 @@ describe('Ask box to-do entry', () => {
     expect(inputEl().props.value).toBe('book the room');
     const plain = pressKey({ altKey: false, code: 'KeyT', key: 't' });
     expect(plain.preventDefault).not.toHaveBeenCalled();
+  });
+
+  test('Opt-T is left alone unless the assistant is on, Option is alone, no dialog is open and no other field has focus', async () => {
+    await mount();
+    const left = (e: Record<string, unknown>) => {
+      const event = pressKey({ altKey: true, code: 'KeyT', key: '†', ...e });
+      expect(event.preventDefault).not.toHaveBeenCalled();
+    };
+    left({ metaKey: true });
+    left({ ctrlKey: true });
+    left({ shiftKey: true });
+    doc.dialogOpen = true;
+    left({});
+    doc.dialogOpen = false;
+    doc.activeElement = { tagName: 'TEXTAREA', isContentEditable: false };
+    left({});
+    doc.activeElement = { tagName: 'DIV', isContentEditable: true };
+    left({});
+    doc.activeElement = null;
+    await act(async () => { statusListener!(status(false)); });
+    left({});
+    expect(byLabel('Send question')).toBeDefined();
+    await act(async () => { statusListener!(status(true)); });
+    // With focus in the Ask box itself the key still works.
+    doc.activeElement = inputNode;
+    const ok = pressKey({ altKey: true, code: 'KeyT', key: '†' });
+    expect(ok.preventDefault).toHaveBeenCalled();
+    expect(byLabel('Add to-do')).toBeDefined();
   });
 });

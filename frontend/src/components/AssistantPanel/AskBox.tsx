@@ -26,7 +26,8 @@ interface AskBoxProps {
  * entry drops back to asking.
  */
 export function AskBox({ disabled, onError }: AskBoxProps) {
-  const { ask, addTodo, voice, voiceStart, voiceFinish } = useAssistant();
+  const { ask, addTodo, voice, voiceStart, voiceFinish, status } = useAssistant();
+  const assistantOn = status.enabled;
   const [value, setValue] = useState('');
   const inputRef = useRef<HTMLInputElement>(null);
 
@@ -57,18 +58,27 @@ export function AskBox({ disabled, onError }: AskBoxProps) {
     }
   };
 
-  // Opt-T: in-app only, while the panel (and so this box) is shown. preventDefault
-  // keeps macOS from typing a dagger.
+  // Opt-T: in-app only, while the panel (and so this box) is shown and the assistant
+  // is on. Option alone, not over a modal dialog, and not while another text field
+  // has focus; in those cases the key is left alone. preventDefault keeps macOS
+  // from typing a dagger.
   useEffect(() => {
+    if (!assistantOn) return;
     const onKeyDown = (e: globalThis.KeyboardEvent) => {
-      if (!e.altKey || e.code !== 'KeyT') return;
+      if (!e.altKey || e.metaKey || e.ctrlKey || e.shiftKey || e.code !== 'KeyT') return;
+      if (document.querySelector('[role="dialog"], [role="alertdialog"]')) return;
+      const active = document.activeElement as HTMLElement | null;
+      if (active && active !== inputRef.current) {
+        const tag = active.tagName;
+        if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT' || active.isContentEditable) return;
+      }
       e.preventDefault();
       setValue((current) => (isTodoEntry(current) ? current : `todo: ${current}`));
       inputRef.current?.focus?.();
     };
     window.addEventListener('keydown', onKeyDown);
     return () => window.removeEventListener('keydown', onKeyDown);
-  }, []);
+  }, [assistantOn]);
 
   const isListening = voice.state === 'listening';
   const isSubmitting = voice.state === 'submitting';
