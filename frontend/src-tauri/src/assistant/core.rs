@@ -628,6 +628,34 @@ pub async fn answer_ask(handle: &AssistantHandle, id: String, answer: String) ->
     true
 }
 
+/// Joseph typed a to-do (`todo:` in the Ask box). It joins the list as a
+/// You to-do stamped with the newest utterance's time; the next ask turn
+/// lists it as typed so the model never adds it again. The error text goes
+/// to the Ask box, so nothing is set on the status.
+pub async fn add_todo(handle: &AssistantHandle, text: String) -> Result<(), String> {
+    let text = super::ask_list::collapse(&text);
+    if text.is_empty() {
+        return Err("Type the to-do after todo:".to_string());
+    }
+    let core = handle.0.lock().await;
+    if !core.session_open || !core.enabled {
+        return Err("Start a recording with the assistant on to add a to-do.".to_string());
+    }
+    core.ask_lane.add_todo(&text, core.transcript.latest_start());
+    Ok(())
+}
+
+/// Joseph dismissed a to-do. An unknown id changes nothing.
+pub async fn dismiss_todo(handle: &AssistantHandle, id: String) {
+    let core = handle.0.lock().await;
+    if !core.ask_lane.dismiss_todo(&id) {
+        return;
+    }
+    if core.session_open && core.enabled {
+        core.ask_lane.request(&core.transcript, false);
+    }
+}
+
 /// Surfaces "the session is not open" as a visible error rather than a
 /// silent no-op. The panel renders `lastError`, so a button press that gets
 /// dropped needs to reach it the same way a lane failure does -- otherwise
@@ -1876,6 +1904,67 @@ mod tests {
         assert_eq!(turns.len(), 2);
         assert!(turns[1].contains("Joseph dismissed these"));
         assert!(handle.0.lock().await.ask_lane.snapshot().asks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn add_todo_needs_text_and_a_live_assistant_then_joins_the_list() {
+        let handle = AssistantHandle::new();
+        assert_eq!(add_todo(&handle, "  \n ".to_string()).await, Err("Type the to-do after todo:".to_string()));
+        assert_eq!(
+            add_todo(&handle, "Send Dana the runbook".to_string()).await,
+            Err("Start a recording with the assistant on to add a to-do.".to_string())
+        );
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        {
+            let mut core = handle.0.lock().await;
+            core.transcript.ingest(&tu("system", "hello there", 2405.0, 2406.0));
+            core.transcript.ingest(&tu("mic", "ok", 2430.5, 2431.0));
+        }
+        assert_eq!(add_todo(&handle, "  Send   Dana the runbook ".to_string()).await, Ok(()));
+        assert_eq!(add_todo(&handle, "Send Dana the runbook".to_string()).await, Ok(()));
+        let out = handle.0.lock().await.ask_lane.snapshot();
+        assert_eq!(out.todos.len(), 1, "an exact repeat is a no-op");
+        assert_eq!(out.todos[0].text, "Send Dana the runbook");
+        assert_eq!(out.todos[0].call_time, 2430.5);
+
+        set_enabled(&handle, false).await;
+        assert_eq!(
+            add_todo(&handle, "Another".to_string()).await,
+            Err("Start a recording with the assistant on to add a to-do.".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn dismiss_todo_removes_it_and_tells_the_model_once() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls.clone())).await;
+        add_todo(&handle, "Send Dana the runbook".to_string()).await.unwrap();
+        let id = handle.0.lock().await.ask_lane.snapshot().todos[0].id.clone();
+
+        dismiss_todo(&handle, "nope".to_string()).await;
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().todos.len(), 1);
+        dismiss_todo(&handle, id.clone()).await;
+        settle().await;
+
+        let out = handle.0.lock().await.ask_lane.snapshot();
+        assert!(out.todos.is_empty());
+        assert_eq!(out.dismissed_todos, vec![id]);
+        let turns = ask_turns(&calls);
+        assert!(turns.last().unwrap().contains("DISMISSED TO-DOS (not to-dos, never add them again):\n- Send Dana the runbook"));
+    }
+
+    #[tokio::test]
+    async fn a_new_meeting_starts_with_no_todos() {
+        let handle = AssistantHandle::new();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        add_todo(&handle, "Send Dana the runbook".to_string()).await.unwrap();
+        let mut core = handle.0.lock().await;
+        core.reset_ask_lane();
+        let out = core.ask_lane.snapshot();
+        assert!(out.todos.is_empty() && out.dismissed_todos.is_empty());
     }
 
     #[tokio::test]

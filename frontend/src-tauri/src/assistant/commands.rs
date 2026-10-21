@@ -124,6 +124,19 @@ pub async fn assistant_answer_ask(
     Ok(())
 }
 
+/// Joseph typed `todo: <text>` in the Ask box: adds a to-do for him.
+#[tauri::command]
+pub async fn assistant_add_todo(handle: State<'_, AssistantHandle>, text: String) -> Result<(), String> {
+    core::add_todo(handle.inner(), text).await
+}
+
+/// Joseph dismissed a to-do that is not one.
+#[tauri::command]
+pub async fn assistant_dismiss_todo(handle: State<'_, AssistantHandle>, id: String) -> Result<(), String> {
+    core::dismiss_todo(handle.inner(), id).await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn assistant_screen_recording_allowed() -> Result<bool, String> {
     Ok(super::vision::permission::screen_recording_allowed())

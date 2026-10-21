@@ -50,12 +50,14 @@ struct OpenUtterance {
     /// Latest partial preview for the segment still in flight, replaced
     /// wholesale (never appended) when its final arrives.
     pending_partial: Option<String>,
+    start_time: f64,
     end_time: f64,
 }
 
 #[derive(Default)]
 pub struct TranscriptLog {
-    finals: Vec<(Speaker, String, f64)>,
+    /// Speaker, text, audio start time and audio end time of each closed utterance.
+    finals: Vec<(Speaker, String, f64, f64)>,
     open: Option<OpenUtterance>,
 }
 
@@ -80,6 +82,7 @@ impl TranscriptLog {
                 speaker,
                 committed_text: String::new(),
                 pending_partial: None,
+                start_time: u.audio_start_time,
                 end_time: u.audio_end_time,
             });
         }
@@ -149,7 +152,7 @@ impl TranscriptLog {
             return None;
         }
         self.finals
-            .push((open.speaker, open.committed_text.clone(), open.end_time));
+            .push((open.speaker, open.committed_text.clone(), open.start_time, open.end_time));
         Some(AssemblerOut::Utterance {
             speaker: open.speaker,
             text: open.committed_text,
@@ -161,10 +164,25 @@ impl TranscriptLog {
         let start = cursor.min(self.finals.len());
         let text = self.finals[start..]
             .iter()
-            .map(|(speaker, text, _)| format!("{}: {}", speaker.label(), text))
+            .map(|(speaker, text, _, _)| format!("{}: {}", speaker.label(), text))
             .collect::<Vec<_>>()
             .join("\n");
         (text, self.finals.len())
+    }
+
+    /// Audio start time (seconds, recording scale) of the newest utterance
+    /// among the finals since `cursor`, or None when there are none.
+    pub fn newest_start_since(&self, cursor: usize) -> Option<f64> {
+        self.finals[cursor.min(self.finals.len())..].last().map(|f| f.2)
+    }
+
+    /// Audio start time of the newest utterance in the whole log, the open
+    /// one included; 0.0 when the log is empty.
+    pub fn latest_start(&self) -> f64 {
+        match self.open.as_ref().filter(|o| !o.committed_text.is_empty()) {
+            Some(open) => open.start_time,
+            None => self.finals.last().map_or(0.0, |f| f.2),
+        }
     }
 
     /// Closed finals plus the still-open utterance's committed text (not its
@@ -176,7 +194,7 @@ impl TranscriptLog {
     fn entries(&self) -> impl Iterator<Item = (Speaker, &str, f64)> {
         self.finals
             .iter()
-            .map(|(s, t, e)| (*s, t.as_str(), *e))
+            .map(|(s, t, _, e)| (*s, t.as_str(), *e))
             .chain(
                 self.open
                     .as_ref()
@@ -320,6 +338,21 @@ mod tests {
         let (text2, cursor2) = log.delta_since(cursor);
         assert_eq!(text2, "Them: hi there");
         assert_eq!(cursor2, 2);
+    }
+
+    #[test]
+    fn utterance_start_times_are_readable_for_a_delta_and_the_whole_log() {
+        let mut log = TranscriptLog::default();
+        assert_eq!(log.latest_start(), 0.0);
+        assert_eq!(log.newest_start_since(0), None);
+        log.ingest(&tu("mic", "first", 2405.0, 2406.0, false, 1));
+        log.ingest(&tu("system", "second", 2430.5, 2432.0, false, 2));
+        log.ingest(&tu("mic", "third, still open", 2440.0, 2441.0, false, 3));
+        // Two closed finals (2405.0 and 2430.5); the third is still open.
+        assert_eq!(log.newest_start_since(0), Some(2430.5));
+        assert_eq!(log.newest_start_since(1), Some(2430.5));
+        assert_eq!(log.newest_start_since(2), None);
+        assert_eq!(log.latest_start(), 2440.0);
     }
 
     #[test]

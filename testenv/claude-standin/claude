@@ -36,6 +36,10 @@ fi
 # "The orange submarine visits Tuesday harbor."), the storage question is answered on the call: the reply drops that ASK
 # and carries its DONE line instead, so a walk sees the question move to the answered list. The stand-in keeps no state:
 # the app keeps an answered question off the list however often a later reply lists it again.
+# The live To do list rides on the same turns. Once the input mentions "pancakes" (the mic clip says "The blue giraffe
+# orders seven pancakes."), the reply adds a You to-do. Once it mentions "submarine" (the call clip), the reply adds a Them
+# to-do and marks the pancakes to-do done. Also stateless: the app dedupes a to-do however often a reply adds it again,
+# and ignores a TODO DONE that matches no open to-do.
 ask_turn=0
 case "$all$input" in *"CURRENT LIST:"*) ask_turn=1 ;; esac
 heard=$(printf '%s' "$all$input" | tr '[:upper:]' '[:lower:]')
@@ -52,6 +56,12 @@ if [ "$ask_turn" = 1 ]; then
   text+=$'YOU: Is pricing in scope for this call?'
   case "$heard" in
     *submarine*) text+=$'\nDONE: What storage do you run today? | ANSWER: The orange submarine visits on Tuesday at the harbor. | BY: call' ;;
+  esac
+  case "$heard" in
+    *pancakes*) text+=$'\nTODO: Order seven pancakes for the blue giraffe | OWNER: you | WHO: | WHEN: Friday' ;;
+  esac
+  case "$heard" in
+    *submarine*) text+=$'\nTODO: Send the Tuesday harbor schedule | OWNER: them | WHO: Dana | WHEN: Tuesday\nTODO DONE: Order seven pancakes for the blue giraffe | HOW: said on the call it is done' ;;
   esac
 else
 case "$system" in

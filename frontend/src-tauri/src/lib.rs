@@ -953,6 +953,8 @@ pub fn run() {
             assistant::commands::assistant_refresh_asks,
             assistant::commands::assistant_dismiss_ask,
             assistant::commands::assistant_answer_ask,
+            assistant::commands::assistant_add_todo,
+            assistant::commands::assistant_dismiss_todo,
             assistant::commands::assistant_screen_recording_allowed,
             assistant::commands::assistant_open_screen_recording_settings,
         ])

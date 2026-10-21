@@ -10,6 +10,7 @@ use std::collections::HashSet;
 use serde::Serialize;
 
 use super::card::content_words;
+use super::todo_list::{self, TodoLines};
 
 pub const MAX_ASKS: usize = 5;
 pub const MAX_FOR_YOU: usize = 2;
@@ -68,6 +69,9 @@ pub struct RawList {
     pub done: Vec<(String, String, AnswerHow)>,
     /// The reply said NONE: nothing is left to ask, whatever DONE lines came with it.
     pub none: bool,
+    /// `TODO`, `TODO DONE` and `NOT TODO` lines. They never change the open
+    /// question list.
+    pub todos: TodoLines,
 }
 
 /// `ASK: <question> | WHY: <reason>`, `YOU: <question>` and
@@ -81,6 +85,9 @@ pub fn parse(raw: &str) -> Option<RawList> {
     for line in raw.lines() {
         let line = line.trim();
         let line = line.strip_prefix("- ").unwrap_or(line).trim();
+        if todo_list::parse_line(line, &mut out.todos) {
+            continue;
+        }
         if line == "NONE" {
             saw_none = true;
         } else if let Some(body) = line.strip_prefix("ASK:") {
@@ -103,7 +110,7 @@ pub fn parse(raw: &str) -> Option<RawList> {
             }
         }
     }
-    if out.asks.is_empty() && out.for_you.is_empty() && out.done.is_empty() && !saw_none {
+    if out.asks.is_empty() && out.for_you.is_empty() && out.done.is_empty() && out.todos.is_empty() && !saw_none {
         return None;
     }
     out.none = saw_none;
@@ -204,9 +211,13 @@ pub fn without_answered(list: &AskList, answered: &[AnsweredItem]) -> AskList {
     }
 }
 
-/// True for a reply with DONE lines and no ASK, YOU or NONE line.
+/// True for a reply with DONE or TODO-family lines and no ASK, YOU or NONE
+/// line: it says nothing about the open list, which stays as shown.
 pub fn done_only(raw: &RawList) -> bool {
-    raw.asks.is_empty() && raw.for_you.is_empty() && !raw.done.is_empty() && !raw.none
+    raw.asks.is_empty()
+        && raw.for_you.is_empty()
+        && (!raw.done.is_empty() || !raw.todos.is_empty())
+        && !raw.none
 }
 
 /// Turns a fresh reply into the list the panel shows. DONE lines move onto
@@ -220,7 +231,7 @@ pub fn build(
     dismissed: &[String],
     now: i64,
 ) -> AskList {
-    // A reply of DONE lines alone says nothing about the open list: the
+    // A reply of DONE or TODO lines alone says nothing about the open list: the
     // questions that stay open are the ones already shown.
     if done_only(&raw) {
         raw.asks = prev.asks.iter().map(|i| (i.question.clone(), i.why.clone())).collect();
@@ -321,6 +332,47 @@ mod tests {
                 "Is pricing in scope for this call?".to_string(),
             ]
         );
+    }
+
+    #[test]
+    fn parse_reads_todo_lines_beside_questions() {
+        let raw = parse("ASK: Q? | WHY: w\nTODO: X | OWNER: you\nTODO DONE: Y | HOW: sent\nNOT TODO: Z").unwrap();
+        assert_eq!(raw.asks, vec![("Q?".to_string(), "w".to_string())]);
+        assert_eq!(raw.todos.adds.len(), 1);
+        assert_eq!(raw.todos.done.len(), 1);
+        assert_eq!(raw.todos.retract, vec!["Z".to_string()]);
+        assert!(!raw.none);
+    }
+
+    #[test]
+    fn a_reply_of_only_todo_lines_is_usable_and_keeps_the_open_list() {
+        for reply in ["TODO: X | OWNER: them", "TODO DONE: X | HOW: sent", "NOT TODO: X"] {
+            let raw = parse(reply).expect(reply);
+            assert!(done_only(&raw), "{}", reply);
+        }
+        let prev = AskList {
+            asks: vec![AskItem { id: "a".into(), question: "Q?".into(), why: "w".into() }],
+            for_you: vec![],
+        };
+        let raw = parse("TODO: X | OWNER: them").unwrap();
+        let built = build(&prev, &mut Vec::new(), raw, &[], 1);
+        assert_eq!(built, prev);
+    }
+
+    #[test]
+    fn none_with_todo_lines_still_empties_the_open_list() {
+        let raw = parse("NONE\nTODO: X | OWNER: you").unwrap();
+        assert!(raw.none && !done_only(&raw));
+        let prev = AskList {
+            asks: vec![AskItem { id: "a".into(), question: "Q?".into(), why: "w".into() }],
+            for_you: vec![],
+        };
+        assert_eq!(build(&prev, &mut Vec::new(), raw, &[], 1), AskList::default());
+    }
+
+    #[test]
+    fn a_todo_line_with_no_owner_does_not_make_a_reply_usable() {
+        assert_eq!(parse("TODO: Send it"), None);
     }
 
     #[test]

@@ -22,7 +22,7 @@ use super::claude_cli::{
     ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS, READ_ONLY_TOOLS, WRITE_TOOLS,
 };
 use super::lanes::{run_with_retry, DeltaCb, FrameBatch, FrameFeed, FrameMode, RegisterCb, Runner};
-use super::todo_list::TodoItem;
+use super::todo_list::{self, TodoItem, TodoLines, TodoOrigin, TodoOwner};
 use super::transcript::TranscriptLog;
 
 pub const ASK_PROMPT: &str = include_str!("prompts/ask.md");
@@ -154,6 +154,8 @@ struct SubLane {
     answered_sent: usize,
     /// How many of the chat log's exchanges the model has heard.
     chats_sent: usize,
+    /// How many of `AskState::dismissed_todo_texts` the model has been told about.
+    todos_dismissed_sent: usize,
 }
 
 #[derive(Default)]
@@ -189,6 +191,13 @@ struct AskState {
     /// Deep runs one turn at a time, so one slot is enough.
     deep_base: AskList,
     changed: Vec<String>,
+    /// Every to-do this session, in the order added (the snapshot shows
+    /// newest first). Lives as long as the lane, like `answered`.
+    todos: Vec<TodoItem>,
+    /// Ids of the to-dos Joseph dismissed (or the checked pass withdrew).
+    dismissed_todos: Vec<String>,
+    /// Their texts, for filtering and for telling each sub-lane once.
+    dismissed_todo_texts: Vec<String>,
 }
 
 /// Everything one fired turn needs once it comes back.
@@ -202,7 +211,11 @@ struct Job {
     sent_dismissed: usize,
     sent_answered: usize,
     sent_chats: usize,
+    sent_todos_dismissed: usize,
     new_cursor: usize,
+    /// Audio start time of the newest utterance this turn's transcript delta
+    /// covered: when a to-do it picks up was said.
+    call_time: f64,
 }
 
 struct Landed {
@@ -245,8 +258,8 @@ impl AskState {
             checked: self.shown_by == Shown::Deep,
             checking: self.sub(Which::Deep).in_flight && self.shown_by != Shown::Deep,
             changed: self.changed.clone(),
-            todos: Vec::new(),
-            dismissed_todos: Vec::new(),
+            todos: todo_list::newest_first(&self.todos),
+            dismissed_todos: self.dismissed_todos.clone(),
         }
     }
 }
@@ -276,9 +289,11 @@ impl AskState {
             let chats = self.chats.lock().unwrap_or_else(|e| e.into_inner());
             (chats[sub.chats_sent.min(chats.len())..].to_vec(), chats.len())
         };
+        let unsent_todos = &self.dismissed_todo_texts[sub.todos_dismissed_sent.min(self.dismissed_todo_texts.len())..];
         let has_news = !delta.is_empty()
             || brief_changed
             || !unsent.is_empty()
+            || !unsent_todos.is_empty()
             || !unsent_answered.is_empty()
             || !unsent_chats.is_empty();
         if !force && !has_news {
@@ -288,9 +303,17 @@ impl AskState {
             &delta,
             &in_progress,
             brief_changed.then(|| self.brief.as_str()),
-            &Unsent { dismissed: unsent, answered: unsent_answered, chats: &unsent_chats },
+            &Unsent {
+                dismissed: unsent,
+                answered: unsent_answered,
+                chats: &unsent_chats,
+                dismissed_todos: unsent_todos,
+            },
             &self.list,
+            &self.todos,
         );
+        let call_time = log.newest_start_since(sub.cursor).unwrap_or_else(|| log.latest_start());
+        let sent_todos_dismissed = self.dismissed_todo_texts.len();
         let sent_dismissed = self.dismissed.len();
         let sent_answered = self.answered.len();
         let sent_version = self.brief_version;
@@ -316,8 +339,22 @@ impl AskState {
             sent_dismissed,
             sent_answered,
             sent_chats: chats_len,
+            sent_todos_dismissed,
             new_cursor,
+            call_time,
         })
+    }
+
+    /// Applies a reply's TODO-family lines, whichever list they rode with and
+    /// even when the list itself was dropped as stale: the model will not say
+    /// them twice. New to-dos first, then the done ones, then (checked pass
+    /// only) the withdrawn ones.
+    fn apply_todos(&mut self, which: Which, lines: TodoLines, call_time: f64, now: i64) {
+        todo_list::add_picked(&mut self.todos, &self.dismissed_todo_texts, lines.adds, call_time, now);
+        todo_list::apply_done(&mut self.todos, lines.done, call_time, now);
+        if which == Which::Deep {
+            todo_list::retract(&mut self.todos, &mut self.dismissed_todos, &mut self.dismissed_todo_texts, lines.retract);
+        }
     }
 
     /// Takes in a finished turn. The sub-lane's own cursors advance on any
@@ -330,7 +367,11 @@ impl AskState {
         sub.in_flight = false;
         let error = match parsed {
             Some(raw) => {
+                // Cloned, not taken: build and merge read them to tell a TODO-only
+                // reply (open list unchanged) from one that rewrites the list.
+                let todo_lines = raw.todos.clone();
                 sub.cursor = job.new_cursor;
+                sub.todos_dismissed_sent = job.sent_todos_dismissed;
                 sub.frame_cursor = job.new_frame_cursor;
                 sub.brief_sent = job.sent_version;
                 sub.dismissed_sent = job.sent_dismissed;
@@ -381,6 +422,7 @@ impl AskState {
                         self.failed = false;
                     }
                 }
+                self.apply_todos(which, todo_lines, job.call_time, now);
                 None
             }
             None => {
@@ -727,6 +769,50 @@ impl AskLane {
         true
     }
 
+    /// Joseph typed a to-do (owner You). `text` is already trimmed and
+    /// collapsed. False, and nothing emitted, when a to-do of his with the
+    /// same words is already on the list.
+    pub fn add_todo(&self, text: &str, call_time: f64) -> bool {
+        let out = {
+            let mut s = self.state.lock().unwrap();
+            let seen = s.todos.iter().any(|t| t.owner == TodoOwner::You && ask_list::same_item(&t.text, text));
+            if seen {
+                return false;
+            }
+            s.todos.push(TodoItem {
+                id: uuid::Uuid::new_v4().to_string(),
+                text: text.to_string(),
+                owner: TodoOwner::You,
+                who: String::new(),
+                due: String::new(),
+                origin: TodoOrigin::Typed,
+                call_time,
+                at: chrono::Utc::now().timestamp_millis(),
+                done: None,
+            });
+            s.snapshot()
+        };
+        (self.hooks.emit)(out);
+        true
+    }
+
+    /// Removes the to-do at once and remembers it, so no sub-lane adds it
+    /// back. False when no to-do has that id.
+    pub fn dismiss_todo(&self, id: &str) -> bool {
+        let out = {
+            let mut s = self.state.lock().unwrap();
+            let Some(pos) = s.todos.iter().position(|t| t.id == id) else {
+                return false;
+            };
+            let gone = s.todos.remove(pos);
+            s.dismissed_todos.push(gone.id);
+            s.dismissed_todo_texts.push(gone.text);
+            s.snapshot()
+        };
+        (self.hooks.emit)(out);
+        true
+    }
+
     /// Joseph typed the answer to a list question: the item with that id moves
     /// to the answered list ("you"). False when no item has that id or the
     /// answer is empty. The brief is not touched.
@@ -827,6 +913,7 @@ struct Unsent<'a> {
     dismissed: &'a [String],
     answered: &'a [AnsweredItem],
     chats: &'a [ChatExchange],
+    dismissed_todos: &'a [String],
 }
 
 fn ask_prompt(
@@ -835,6 +922,7 @@ fn ask_prompt(
     brief: Option<&str>,
     unsent: &Unsent,
     current: &AskList,
+    todos: &[TodoItem],
 ) -> String {
     let mut out = String::new();
     if let Some(brief) = brief {
@@ -879,9 +967,22 @@ fn ask_prompt(
         }
         out.push_str("If that exchange answers a question on CURRENT LIST, mark it DONE with BY: chat.\n\n");
     }
+    if !unsent.dismissed_todos.is_empty() {
+        out.push_str("DISMISSED TO-DOS (not to-dos, never add them again):\n");
+        for t in unsent.dismissed_todos {
+            out.push_str("- ");
+            out.push_str(t);
+            out.push('\n');
+        }
+        out.push('\n');
+    }
     out.push_str("CURRENT LIST:\n");
     out.push_str(&ask_list::render(current));
-    out.push_str("\n\nReply with the full updated list in the ASK / YOU format, plus a DONE line for each question answered since your last turn, or NONE.");
+    if !todos.is_empty() {
+        out.push_str("\n\nCURRENT TO-DOS (never add these again):\n");
+        out.push_str(&todo_list::render(todos));
+    }
+    out.push_str("\n\nReply with the full updated list in the ASK / YOU format, plus a DONE line for each question answered since your last turn, or NONE. Add TODO, TODO DONE and NOT TODO lines after them only for to-dos the new transcript shows.");
     out
 }
 
@@ -2248,5 +2349,332 @@ mod tests {
         assert_eq!(out.answered[0].question, STORAGE);
         assert_eq!(out.asks.len(), 1, "the checked list lost the answered question");
         assert_eq!(out.asks[0].question, "Who handles backups?");
+    }
+
+    // ---- the live To do list ----
+
+    const Q1: &str = "ASK: How do you screen tenants? | WHY: screening unclear";
+    const TODO_YOU: &str = "TODO: Send the design doc | OWNER: you | WHO: | WHEN: By Friday";
+    const TODO_THEM: &str = "TODO: Send the host inventory export | OWNER: them | WHO: Marcus | WHEN: Monday";
+
+    /// Two closed utterances (2405.0 and 2430.5), a third still open.
+    fn call_log() -> TranscriptLog {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("system", "Marcus can get you the host inventory export, probably Monday", 2405.0, 2408.0));
+        log.ingest(&tu("mic", "I will send the design doc by Friday", 2430.5, 2433.0));
+        log.ingest(&tu("system", "great", 2440.0, 2441.0));
+        log
+    }
+
+    fn capture_hooks() -> (AskHooks, Arc<Mutex<Vec<AsksOut>>>) {
+        let outs: Arc<Mutex<Vec<AsksOut>>> = Arc::default();
+        let o = outs.clone();
+        let hooks = AskHooks { emit: Arc::new(move |out| o.lock().unwrap().push(out)), ..AskHooks::default() };
+        (hooks, outs)
+    }
+
+    fn todo<'a>(out: &'a AsksOut, text: &str) -> &'a TodoItem {
+        out.todos.iter().find(|t| t.text == text).unwrap_or_else(|| panic!("no to-do {:?} in {:?}", text, out.todos))
+    }
+
+    #[tokio::test]
+    async fn ask_todo_and_todo_done_lines_land_without_touching_the_open_questions() {
+        let calls: Calls = Arc::default();
+        let (hooks, outs) = capture_hooks();
+        let turn2 = "ASK: How do you screen tenants? | WHY: screening unclear\nTODO: Send the runbook | OWNER: them | WHO: Dana | WHEN:\nTODO DONE: Send the design doc | HOW: said he sent it";
+        let first = Box::leak(format!("{}\n{}\n{}", Q1, TODO_YOU, TODO_THEM).into_boxed_str());
+        let lane = AskLane::for_test(seq_runner(vec![first, turn2], calls.clone()), hooks);
+        let mut log = call_log();
+        lane.request(&log, false);
+        settle().await;
+
+        let out = outs.lock().unwrap().last().unwrap().clone();
+        assert_eq!(out.asks.len(), 1);
+        assert_eq!(out.todos.len(), 2);
+        let mine = todo(&out, "Send the design doc");
+        assert_eq!((mine.owner, mine.who.as_str(), mine.due.as_str()), (TodoOwner::You, "", "By Friday"));
+        assert_eq!((mine.origin, mine.call_time), (TodoOrigin::Call, 2430.5));
+        assert!(mine.done.is_none() && mine.at > 0);
+        let theirs = todo(&out, "Send the host inventory export");
+        assert_eq!((theirs.owner, theirs.who.as_str(), theirs.due.as_str()), (TodoOwner::Them, "Marcus", "Monday"));
+        let q_id = out.asks[0].id.clone();
+
+        log.ingest(&tu("mic", "ok I just sent the design doc to you", 2500.0, 2503.0));
+        log.ingest(&tu("system", "got it", 2510.0, 2511.0));
+        log.ingest(&tu("mic", "thanks", 2520.0, 2521.0));
+        lane.request(&log, false);
+        settle().await;
+        let out = outs.lock().unwrap().last().unwrap().clone();
+        assert_eq!(out.asks.len(), 1);
+        assert_eq!(out.asks[0].id, q_id, "TODO lines leave the question list alone");
+        assert_eq!(out.todos.len(), 3);
+        let done = todo(&out, "Send the design doc").done.clone().expect("marked done by the call");
+        assert_eq!((done.how.as_str(), done.call_time), ("said he sent it", 2510.0));
+        assert!(done.at > 0);
+        assert_eq!(todo(&out, "Send the runbook").call_time, 2510.0);
+        assert!(todo(&out, "Send the host inventory export").done.is_none());
+        assert!(out.dismissed_todos.is_empty());
+        // newest first: the runbook landed last
+        assert_eq!(out.todos[0].text, "Send the runbook");
+    }
+
+    #[tokio::test]
+    async fn a_reply_of_only_todo_lines_keeps_the_list_and_is_not_a_failure() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test(
+            seq_runner(vec![GOOD, "TODO: Send it over | OWNER: them", "TODO DONE: Send it over | HOW: sent", "NOT TODO: Send it over"], calls),
+            AskHooks::default(),
+        );
+        let mut log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        let before = lane.snapshot();
+        for (i, expect_todos) in [1usize, 1, 1].into_iter().enumerate() {
+            log.ingest(&tu("system", &format!("more {}", i), 10.0 + i as f64 * 5.0, 11.0 + i as f64 * 5.0));
+            log.ingest(&tu("mic", "yes", 12.0 + i as f64 * 5.0, 13.0 + i as f64 * 5.0));
+            lane.request(&log, false);
+            settle().await;
+            let out = lane.snapshot();
+            assert_eq!(out.state, "idle");
+            assert_eq!(out.asks, before.asks, "reply {}", i);
+            assert_eq!(out.for_you, before.for_you);
+            assert_eq!(out.todos.len(), expect_todos);
+        }
+    }
+
+    #[tokio::test]
+    async fn none_with_a_todo_empties_the_questions_and_adds_the_todo() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test(seq_runner(vec![GOOD, "NONE\nTODO: Send the design doc | OWNER: you"], calls), AskHooks::default());
+        let mut log = sample_log();
+        lane.request(&log, false);
+        settle().await;
+        assert_eq!(lane.snapshot().asks.len(), 1);
+        log.ingest(&tu("system", "more", 10.0, 11.0));
+        log.ingest(&tu("mic", "yes", 12.0, 13.0));
+        lane.request(&log, false);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(out.asks.is_empty() && out.for_you.is_empty());
+        assert_eq!(out.todos.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn todo_lines_apply_before_todo_done_lines_in_one_reply() {
+        let calls: Calls = Arc::default();
+        let reply = "TODO DONE: Order seven pancakes | HOW: said it is done\nTODO: Order seven pancakes | OWNER: you";
+        let lane = AskLane::for_test(seq_runner(vec![reply], calls), AskHooks::default());
+        lane.request(&call_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.todos.len(), 1);
+        assert!(out.todos[0].done.is_some());
+    }
+
+    #[tokio::test]
+    async fn a_dropped_stale_quick_list_still_adds_and_finishes_todos() {
+        let calls: Calls = Arc::default();
+        let fast_gate = Arc::new(Semaphore::new(0));
+        let fast = "ASK: Never shown? | WHY: x\nTODO: Send the design doc | OWNER: you\nTODO DONE: Order seven pancakes | HOW: said so";
+        let lane = AskLane::for_test_two(two_runner(fast, CHECKED, Some(fast_gate.clone()), None, calls), AskHooks::default());
+        let log = call_log();
+        lane.request(&log, false);
+        settle().await;
+        assert!(lane.snapshot().checked);
+        assert!(lane.add_todo("Order seven pancakes", 5.0));
+        assert!(lane.snapshot().todos.iter().all(|t| t.done.is_none()));
+
+        fast_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.asks.len(), 2, "the quick questions were dropped");
+        assert_eq!(out.todos.len(), 2);
+        assert!(todo(&out, "Order seven pancakes").done.is_some());
+        assert!(todo(&out, "Send the design doc").done.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_repeat_in_other_words_is_not_added_but_the_other_owner_is() {
+        let calls: Calls = Arc::default();
+        let replies = vec![
+            "TODO: Send the design doc with the domain layout | OWNER: you",
+            "TODO: Send the design doc with domain layout | OWNER: you",
+            "TODO: Send the design doc with domain layout | OWNER: them | WHO: Dana",
+        ];
+        let lane = AskLane::for_test(seq_runner(replies, calls), AskHooks::default());
+        let mut log = call_log();
+        for i in 0..3 {
+            lane.request(&log, false);
+            settle().await;
+            log.ingest(&tu("mic", "again", 3000.0 + i as f64 * 10.0, 3001.0 + i as f64 * 10.0));
+            log.ingest(&tu("system", "yes", 3005.0 + i as f64 * 10.0, 3006.0 + i as f64 * 10.0));
+            if i == 0 {
+                assert_eq!(lane.snapshot().todos.len(), 1);
+            }
+            if i == 1 {
+                assert_eq!(lane.snapshot().todos.len(), 1);
+            }
+        }
+        let out = lane.snapshot();
+        assert_eq!(out.todos.len(), 2);
+        assert!(out.todos.iter().any(|t| t.owner == TodoOwner::Them && t.who == "Dana"));
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_todo_goes_away_is_told_once_and_never_returns() {
+        let calls: Calls = Arc::default();
+        let (hooks, outs) = capture_hooks();
+        let lane = AskLane::for_test_two(
+            seq_runner(vec![TODO_YOU, TODO_YOU, "NONE", "NONE", "NONE"], calls.clone()),
+            hooks,
+        );
+        let mut log = call_log();
+        lane.request(&log, false);
+        settle().await;
+        let id = lane.snapshot().todos[0].id.clone();
+        assert!(!lane.dismiss_todo("no-such-id"));
+
+        assert!(lane.dismiss_todo(&id));
+        let out = outs.lock().unwrap().last().unwrap().clone();
+        assert!(out.todos.is_empty());
+        assert_eq!(out.dismissed_todos, vec![id.clone()]);
+
+        calls.lock().unwrap().clear();
+        lane.request(&log, true);
+        settle().await;
+        {
+            let c = calls.lock().unwrap();
+            assert_eq!(c.len(), 2, "both sub-lanes run");
+            for t in c.iter() {
+                assert!(
+                    t.prompt.contains("DISMISSED TO-DOS (not to-dos, never add them again):\n- Send the design doc"),
+                    "{}",
+                    t.prompt
+                );
+            }
+        }
+        log.ingest(&tu("mic", "again", 3000.0, 3001.0));
+        log.ingest(&tu("system", "yes", 3005.0, 3006.0));
+        calls.lock().unwrap().clear();
+        lane.request(&log, true);
+        settle().await;
+        assert!(calls.lock().unwrap().iter().all(|t| !t.prompt.contains("DISMISSED TO-DOS")), "told once");
+        assert!(lane.snapshot().todos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_dismissed_todo_is_not_re_added_by_a_later_reply() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test(seq_runner(vec![TODO_YOU, TODO_YOU], calls), AskHooks::default());
+        let mut log = call_log();
+        lane.request(&log, false);
+        settle().await;
+        let id = lane.snapshot().todos[0].id.clone();
+        lane.dismiss_todo(&id);
+        log.ingest(&tu("mic", "again", 3000.0, 3001.0));
+        log.ingest(&tu("system", "yes", 3005.0, 3006.0));
+        lane.request(&log, false);
+        settle().await;
+        assert!(lane.snapshot().todos.is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_prompt_lists_current_todos_every_turn() {
+        let calls: Calls = Arc::default();
+        let first = Box::leak(format!("{}\n{}", TODO_YOU, TODO_THEM).into_boxed_str());
+        let lane = AskLane::for_test(seq_runner(vec![first, "NONE"], calls.clone()), AskHooks::default());
+        let mut log = call_log();
+        lane.request(&log, false);
+        settle().await;
+        assert!(!calls.lock().unwrap()[0].prompt.contains("CURRENT TO-DOS"), "none yet");
+        assert!(lane.add_todo("Send Dana the runbook template", 9.0));
+        log.ingest(&tu("mic", "again", 3000.0, 3001.0));
+        log.ingest(&tu("system", "yes", 3005.0, 3006.0));
+        lane.request(&log, false);
+        settle().await;
+        let prompt = calls.lock().unwrap()[1].prompt.clone();
+        assert!(prompt.contains("CURRENT TO-DOS (never add these again):\n"), "{}", prompt);
+        assert!(prompt.contains("- [you] Send the design doc | WHEN: By Friday"));
+        assert!(prompt.contains("- [them: Marcus] Send the host inventory export | WHEN: Monday"));
+        assert!(prompt.contains("- [you, typed] Send Dana the runbook template"));
+    }
+
+    #[tokio::test]
+    async fn only_the_checked_pass_can_retract_a_call_todo() {
+        let calls: Calls = Arc::default();
+        let deep_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(
+                "ASK: How do you screen tenants? | WHY: x\nTODO: Send the design doc | OWNER: you\nNOT TODO: Send the design doc",
+                "NOT TODO: Send the design doc",
+                None,
+                Some(deep_gate.clone()),
+                calls,
+            ),
+            AskHooks::default(),
+        );
+        lane.request(&call_log(), false);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.todos.len(), 1, "a quick NOT TODO is ignored");
+        let id = out.todos[0].id.clone();
+
+        deep_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert!(out.todos.is_empty(), "the checked pass withdrew it");
+        assert_eq!(out.dismissed_todos, vec![id]);
+    }
+
+    #[tokio::test]
+    async fn a_checked_retract_leaves_typed_and_done_todos() {
+        let calls: Calls = Arc::default();
+        let deep_gate = Arc::new(Semaphore::new(0));
+        let lane = AskLane::for_test_two(
+            two_runner(
+                "ASK: How do you screen tenants? | WHY: x\nTODO: Send the design doc | OWNER: you\nTODO DONE: Send the design doc | HOW: sent",
+                "NOT TODO: Send the design doc\nNOT TODO: Send Dana the runbook template",
+                None,
+                Some(deep_gate.clone()),
+                calls,
+            ),
+            AskHooks::default(),
+        );
+        assert!(lane.add_todo("Send Dana the runbook template", 1.0));
+        lane.request(&call_log(), false);
+        settle().await;
+        deep_gate.add_permits(1);
+        settle().await;
+        let out = lane.snapshot();
+        assert_eq!(out.todos.len(), 2);
+        assert!(out.dismissed_todos.is_empty());
+    }
+
+    #[test]
+    fn a_typed_todo_is_yours_and_an_exact_repeat_is_a_no_op() {
+        let (hooks, outs) = capture_hooks();
+        let lane = AskLane::new(seq_runner(vec![], Arc::default()), hooks);
+        assert!(lane.add_todo("Send Dana the runbook template", 2430.5));
+        assert!(!lane.add_todo("Send Dana the runbook template", 2500.0));
+        let out = lane.snapshot();
+        assert_eq!(out.todos.len(), 1);
+        let t = &out.todos[0];
+        assert_eq!((t.owner, t.origin, t.call_time), (TodoOwner::You, TodoOrigin::Typed, 2430.5));
+        assert_eq!((t.who.as_str(), t.due.as_str()), ("", ""));
+        assert!(t.done.is_none() && t.at > 0);
+        assert_eq!(outs.lock().unwrap().len(), 1, "only the add emitted");
+    }
+
+    #[tokio::test]
+    async fn todos_stay_after_close_and_belong_to_one_lane() {
+        let calls: Calls = Arc::default();
+        let lane = AskLane::for_test(seq_runner(vec![TODO_YOU], calls), AskHooks::default());
+        lane.request(&call_log(), false);
+        settle().await;
+        lane.close();
+        assert_eq!(lane.snapshot().todos.len(), 1);
+        let fresh = AskLane::new(seq_runner(vec![], Arc::default()), AskHooks::default());
+        assert!(fresh.snapshot().todos.is_empty());
+        assert!(fresh.snapshot().dismissed_todos.is_empty());
     }
 }
