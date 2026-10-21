@@ -26,8 +26,8 @@ Each story is one person and one result. Check a change against them: Joseph mus
 
 Decisions Joseph has made for this version. Every feature follows them.
 - Every model call is the local `claude` CLI on his subscription. No API keys, no paid APIs, and Meetily's own summary providers stay untouched.
-- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI, and that path also carries pictures of the Zoom meeting window when "See the Zoom window" is on.
-- The assistant sees only the Zoom meeting window, and only while recording. It keeps a picture only when the window changes, by the /watch rule in `~/.claude/skills/watch/scripts/frames.py` (scene score above 0.20, then a 16x16 thumbnail more than 2.0 from the last kept picture). Kept pictures are saved full-size in the meeting folder.
+- Audio and transcripts stay on the Mac. The only outside path is Anthropic through the `claude` CLI, and that path also carries pictures of the Zoom or Teams meeting window when "See the Zoom or Teams window" is on.
+- The assistant sees only the Zoom or Microsoft Teams meeting window (Zoom first when both are open), and only while recording. It keeps a picture only when the window changes, by the /watch rule in `~/.claude/skills/watch/scripts/frames.py` (scene score above 0.20, then a 16x16 thumbnail more than 2.0 from the last kept picture). Kept pictures are saved full-size in the meeting folder.
 - The assistant informs and converses, and never acts. Nothing is written anywhere without a Save press.
 - Output is text only, with no spoken replies.
 - The app runs on macOS on Apple Silicon.
@@ -50,3 +50,5 @@ Decisions Joseph has made for this version. Every feature follows them.
 - Upstream releases arrive only by merging into the fork. Meetily's in-app updater stays off, because it would install plain Meetily over the fork.
 - Every assistant Claude session starts with a small fixed context and nothing else (`--safe-mode` on): the vault page index, the routing registry, Joseph's profile, and the meeting rule (live call, read only, answer briefly, never start helpers or agents, never write anything). When the brief names a project or client, that project's vault page comes with it.
 - Gap questions and Ask follow the answer cards: a fast answer shows first and the deep model, with read-only access to the vault, replaces or corrects it. The fast lane runs at medium effort.
+- A new meeting is named from its call window title, kept whole (a ": <name> 1:1" tail stays, since it says who the call is with); only app chrome such as " - Zoom" is dropped.
+- Each meeting shows what it saved (times, length, pictures, disk space) and the meeting list shows totals. The keep rule for pictures stays as it is.
