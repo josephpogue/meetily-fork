@@ -673,19 +673,20 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 }
 
 /// Titles of the call windows the assistant's capture grabbed this
-/// recording; empty when the assistant is off or does not answer in time.
+/// recording, taken so they name one meeting only. Empty when the assistant
+/// is off, None when it does not answer in time.
 async fn call_window_titles<R: Runtime>(
     app: &AppHandle<R>,
-) -> Vec<(crate::assistant::vision::CallApp, String)> {
+) -> Option<Vec<(crate::assistant::vision::CallApp, String)>> {
     let Some(handle) = app.try_state::<crate::assistant::AssistantHandle>() else {
-        return Vec::new();
+        return Some(Vec::new());
     };
     tokio::time::timeout(
         tokio::time::Duration::from_secs(2),
-        crate::assistant::core::window_titles(&handle),
+        crate::assistant::core::take_window_titles(&handle),
     )
     .await
-    .unwrap_or_default()
+    .ok()
 }
 
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
@@ -1034,7 +1035,16 @@ pub async fn stop_recording<R: Runtime>(
 
         // Name the meeting after its call window before metadata.json is
         // finalised and before the name goes to the frontend's save.
-        let titles = call_window_titles(&app).await;
+        let titles = match call_window_titles(&app).await {
+            Some(t) => t,
+            None => {
+                warn!(
+                    "could not read call window titles in time, keeping {}",
+                    manager.get_meeting_name().unwrap_or_default()
+                );
+                Vec::new()
+            }
+        };
         match manager.rename_from_window_titles(&titles) {
             Some(name) => info!("meeting name from call window title: {}", name),
             None => info!(

@@ -20,7 +20,7 @@ const ZOOM_MIN_WIDTH: f64 = 400.0;
 const ZOOM_MIN_HEIGHT: f64 = 300.0;
 /// The sections Teams' main window starts its title with ("Chat | Acme |
 /// Microsoft Teams"). A meeting window has none of them.
-const TEAMS_SECTIONS: [&str; 17] = [
+const TEAMS_SECTIONS: [&str; 34] = [
     "activity",
     "chat",
     "teams",
@@ -38,6 +38,23 @@ const TEAMS_SECTIONS: [&str; 17] = [
     "search",
     "viva engage",
     "approvals",
+    "planner",
+    "shifts",
+    "tasks",
+    "loop",
+    "workflows",
+    "viva insights",
+    "wiki",
+    "notes",
+    "bookings",
+    "praise",
+    "lists",
+    "whiteboard",
+    "forms",
+    "polls",
+    "updates",
+    "activity feed",
+    "microsoft teams",
 ];
 /// Kept frames are saved at this JPEG quality, full size.
 const SAVE_QUALITY: f64 = 0.9;
@@ -397,9 +414,9 @@ fn log_state(state: &State) {
             log::info!("vision: no window to capture yet, waiting")
         }
         State::NoWindow(titles) => log::info!(
-            "vision: Zoom or Teams is open but none of its windows is a meeting window, waiting. Zoom windows: {:?}. Teams windows: {:?}",
+            "vision: Zoom or Teams is open but none of its windows is a meeting window, waiting. Zoom windows: {:?}. Teams windows: {}",
             titles.zoom,
-            titles.teams
+            titles.teams.len()
         ),
         State::Failed(e) => log::info!("vision: capture failed, will retry: {}", e),
         State::Capturing(app, title) => {
@@ -785,11 +802,18 @@ mod tests {
             win(T, "Copilot | Microsoft Teams", 1400.0, 800.0),
         ];
         assert_eq!(choose_window(&WindowTarget::zoom(), &ws), None);
-        assert_eq!(
-            teams_titles(&ws).len(),
-            5,
-            "the log line still lists them so a wrong rule is visible"
-        );
+        assert_eq!(teams_titles(&ws).len(), 5, "the log line counts them");
+    }
+
+    #[test]
+    fn teams_pinned_app_windows_are_never_chosen() {
+        let ws = vec![
+            win(T, "Planner | Microsoft Teams", 1400.0, 800.0),
+            win(T, "Whiteboard | Q3 plan | Microsoft Teams", 1400.0, 800.0),
+            win(T, "Viva Insights | Microsoft Teams", 1400.0, 800.0),
+            win(T, "LOOP | Microsoft Teams", 1400.0, 800.0),
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), None);
     }
 
     #[test]

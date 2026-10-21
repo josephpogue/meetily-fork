@@ -468,10 +468,11 @@ fn make_ask_hooks(app: AppHandle<Wry>, handle: AssistantHandle, history: super::
 
 /// The Zoom or Teams window titles the capture grabbed in the recording that
 /// is ending, first-seen order. Empty when the assistant or "See the Zoom
-/// window" is off. Read at Stop, before the next open drops the store.
-pub async fn window_titles(handle: &AssistantHandle) -> Vec<(CallApp, String)> {
+/// window" is off. Taken at Stop, so a quick next recording cannot be named
+/// from them again.
+pub async fn take_window_titles(handle: &AssistantHandle) -> Vec<(CallApp, String)> {
     let core = handle.0.lock().await;
-    core.frames.as_ref().map(|f| f.window_titles()).unwrap_or_default()
+    core.frames.as_ref().map(|f| f.take_window_titles()).unwrap_or_default()
 }
 
 pub async fn get_state(handle: &AssistantHandle) -> StatusOut {
@@ -2076,7 +2077,7 @@ mod tests {
     #[tokio::test]
     async fn window_titles_are_this_recordings_and_empty_without_sight() {
         let handle = AssistantHandle::new();
-        assert!(window_titles(&handle).await.is_empty(), "no store, no titles");
+        assert!(take_window_titles(&handle).await.is_empty(), "no store, no titles");
 
         let store = FrameStore::new();
         store.record_title(CallApp::Teams, "Storage roadmap review | Microsoft Teams");
@@ -2087,14 +2088,18 @@ mod tests {
         }
         close_session(&handle).await;
         assert_eq!(
-            window_titles(&handle).await,
+            take_window_titles(&handle).await,
             vec![(CallApp::Teams, "Storage roadmap review | Microsoft Teams".to_string())],
             "readable after the recording-stopped close, as Stop needs"
+        );
+        assert!(
+            take_window_titles(&handle).await.is_empty(),
+            "a second Stop before the next open finds nothing"
         );
 
         // The next recording opens with no store, so it cannot see these.
         set_enabled(&handle, false).await;
-        assert!(window_titles(&handle).await.is_empty());
+        assert!(take_window_titles(&handle).await.is_empty());
     }
 
     #[tokio::test]

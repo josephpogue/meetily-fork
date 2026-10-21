@@ -82,6 +82,12 @@ impl RecordingSaver {
         if let Some(metadata) = self.metadata.as_mut() {
             metadata.meeting_name = Some(new_name.clone());
         }
+        // stop_and_save can return before it writes metadata.json, so write it now.
+        if let (Some(folder), Some(metadata)) = (&self.meeting_folder, &self.metadata) {
+            if let Err(e) = self.write_metadata(folder, metadata) {
+                warn!("could not write the new meeting name to metadata.json: {}", e);
+            }
+        }
         Some(new_name)
     }
 
@@ -538,6 +544,12 @@ mod tests {
         let renamed = saver.rename_from_window_titles(&teams_title());
         assert_eq!(renamed.as_deref(), Some("Storage roadmap review"));
         assert_eq!(saver.get_meeting_name().as_deref(), Some("Storage roadmap review"));
+        // Written by the rename itself, before any save runs.
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["meeting_name"], "Storage roadmap review");
         assert_eq!(metadata_name(&saver, dir.path()), "Storage roadmap review");
     }
 

@@ -96,6 +96,12 @@ impl FrameStore {
         self.inner.lock().unwrap().titles.clone()
     }
 
+    /// Returns the window titles and empties them, so one recording's titles
+    /// name at most one meeting.
+    pub fn take_window_titles(&self) -> Vec<(CallApp, String)> {
+        std::mem::take(&mut self.inner.lock().unwrap().titles)
+    }
+
     /// Seq of the newest kept frame, 0 when none.
     pub fn latest_seq(&self) -> u64 {
         self.inner.lock().unwrap().frames.last().map(|f| f.seq).unwrap_or(0)
@@ -178,6 +184,15 @@ mod tests {
                 (CallApp::Zoom, "Review | Microsoft Teams".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn taking_the_window_titles_empties_them() {
+        let s = FrameStore::new();
+        s.record_title(CallApp::Zoom, "A");
+        assert_eq!(s.take_window_titles(), vec![(CallApp::Zoom, "A".to_string())]);
+        assert!(s.take_window_titles().is_empty());
+        assert!(s.window_titles().is_empty());
     }
 
     #[test]
