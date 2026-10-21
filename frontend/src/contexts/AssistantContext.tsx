@@ -71,7 +71,12 @@ interface AssistantContextType {
   voiceFinish: () => Promise<void>;
   voiceCancel: () => Promise<void>;
   draftNote: () => Promise<void>;
-  saveNote: () => Promise<void>;
+  /** Files the drafted note under the chosen vault project slug, or null for none. */
+  saveNote: (project: string | null) => Promise<void>;
+  /** The project the note was last filed under: undefined before a save, null for none. */
+  savedNoteProject: string | null | undefined;
+  listVaultProjects: () => Promise<string[]>;
+  suggestVaultProject: () => Promise<string | null>;
   discardNote: () => Promise<void>;
   setBrief: (text: string) => Promise<void>;
   /** The brief box's text, kept here so it survives the box unmounting. */
@@ -97,6 +102,7 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
   const [status, setStatus] = useState<AssistantStatus>(DEFAULT_STATUS);
   const [voice, setVoice] = useState<AssistantVoice>(DEFAULT_VOICE);
   const [note, setNote] = useState<AssistantNote>(DEFAULT_NOTE);
+  const [savedNoteProject, setSavedNoteProject] = useState<string | null | undefined>(undefined);
   const [rawAsks, setAsks] = useState<AssistantAsks>(DEFAULT_ASKS);
   const [rawCards, setCards] = useState<AssistantCard[]>(INITIAL_CARDS);
   // Ids Joseph deleted this session. The backend keeps sending some of them (an
@@ -295,11 +301,30 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const saveNote = useCallback(async () => {
+  const saveNote = useCallback(async (project: string | null) => {
     try {
-      await assistantService.saveNote();
+      const saved = await assistantService.saveNote(project);
+      setSavedNoteProject(saved.project);
     } catch (error) {
       console.error('[AssistantContext] assistant_save_note failed:', error);
+    }
+  }, []);
+
+  const listVaultProjects = useCallback(async () => {
+    try {
+      return await assistantService.listVaultProjects();
+    } catch (error) {
+      console.error('[AssistantContext] assistant_list_vault_projects failed:', error);
+      return [];
+    }
+  }, []);
+
+  const suggestVaultProject = useCallback(async () => {
+    try {
+      return await assistantService.suggestVaultProject();
+    } catch (error) {
+      console.error('[AssistantContext] assistant_suggest_vault_project failed:', error);
+      return null;
     }
   }, []);
 
@@ -410,6 +435,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     voiceCancel,
     draftNote,
     saveNote,
+    savedNoteProject,
+    listVaultProjects,
+    suggestVaultProject,
     discardNote,
     setBrief,
     briefDraft: brief.draft,

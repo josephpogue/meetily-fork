@@ -950,6 +950,8 @@ pub fn run() {
             assistant::commands::assistant_voice_cancel,
             assistant::commands::assistant_draft_note,
             assistant::commands::assistant_save_note,
+            assistant::commands::assistant_list_vault_projects,
+            assistant::commands::assistant_suggest_vault_project,
             assistant::commands::assistant_discard_note,
             assistant::commands::assistant_set_brief,
             assistant::commands::assistant_refresh_asks,

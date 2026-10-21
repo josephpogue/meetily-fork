@@ -532,10 +532,11 @@ pub async fn delete_for_meeting(pool: &SqlitePool, meeting_id: &str) -> Result<u
 }
 
 /// The one step every delete goes through once its rows are gone from the
-/// database (the vault update joins here later). `deleted` are the rows that
-/// were removed; the meeting's remaining rows are what `assistant.json` keeps:
-/// the file is rewritten from them with its old `recordingStartedAt`, and
-/// removed when none remain. A meeting with no folder on disk has no file.
+/// database. `deleted` are the rows that were removed; the meeting's remaining
+/// rows are what `assistant.json` keeps: the file is rewritten from them with
+/// its old `recordingStartedAt`, and removed when none remain. A meeting with
+/// no folder on disk has no file. A meeting already filed in the vault also
+/// has its note rewritten and committed; a vault failure is only logged.
 pub async fn after_items_deleted(
     pool: &SqlitePool,
     meeting_id: &str,
@@ -547,6 +548,7 @@ pub async fn after_items_deleted(
     let remaining = AssistantItemsRepository::list_for_meeting(pool, meeting_id)
         .await
         .map_err(|e| e.to_string())?;
+    refile_vault_note(pool, meeting_id, &remaining, deleted).await;
     let Some(folder) = folder_path_of(pool, meeting_id).await.map(std::path::PathBuf::from) else {
         return Ok(());
     };
@@ -577,6 +579,25 @@ pub async fn after_items_deleted(
         log::warn!("assistant: could not rewrite assistant.json for {}: {}", meeting_id, e);
     }
     Ok(())
+}
+
+/// Rewrites the meeting's filed vault note from its remaining rows, when it was
+/// filed and the file is still there. Never fails the delete: a problem is logged.
+async fn refile_vault_note(pool: &SqlitePool, meeting_id: &str, remaining: &[AssistantItem], deleted: &[AssistantItem]) {
+    let meta = match AssistantMetaRepository::get(pool, meeting_id).await {
+        Ok(m) => m,
+        Err(e) => {
+            log::warn!("assistant: could not read the vault record of {}: {}", meeting_id, e);
+            return;
+        }
+    };
+    let Some(note_path) = meta.and_then(|m| m.vault_note_path) else {
+        return;
+    };
+    let dry_run = std::env::var("ASSISTANT_DRY_RUN").ok().as_deref() == Some("1");
+    if let Err(e) = super::note::refile(Path::new(&note_path), remaining, deleted, dry_run) {
+        log::warn!("assistant: vault note {} not updated after the delete: {}", note_path, e);
+    }
 }
 
 /// `recordingStartedAt` of an existing `<folder>/assistant.json`, in epoch ms.
@@ -1316,5 +1337,51 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
         assert_eq!(file["recordingStartedAt"], START);
         assert_eq!(file["items"][0]["id"], "y");
+    }
+
+    #[tokio::test]
+    async fn deleting_rows_of_a_filed_meeting_rewrites_and_commits_its_vault_note() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let vault = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            let st = std::process::Command::new("git").arg("-C").arg(vault.path()).args(args).status().unwrap();
+            assert!(st.success());
+        };
+        git(&["init", "-q"]);
+        git(&["config", "user.email", "t@example.com"]);
+        git(&["config", "user.name", "T"]);
+        let note = vault.path().join("2026-10-21-sync.md");
+        let mut answered = row("x", 1.0);
+        answered.kind = "question".into();
+        answered.question = "What storage?".into();
+        answered.answer = "NetApp.".into();
+        answered.answered_how = "call".into();
+        let keep = row("y", 2.0);
+        std::fs::write(&note, "# T\n\n## Summary\n\nx\n\n## Answered questions\n\n- **What storage?** NetApp. (On the call)\n\n## Q&A log\n\nQ: Q?\nA: lead y\n").unwrap();
+        git(&["add", "-A"]);
+        git(&["commit", "-q", "-m", "seed"]);
+        AssistantItemsRepository::replace_for_meeting(&pool, "m1", &[answered.clone(), keep]).await.unwrap();
+        AssistantMetaRepository::set_filed(&pool, "m1", None, &note.to_string_lossy(), "t", "now").await.unwrap();
+
+        assert_eq!(delete_saved_items(&pool, "m1", &["x".to_string()]).await.unwrap(), 1);
+        let text = std::fs::read_to_string(&note).unwrap();
+        assert!(!text.contains("What storage?") && text.contains("A: lead y"), "{text}");
+        let log = std::process::Command::new("git").arg("-C").arg(vault.path()).args(["log", "-1", "--format=%s"]).output().unwrap();
+        assert_eq!(String::from_utf8_lossy(&log.stdout).trim(), "Meeting note: 2026-10-21-sync, items deleted");
+    }
+
+    #[tokio::test]
+    async fn a_vault_failure_never_undoes_the_row_delete() {
+        let pool = test_pool().await;
+        add_meeting(&pool, "m1", None).await;
+        let not_a_repo = tempfile::tempdir().unwrap();
+        let note = not_a_repo.path().join("n.md");
+        std::fs::write(&note, "# T\n\n## Q&A log\n\nQ: Q?\nA: lead x\n").unwrap();
+        AssistantItemsRepository::replace_for_meeting(&pool, "m1", &[row("x", 1.0), row("y", 2.0)]).await.unwrap();
+        AssistantMetaRepository::set_filed(&pool, "m1", None, &note.to_string_lossy(), "t", "now").await.unwrap();
+        assert_eq!(delete_saved_items(&pool, "m1", &["x".to_string()]).await.unwrap(), 1);
+        let left = AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap();
+        assert_eq!(left.len(), 1);
     }
 }

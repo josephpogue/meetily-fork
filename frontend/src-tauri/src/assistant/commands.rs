@@ -84,10 +84,30 @@ pub async fn assistant_draft_note(handle: State<'_, AssistantHandle>) -> Result<
     core::draft_note(handle.inner()).await
 }
 
+/// Files the drafted note under `project` (a slug from
+/// `assistant_list_vault_projects`, or None) and returns where it went.
 #[tauri::command]
-pub async fn assistant_save_note(handle: State<'_, AssistantHandle>) -> Result<(), String> {
-    core::save_note(handle.inner()).await;
-    Ok(())
+pub async fn assistant_save_note(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+    project: Option<String>,
+) -> Result<core::SavedNote, String> {
+    core::save_note(handle.inner(), state.db_manager.pool(), project).await
+}
+
+/// Slugs of the vault's project pages, sorted.
+#[tauri::command]
+pub async fn assistant_list_vault_projects(handle: State<'_, AssistantHandle>) -> Result<Vec<String>, String> {
+    Ok(core::list_vault_projects(handle.inner()).await)
+}
+
+/// The project the finished meeting most likely belongs to, if any.
+#[tauri::command]
+pub async fn assistant_suggest_vault_project(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+) -> Result<Option<String>, String> {
+    Ok(core::suggest_vault_project(handle.inner(), state.db_manager.pool()).await)
 }
 
 #[tauri::command]

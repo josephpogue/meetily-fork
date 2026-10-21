@@ -142,7 +142,7 @@ pub fn log_built(context: &str, slug: Option<&str>, why: &str) {
 }
 
 /// `[[Projects/<slug>]]` and `[[Projects/<slug>|alias]]` links, in index order.
-fn candidates(index: &str) -> Vec<String> {
+pub(crate) fn candidates(index: &str) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut rest = index;
     while let Some(i) = rest.find("[[Projects/") {

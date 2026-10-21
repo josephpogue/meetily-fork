@@ -19,6 +19,8 @@ use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 
 use crate::audio::TranscriptUpdate;
+use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
+use crate::database::repositories::assistant_meta::AssistantMetaRepository;
 
 use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut, ChatExchange, ChatLog};
 use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, FrameFeed, LaneConfig, Runner};
@@ -888,12 +890,12 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
     let mut core = handle.0.lock().await;
     match result {
         Ok(raw) => match note::parse_note(&raw) {
-            Ok(mut draft) => {
-                // Built in code, not by the model: the answered list as it
-                // stood, in the preview and in the saved file alike.
+            Ok(draft) => {
+                // The preview carries the answered list as it stands, built in
+                // code. The draft keeps only the model's body: the saved file
+                // builds its own code sections from the meeting's rows.
                 let deleted = core.history.lock().unwrap().deleted_ids();
-                draft.markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
-                core.note_markdown = draft.markdown.clone();
+                core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
                 core.note_draft = Some(draft);
                 core.note_state = NoteState::Ready;
                 core.note_error = None;
@@ -912,36 +914,150 @@ pub async fn draft_note(handle: &AssistantHandle) -> Result<(), String> {
     Ok(())
 }
 
-pub async fn save_note(handle: &AssistantHandle) {
+/// What the vault note is built from: the meeting's rows (saved rows when the
+/// meeting was saved at Stop, else the live collector's), its title, the Brief.
+struct MeetingFacts {
+    saved_id: Option<String>,
+    rows: Vec<AssistantItem>,
+    title: Option<String>,
+    brief: String,
+}
+
+async fn meeting_facts(pool: &SqlitePool, history: &super::history::HistoryHandle) -> Result<MeetingFacts, String> {
+    let (saved_id, brief, live_rows) = {
+        let h = history.lock().unwrap();
+        let saved_id = h.saved_meeting_id();
+        let live_rows = if saved_id.is_none() { h.finalize(h.opened_ms()) } else { Vec::new() };
+        (saved_id, h.brief().to_string(), live_rows)
+    };
+    let Some(id) = saved_id.clone() else {
+        return Ok(MeetingFacts { saved_id, rows: live_rows, title: None, brief });
+    };
+    let rows = AssistantItemsRepository::list_for_meeting(pool, &id).await.map_err(|e| e.to_string())?;
+    let title = sqlx::query_scalar::<_, Option<String>>("SELECT title FROM meetings WHERE id = ?")
+        .bind(&id)
+        .fetch_optional(pool)
+        .await
+        .map_err(|e| e.to_string())?
+        .flatten()
+        .filter(|t| !t.trim().is_empty());
+    let brief = if brief.trim().is_empty() {
+        AssistantMetaRepository::get(pool, &id)
+            .await
+            .map_err(|e| e.to_string())?
+            .map(|m| m.brief)
+            .unwrap_or_default()
+    } else {
+        brief
+    };
+    Ok(MeetingFacts { saved_id, rows, title, brief })
+}
+
+/// Slugs of the vault's project pages, for the note bar's dropdown.
+pub async fn list_vault_projects(handle: &AssistantHandle) -> Vec<String> {
+    let root = resolve_vault_root(&handle.0.lock().await.settings.vault_root);
+    note::list_projects(&root)
+}
+
+/// The project the finished meeting looks like it belongs to, if any.
+pub async fn suggest_vault_project(handle: &AssistantHandle, pool: &SqlitePool) -> Option<String> {
+    let (root, history, transcript) = {
+        let core = handle.0.lock().await;
+        let transcript = if core.session_transcript.is_empty() { core.transcript.all() } else { core.session_transcript.clone() };
+        (resolve_vault_root(&core.settings.vault_root), core.history.clone(), transcript)
+    };
+    let facts = match meeting_facts(pool, &history).await {
+        Ok(f) => f,
+        Err(e) => {
+            log::warn!("assistant: no vault project suggestion, meeting data unreadable: {}", e);
+            return None;
+        }
+    };
+    note::suggest_project(&root, facts.title.as_deref().unwrap_or(""), &facts.brief, &transcript)
+}
+
+/// What a save returns to the note bar.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SavedNote {
+    pub note_path: String,
+    pub project: Option<String>,
+}
+
+/// Files the drafted note in the vault under `project` (None: no project) and
+/// links it on the project page. A project that is not a page in the vault is
+/// refused with an error and the note stays Ready; any other failure puts the
+/// note in Failed with its message, as it always did.
+pub async fn save_note(
+    handle: &AssistantHandle,
+    pool: &SqlitePool,
+    project: Option<String>,
+) -> Result<SavedNote, String> {
     let mut core = handle.0.lock().await;
     let Some(draft) = core.note_draft.clone() else {
         core.note_state = NoteState::Failed;
         core.note_error = Some("no note draft to save".to_string());
         core.emit_note();
-        return;
+        return Err("no note draft to save".to_string());
     };
     let vault_root = resolve_vault_root(&core.settings.vault_root);
+    note::check_project(&vault_root, project.as_deref())?;
     let date = chrono::Local::now().format("%Y-%m-%d").to_string();
     let dry_run = std::env::var("ASSISTANT_DRY_RUN").ok().as_deref() == Some("1");
-    let qa_log_text = qa_log_text(&core.qa_log);
     let transcript_text = core.session_transcript.clone();
+    let history = core.history.clone();
 
-    match note::save_note(&vault_root, &date, &draft, &transcript_text, &qa_log_text, dry_run) {
-        Ok(paths) => {
+    let result = async {
+        let facts = meeting_facts(pool, &history).await?;
+        let filed = note::save_note(note::SaveInput {
+            vault_root: &vault_root,
+            date: &date,
+            draft: &draft,
+            title: facts.title.as_deref(),
+            brief: &facts.brief,
+            rows: &facts.rows,
+            transcript: &transcript_text,
+            project: project.as_deref(),
+            dry_run,
+        })?;
+        Ok::<_, String>((filed, facts.saved_id))
+    }
+    .await;
+
+    match result {
+        Ok((filed, saved_id)) => {
             if dry_run {
-                log::info!("assistant: dry-run, not written: {:?}", paths);
+                log::info!("assistant: dry-run, not written: {:?}", filed);
             } else {
-                log::info!("assistant: note saved: {:?}", paths);
+                log::info!("assistant: note saved: {:?}", filed);
+                if let Some(id) = saved_id {
+                    let filed_at = chrono::Utc::now().to_rfc3339();
+                    if let Err(e) = AssistantMetaRepository::set_filed(
+                        pool,
+                        &id,
+                        filed.project.as_deref(),
+                        &filed.note_path.to_string_lossy(),
+                        &filed.transcript_path.to_string_lossy(),
+                        &filed_at,
+                    )
+                    .await
+                    {
+                        log::warn!("assistant: filed the note but could not record it for {}: {}", id, e);
+                    }
+                }
             }
             core.note_state = NoteState::Saved;
             core.note_error = None;
+            core.emit_note();
+            Ok(SavedNote { note_path: filed.note_path.to_string_lossy().into_owned(), project: filed.project })
         }
         Err(e) => {
             core.note_state = NoteState::Failed;
-            core.note_error = Some(e);
+            core.note_error = Some(e.clone());
+            core.emit_note();
+            Err(e)
         }
     }
-    core.emit_note();
 }
 
 pub async fn discard_note(handle: &AssistantHandle) {
@@ -2354,7 +2470,7 @@ mod tests {
             "## Answered questions\n\n- **What are your fees?** Ten percent of rent. (On the call)"
         ), "note was: {}", core.note_markdown);
         assert!(core.note_markdown.starts_with("## Summary"));
-        assert_eq!(core.note_draft.as_ref().unwrap().markdown, core.note_markdown, "the saved file gets it too");
+        assert!(!core.note_draft.as_ref().unwrap().markdown.contains("Answered questions"), "the saved file builds its own from the rows");
         let note_prompt = calls
             .lock()
             .unwrap()
@@ -2639,6 +2755,71 @@ mod tests {
         assert_eq!(handle.0.lock().await.ask_lane.snapshot().answered.len(), 1, "a closed session's lane is not touched");
         settle().await;
         assert_eq!(calls.lock().unwrap().len(), turns_before, "no turn ran");
+    }
+
+    fn git_vault() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            let st = std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap();
+            assert!(st.success(), "git {args:?}");
+        };
+        run(&["init", "-q"]);
+        run(&["config", "user.email", "t@example.com"]);
+        run(&["config", "user.name", "T"]);
+        std::fs::create_dir_all(dir.path().join("Wiki/Projects")).unwrap();
+        std::fs::write(dir.path().join("Wiki/Projects/mission-control.md"), "# MC\n").unwrap();
+        run(&["add", "-A"]);
+        run(&["commit", "-q", "-m", "seed"]);
+        dir
+    }
+
+    #[tokio::test]
+    async fn saving_files_the_saved_rows_under_the_project_and_a_later_delete_updates_the_note() {
+        let pool = test_pool().await;
+        let folder = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(folder.path().to_str().unwrap())).await;
+        let vault = git_vault();
+        let handle = AssistantHandle::new();
+        let history = collect_asks(&handle).await;
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), note_runner(calls)).await;
+        refresh_asks(&handle).await;
+        settle().await;
+        refresh_asks(&handle).await;
+        settle().await;
+        let answered_id = handle.0.lock().await.ask_lane.snapshot().answered[0].id.clone();
+        close_session(&handle).await;
+        history.lock().unwrap().set_brief("Mission Control review");
+        super::super::history::save_for_meeting(&pool, &history, "m1").await.unwrap();
+        handle.0.lock().await.settings.vault_root = vault.path().to_string_lossy().into_owned();
+        assert!(draft_note(&handle).await.is_ok());
+
+        assert_eq!(list_vault_projects(&handle).await, vec!["mission-control"]);
+        let err = save_note(&handle, &pool, Some("../secret".to_string())).await.unwrap_err();
+        assert!(err.contains("not a project"), "{err}");
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Ready, "a refusal leaves the note to save again");
+
+        let saved = save_note(&handle, &pool, Some("mission-control".to_string())).await.unwrap();
+        assert_eq!(saved.project.as_deref(), Some("mission-control"));
+        let note = std::fs::read_to_string(&saved.note_path).unwrap();
+        assert!(note.starts_with("# t\n\n- Date: "), "title is the meeting's: {note}");
+        assert!(note.contains("- Linked projects: [[mission-control]]"));
+        assert!(note.contains("## Brief\n\nMission Control review"));
+        assert_eq!(note.matches("## Answered questions").count(), 1, "{note}");
+        assert!(note.contains("- **What are your fees?** Ten percent of rent. (On the call)"));
+        let page = std::fs::read_to_string(vault.path().join("Wiki/Projects/mission-control.md")).unwrap();
+        assert!(page.contains("## Meetings\n\n- "), "{page}");
+        let meta = AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap();
+        assert_eq!(meta.vault_project.as_deref(), Some("mission-control"));
+        assert_eq!(meta.vault_note_path.as_deref(), Some(saved.note_path.as_str()));
+        assert!(meta.filed_at.is_some());
+        assert_eq!(handle.0.lock().await.note_state, NoteState::Saved);
+
+        // A delete made after the save reaches the filed note.
+        assert_eq!(delete_items(&handle, &pool, vec![answered_id]).await, Ok(1));
+        let note = std::fs::read_to_string(&saved.note_path).unwrap();
+        assert!(!note.contains("What are your fees?"), "{note}");
+        assert!(note.contains("## Brief"), "the rest stays: {note}");
     }
 
     fn settled_card(id: &str, question: &str) -> CardOut {
