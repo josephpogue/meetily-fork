@@ -30,7 +30,7 @@ build {
 
   # Files made on the host at build time; `generated = true` skips Packer's up-front existence check.
   provisioner "shell-local" {
-    inline = ["bash clips/make-clips.sh build/clips", "bash zoom-standin/build.sh build/zoom-standin"]
+    inline = ["bash clips/make-clips.sh build/clips", "bash zoom-standin/build.sh build/zoom-standin", "bash teams-standin/build.sh build/teams-standin"]
   }
   provisioner "shell" {
     inline = ["mkdir -p ~/clips ~/testenv-ui ~/model-staging '/Users/admin/Library/Application Support/com.meetily.ai/models'"]
@@ -42,6 +42,11 @@ build {
   }
   provisioner "file" {
     source      = "build/zoom-standin/"
+    destination = "/Users/admin/"
+    generated   = true
+  }
+  provisioner "file" {
+    source      = "build/teams-standin/"
     destination = "/Users/admin/"
     generated   = true
   }
@@ -73,7 +78,7 @@ build {
     destination = "/Users/admin/launch-app.sh"
   }
   provisioner "shell" {
-    inline = ["sudo mv '/Users/admin/Zoom Stand-in.app' /Applications/"]
+    inline = ["sudo mv '/Users/admin/Zoom Stand-in.app' '/Users/admin/Teams Stand-in.app' /Applications/"]
   }
   provisioner "shell" {
     script = "provision/audio.sh"

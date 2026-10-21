@@ -13,6 +13,7 @@ pub mod commands;
 pub mod core;
 pub mod history;
 pub mod lanes;
+pub mod meeting_name;
 pub mod note;
 pub mod settings;
 pub mod startup_context;

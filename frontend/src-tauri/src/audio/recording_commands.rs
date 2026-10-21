@@ -672,6 +672,23 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     Ok(())
 }
 
+/// Titles of the call windows the assistant's capture grabbed this
+/// recording, taken so they name one meeting only. Empty when the assistant
+/// is off, None when it does not answer in time.
+async fn call_window_titles<R: Runtime>(
+    app: &AppHandle<R>,
+) -> Option<Vec<(crate::assistant::vision::CallApp, String)>> {
+    let Some(handle) = app.try_state::<crate::assistant::AssistantHandle>() else {
+        return Some(Vec::new());
+    };
+    tokio::time::timeout(
+        tokio::time::Duration::from_secs(2),
+        crate::assistant::core::take_window_titles(&handle),
+    )
+    .await
+    .ok()
+}
+
 /// Stop recording with optimized graceful shutdown ensuring NO transcript chunks are lost
 pub async fn stop_recording<R: Runtime>(
     app: AppHandle<R>,
@@ -1015,6 +1032,26 @@ pub async fn stop_recording<R: Runtime>(
     // Perform final cleanup with the manager if available
     let (meeting_folder, meeting_name) = if let Some(mut manager) = manager_for_cleanup {
         info!("🧹 Performing final cleanup and saving recording data");
+
+        // Name the meeting after its call window before metadata.json is
+        // finalised and before the name goes to the frontend's save.
+        let titles = match call_window_titles(&app).await {
+            Some(t) => t,
+            None => {
+                warn!(
+                    "could not read call window titles in time, keeping {}",
+                    manager.get_meeting_name().unwrap_or_default()
+                );
+                Vec::new()
+            }
+        };
+        match manager.rename_from_window_titles(&titles) {
+            Some(name) => info!("meeting name from call window title: {}", name),
+            None => info!(
+                "no meeting window title, keeping {}",
+                manager.get_meeting_name().unwrap_or_default()
+            ),
+        }
 
         // Extract meeting info BEFORE async operations
         let meeting_folder = manager.get_meeting_folder();

@@ -14,7 +14,7 @@ Joseph reads this preview and then decides whether to keep it. Nothing you write
 
 ## Pictures
 
-Pictures of the Zoom meeting window may come with this turn. Draw on the slides and shared documents for decisions and details the transcript missed. Faces and video tiles carry no content, and the note never describes the pictures.
+Pictures of the Zoom or Teams meeting window may come with this turn. Draw on the slides and shared documents for decisions and details the transcript missed. Faces and video tiles carry no content, and the note never describes the pictures.
 
 ## Output contract
 

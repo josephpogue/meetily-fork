@@ -152,9 +152,9 @@ export function AssistantSettings() {
       <div className="bg-white rounded-lg border border-gray-200 p-6 shadow-sm">
         <div className="flex items-center justify-between">
           <div>
-            <Label htmlFor="see-zoom-window" className="text-base font-semibold text-gray-900">See the Zoom window</Label>
+            <Label htmlFor="see-zoom-window" className="text-base font-semibold text-gray-900">See the Zoom or Teams window</Label>
             <p className="text-sm text-gray-600 mt-1">
-              Sends changed pictures of the Zoom meeting window to Claude with each answer.
+              Sends changed pictures of the Zoom or Teams meeting window to Claude with each answer.
             </p>
           </div>
           <Switch

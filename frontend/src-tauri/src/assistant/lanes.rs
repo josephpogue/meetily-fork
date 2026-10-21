@@ -23,7 +23,7 @@ use std::sync::{Arc, Mutex};
 use super::card::{self, ParsedCard};
 use super::claude_cli::{ClaudeOutcome, ClaudeTurn, TurnHandle, NO_TOOLS, READ_ONLY_TOOLS, WRITE_TOOLS};
 use super::transcript::{Speaker, TranscriptLog};
-use super::vision::{encode, FrameStore, ImageBlock, KeptFrame};
+use super::vision::{encode, CallApp, FrameStore, ImageBlock, KeptFrame};
 
 const FAST_PROMPT: &str = include_str!("prompts/fast.md");
 const DEEP_PROMPT: &str = include_str!("prompts/deep.md");
@@ -146,8 +146,8 @@ impl FrameBatch {
             let mut out = Vec::new();
             for f in frames {
                 match encode(&f.path) {
-                    Ok(img) => out.push((frame_label(f.captured_at_ms), img)),
-                    Err(e) => log::debug!("zoom frame {} skipped: {}", f.seq, e),
+                    Ok(img) => out.push((frame_label(f.app, f.captured_at_ms), img)),
+                    Err(e) => log::debug!("{} frame {} skipped: {}", f.app.name(), f.seq, e),
                 }
             }
             out
@@ -161,11 +161,11 @@ impl FrameBatch {
     }
 }
 
-fn frame_label(captured_at_ms: i64) -> String {
+fn frame_label(app: CallApp, captured_at_ms: i64) -> String {
     use chrono::TimeZone;
     match chrono::Local.timestamp_millis_opt(captured_at_ms).single() {
-        Some(t) => format!("Zoom window at {}:", t.format("%H:%M:%S")),
-        None => "Zoom window:".to_string(),
+        Some(t) => format!("{} window at {}:", app.name(), t.format("%H:%M:%S")),
+        None => format!("{} window:", app.name()),
     }
 }
 
@@ -967,7 +967,7 @@ impl AnswerLanes {
         let mut prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
         if has_frames {
             prompt.push_str(
-                "\n\nPictures of the Zoom window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
+                "\n\nPictures of the Zoom or Teams window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
             );
         }
         let turn = build_turn(LaneCall {
@@ -1338,6 +1338,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_teams_frame_is_labelled_teams_and_a_zoom_frame_zoom() {
+        let store = FrameStore::new();
+        store.push_from(CallApp::Teams, "/f/1".into(), 1);
+        store.push("/f/2".into(), 2);
+        let (runner, calls) = skip_runner();
+        let lanes = lanes_with_frames(runner, &store);
+        let log = TranscriptLog::default();
+        let emit: EmitFn = Arc::new(|_| {});
+        let mut lanes = lanes;
+        lanes.answer("q".to_string(), CardKind::Ask, &log, emit);
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let calls = calls.lock().unwrap();
+        let deep = calls.iter().find(|t| t.resume.as_deref() == Some("deep-1")).unwrap();
+        assert!(deep.image_labels[0].starts_with("Teams window at "));
+        assert!(deep.image_labels[1].starts_with("Zoom window at "));
+    }
+
+    #[tokio::test]
     async fn answer_sends_frames_to_each_lane_and_switch_off_sends_none() {
         let store = store_with(3);
         let (runner, calls) = skip_runner();
@@ -1487,7 +1505,7 @@ mod tests {
         let mut off = AnswerLanes::for_test(runner, "fast-1", "deep-1", test_cfg());
         let _ = off.draft_note("t".to_string(), "qa".to_string()).await;
         let calls = calls.lock().unwrap();
-        assert!(calls[0].images.is_empty() && !calls[0].prompt.contains("Pictures of the Zoom"));
+        assert!(calls[0].images.is_empty() && !calls[0].prompt.contains("Pictures of the Zoom or Teams"));
     }
 
     #[tokio::test]

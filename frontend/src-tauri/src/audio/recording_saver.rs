@@ -68,6 +68,29 @@ impl RecordingSaver {
         }
     }
 
+    /// Renames the meeting after its call window when the name is still the
+    /// automatic one (see `meeting_name::renamed_from_titles`). Updates the
+    /// name and the metadata.json copy the next write uses; the folder keeps
+    /// its timestamp name. Returns the new name when it changed.
+    pub fn rename_from_window_titles(
+        &mut self,
+        titles: &[(crate::assistant::vision::CallApp, String)],
+    ) -> Option<String> {
+        let current = self.meeting_name.clone()?;
+        let new_name = crate::assistant::meeting_name::renamed_from_titles(&current, titles)?;
+        self.meeting_name = Some(new_name.clone());
+        if let Some(metadata) = self.metadata.as_mut() {
+            metadata.meeting_name = Some(new_name.clone());
+        }
+        // stop_and_save can return before it writes metadata.json, so write it now.
+        if let (Some(folder), Some(metadata)) = (&self.meeting_folder, &self.metadata) {
+            if let Err(e) = self.write_metadata(folder, metadata) {
+                warn!("could not write the new meeting name to metadata.json: {}", e);
+            }
+        }
+        Some(new_name)
+    }
+
     /// Set the meeting name for this recording session
     pub fn set_meeting_name(&mut self, name: Option<String>) {
         self.meeting_name = name;
@@ -475,5 +498,75 @@ impl RecordingSaver {
 impl Default for RecordingSaver {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::assistant::vision::CallApp;
+
+    fn saver_named(name: &str, folder: &std::path::Path) -> RecordingSaver {
+        let mut saver = RecordingSaver::new();
+        saver.set_meeting_name(Some(name.to_string()));
+        saver.meeting_folder = Some(folder.to_path_buf());
+        saver.metadata = Some(MeetingMetadata {
+            version: "1.0".to_string(),
+            meeting_id: None,
+            meeting_name: Some(name.to_string()),
+            created_at: "2026-10-21T10:04:31Z".to_string(),
+            completed_at: None,
+            duration_seconds: None,
+            devices: DeviceInfo { microphone: None, system_audio: None },
+            audio_file: "audio.mp4".to_string(),
+            transcript_file: "transcripts.json".to_string(),
+            sample_rate: 48000,
+            status: "recording".to_string(),
+        });
+        saver
+    }
+
+    fn teams_title() -> Vec<(CallApp, String)> {
+        vec![(CallApp::Teams, "Storage roadmap review | Microsoft Teams".to_string())]
+    }
+
+    fn metadata_name(saver: &RecordingSaver, folder: &std::path::Path) -> String {
+        saver.write_metadata(&folder.to_path_buf(), saver.metadata.as_ref().unwrap()).unwrap();
+        let json: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(folder.join("metadata.json")).unwrap()).unwrap();
+        json["meeting_name"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn automatic_name_is_replaced_in_name_and_metadata_json() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver_named("Meeting 21_10_26_10_04_31", dir.path());
+        let renamed = saver.rename_from_window_titles(&teams_title());
+        assert_eq!(renamed.as_deref(), Some("Storage roadmap review"));
+        assert_eq!(saver.get_meeting_name().as_deref(), Some("Storage roadmap review"));
+        // Written by the rename itself, before any save runs.
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("metadata.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(json["meeting_name"], "Storage roadmap review");
+        assert_eq!(metadata_name(&saver, dir.path()), "Storage roadmap review");
+    }
+
+    #[test]
+    fn typed_name_is_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver_named("Budget sync", dir.path());
+        assert_eq!(saver.rename_from_window_titles(&teams_title()), None);
+        assert_eq!(saver.get_meeting_name().as_deref(), Some("Budget sync"));
+        assert_eq!(metadata_name(&saver, dir.path()), "Budget sync");
+    }
+
+    #[test]
+    fn no_window_title_keeps_the_timestamp_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut saver = saver_named("Meeting 2026-10-21_10-04-31", dir.path());
+        assert_eq!(saver.rename_from_window_titles(&[]), None);
+        assert_eq!(metadata_name(&saver, dir.path()), "Meeting 2026-10-21_10-04-31");
     }
 }

@@ -37,9 +37,17 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 - Open the stand-in Zoom window: `testenv exec <id> -- open -a "Zoom Stand-in"`
 - Opening it puts Zoom in front. Bring Meetily back before you click anything: `testenv exec <id> -- open -a meetily-fork`
-- "See the Zoom window" is on by default, so you do not need to turn it on in the app's settings.
+- "See the Zoom or Teams window" is on by default, so you do not need to turn it on in the app's settings.
 - During a recording, run `testenv exec <id> -- bash -c 'ls /Users/admin/Movies/meetily-recordings/*/zoom-frames/ 2>/dev/null | head'`. It must list picture files.
-- The app saves the frames in `zoom-frames` inside the meeting folder (default `~/Movies/meetily-recordings/<meeting>/`). See `zoom_frames_dir` in `frontend/src-tauri/src/assistant/core.rs`. You do not read that file; this is only where the pictures land.
+- The app saves the frames in `zoom-frames` inside the meeting folder (default `~/Movies/meetily-recordings/<meeting>/`). See `frames_dirs` in `frontend/src-tauri/src/assistant/core.rs`. You do not read that file; this is only where the pictures land.
+
+## 5b. Teams
+
+- Open the stand-in Teams window: `testenv exec <id> -- open -a "Teams Stand-in"`
+- Opening it puts Teams in front. Bring Meetily back before you click anything: `testenv exec <id> -- open -a meetily-fork`
+- "See the Zoom or Teams window" is on by default, so you do not need to turn it on in the app's settings.
+- During a recording, run `testenv exec <id> -- bash -c 'ls /Users/admin/Movies/meetily-recordings/*/teams-frames/ 2>/dev/null | head'`. It must list `teams-*.jpg` files.
+- The app saves the frames in `teams-frames` inside the meeting folder, next to `zoom-frames`. With only the Teams stand-in open, `zoom-frames` does not exist. If both stand-ins are open, the Zoom one is captured and `teams-frames` stays empty or missing.
 
 ## 6. The three standing checks
 

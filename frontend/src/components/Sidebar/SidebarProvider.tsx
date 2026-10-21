@@ -6,6 +6,7 @@ import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
+import type { SavedOverview } from '@/components/MeetingSaved';
 
 
 
@@ -62,6 +63,8 @@ interface SidebarContextType {
   stopSummaryPolling: (meetingId: string, processId?: string) => void;
   // Refetch meetings from backend
   refetchMeetings: () => Promise<void>;
+  // Per-meeting Brief and "what was saved" numbers; reloaded with the meeting list
+  saved: SavedOverview | null;
 
 }
 
@@ -79,12 +82,14 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const [currentMeeting, setCurrentMeeting] = useState<CurrentMeeting | null>({ id: 'intro-call', title: '+ New Call' });
   const [isCollapsed, setIsCollapsed] = useState(true);
   const [meetings, setMeetings] = useState<CurrentMeeting[]>([]);
+  const [saved, setSaved] = useState<SavedOverview | null>(null);
   const [sidebarItems, setSidebarItems] = useState<SidebarItem[]>([]);
   const [isMeetingActive, setIsMeetingActive] = useState(false);
   const [searchResults, setSearchResults] = useState<any[]>([]);
   const [isSearching, setIsSearching] = useState(false);
   const [serverAddress, setServerAddress] = useState('');
   const [transcriptServerAddress, setTranscriptServerAddress] = useState('');
+  const savedRequestRef = React.useRef(0);
   const summaryPollsRef = React.useRef(new Map<string, SummaryPoll>());
 
   // Use recording state from RecordingStateContext (single source of truth)
@@ -103,6 +108,13 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           title: meeting.title
         }));
         setMeetings(transformedMeetings);
+        // Extra numbers for the list; the list itself must not depend on them.
+        // Replies can land out of order (a slow scan from Stop vs a newer one after a delete):
+        // only the latest request may set the numbers.
+        const request = ++savedRequestRef.current;
+        invoke<SavedOverview>('api_get_meetings_saved')
+          .then((overview) => { if (request === savedRequestRef.current) setSaved(overview); })
+          .catch((error) => console.error('Error fetching what was saved:', error));
         Analytics.trackBackendConnection(true);
       } catch (error) {
         console.error('Error fetching meetings:', error);
@@ -316,6 +328,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       startSummaryPolling,
       stopSummaryPolling,
       refetchMeetings: fetchMeetings,
+      saved,
 
     }}>
       {children}
