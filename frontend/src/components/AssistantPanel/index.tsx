@@ -373,7 +373,7 @@ export function AssistantPanel() {
                 )}
               </div>
             </div>
-            <TodoDock />
+            <TodoDock disabled={actionsDisabled} />
           </>
         )}
       </div>

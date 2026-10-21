@@ -13,6 +13,8 @@ interface TodoDrawerColumnsProps {
   onDismiss: (id: string) => void;
   /** Where focus goes when a dismiss empties the column it was in. */
   focusClose: () => void;
+  /** The session is closed: the core ignores a dismiss, so the buttons are off. */
+  disabled: boolean;
 }
 
 /**
@@ -20,18 +22,18 @@ interface TodoDrawerColumnsProps {
  * sits under the Say lane and "They owe you" under the Ask lane. Each column
  * scrolls on its own.
  */
-export function TodoDrawerColumns({ todos, lastClosedAt, onDismiss, focusClose }: TodoDrawerColumnsProps) {
+export function TodoDrawerColumns({ todos, lastClosedAt, onDismiss, focusClose, disabled }: TodoDrawerColumnsProps) {
   const split = splitByOwner(todos);
   return (
     <div className="grid min-h-0 flex-1 grid-cols-[minmax(0,1.08fr)_minmax(0,1fr)]">
-      <Column owner="you" title="You promised" group={split.you} lastClosedAt={lastClosedAt} onDismiss={onDismiss} focusClose={focusClose} />
+      <Column owner="you" title="You promised" group={split.you} lastClosedAt={lastClosedAt} onDismiss={onDismiss} focusClose={focusClose} disabled={disabled} list={todos} />
       <Column
         owner="them"
         title="They owe you"
         group={split.them}
         lastClosedAt={lastClosedAt}
         onDismiss={onDismiss}
-        focusClose={focusClose}
+        focusClose={focusClose} disabled={disabled} list={todos}
         className="border-l border-gray-200"
       />
     </div>
@@ -45,30 +47,40 @@ interface ColumnProps {
   lastClosedAt: number;
   onDismiss: (id: string) => void;
   focusClose: () => void;
+  disabled: boolean;
+  /** The whole to-do list as last delivered: a new array means a new update arrived. */
+  list: AssistantTodo[];
   className?: string;
 }
 
-function Column({ owner, title, group, lastClosedAt, onDismiss, focusClose, className }: ColumnProps) {
+function Column({ owner, title, group, lastClosedAt, onDismiss, focusClose, disabled, list, className }: ColumnProps) {
   // After a dismiss the row is gone and focus would fall to the page. Once the
   // item has left the list, focus goes to the next row's dismiss button, else
   // the previous one, else the drawer's Close button.
   const buttons = useRef(new Map<string, HTMLButtonElement | null>());
-  const pending = useRef<{ id: string; target: string | null } | null>(null);
+  // `after` is the list as it must look once the dismiss has landed; any other
+  // update (the item stayed, or the list was reset for a new meeting) drops it.
+  const pending = useRef<{ id: string; target: string | null; after: string } | null>(null);
   const order = [...group.open, ...group.done].map((t) => t.id);
   const dismiss = (id: string) => {
     const at = order.indexOf(id);
-    pending.current = { id, target: order[at + 1] ?? order[at - 1] ?? null };
+    pending.current = {
+      id,
+      target: order[at + 1] ?? order[at - 1] ?? null,
+      after: order.filter((x) => x !== id).join('|'),
+    };
     onDismiss(id);
   };
   const orderKey = order.join('|');
   useEffect(() => {
     const p = pending.current;
-    if (!p || order.includes(p.id)) return;
+    if (!p) return;
     pending.current = null;
+    if (orderKey !== p.after) return;
     if (p.target === null) focusClose();
     else buttons.current.get(p.target)?.focus?.();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [orderKey]);
+  }, [list]);
   const setButton = (id: string) => (el: HTMLButtonElement | null) => {
     if (el) buttons.current.set(id, el);
     else buttons.current.delete(id);
@@ -89,7 +101,7 @@ function Column({ owner, title, group, lastClosedAt, onDismiss, focusClose, clas
       ) : (
         <ul className="flex flex-col">
           {group.open.map((t) => (
-            <TodoRow key={t.id} todo={t} fresh={isNewTodo(t, lastClosedAt)} onDismiss={dismiss} buttonRef={setButton(t.id)} />
+            <TodoRow key={t.id} todo={t} fresh={isNewTodo(t, lastClosedAt)} onDismiss={dismiss} buttonRef={setButton(t.id)} disabled={disabled} />
           ))}
         </ul>
       )}
@@ -101,7 +113,7 @@ function Column({ owner, title, group, lastClosedAt, onDismiss, focusClose, clas
           </div>
           <ul className="flex flex-col">
             {group.done.map((t) => (
-              <TodoRow key={t.id} todo={t} fresh={false} onDismiss={dismiss} buttonRef={setButton(t.id)} />
+              <TodoRow key={t.id} todo={t} fresh={false} onDismiss={dismiss} buttonRef={setButton(t.id)} disabled={disabled} />
             ))}
           </ul>
         </>
@@ -115,11 +127,13 @@ function TodoRow({
   fresh,
   onDismiss,
   buttonRef,
+  disabled,
 }: {
   todo: AssistantTodo;
   fresh: boolean;
   onDismiss: (id: string) => void;
   buttonRef: (el: HTMLButtonElement | null) => void;
+  disabled: boolean;
 }) {
   const done = todo.done;
   const origin = `${todo.origin === 'typed' ? 'You added at' : 'Said at'} ${callStamp(todo.callTime)}`;
@@ -150,10 +164,11 @@ function TodoRow({
       <button
         ref={buttonRef}
         type="button"
+        disabled={disabled}
         onClick={() => onDismiss(todo.id)}
         title="Dismiss"
         aria-label={`Dismiss to-do: ${todo.text}`}
-        className="mt-0.5 shrink-0 rounded text-gray-300 opacity-0 hover:text-gray-500 focus-visible:opacity-100 focus-visible:text-gray-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400 group-hover:opacity-100"
+        className="mt-0.5 shrink-0 rounded text-gray-300 opacity-0 hover:text-gray-500 focus-visible:opacity-100 focus-visible:text-gray-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-rose-400 group-hover:opacity-100 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:text-gray-300"
       >
         <X className="h-3.5 w-3.5" aria-hidden="true" />
       </button>

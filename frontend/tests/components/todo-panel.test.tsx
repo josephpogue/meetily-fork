@@ -228,6 +228,28 @@ describe('To do drawer', () => {
     expect(focused.at(-1)).toBe('Close to-do list');
   });
 
+  test('a dismiss that leaves the item in the list never steals focus later, even after a reset', async () => {
+    await mount([todos[0]]);
+    await open();
+    focused = [];
+    await act(async () => { byLabel('Dismiss to-do: Send Dana the runbook template').props.onClick(); });
+    // The core ignored it: the same list comes back, then a new meeting resets it.
+    await act(async () => { asksListener!(payload([todos[0]])); });
+    await act(async () => { asksListener!(payload([])); });
+    expect(focused).toEqual([]);
+  });
+
+  test('the drawer dismiss buttons are disabled while the session is closed', async () => {
+    await act(async () => {
+      renderer = create(<AssistantProvider><TodoDock disabled /></AssistantProvider>, { createNodeMock });
+    });
+    await act(async () => { asksListener!(payload(todos)); });
+    await open();
+    expect(byLabel('Dismiss to-do: Send Dana the runbook template').props.disabled).toBe(true);
+    await act(async () => { renderer.update(<AssistantProvider><TodoDock disabled={false} /></AssistantProvider>); });
+    expect(byLabel('Dismiss to-do: Send Dana the runbook template').props.disabled).toBe(false);
+  });
+
   test('New marks items that arrived since the drawer was last closed', async () => {
     await mount();
     await open();
