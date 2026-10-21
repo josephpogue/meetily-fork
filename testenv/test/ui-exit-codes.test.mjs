@@ -48,6 +48,11 @@ before(async () => {
       if (req.method === 'GET' && req.url === '/session/s1/window') return send(200, 'w1');
       // ui.mjs looks elements up with POST /elements (an empty list when nothing matches) and takes the first displayed one.
       // mode.find(xpath) returns the element ids that xpath would match; without it every xpath matches e1 (or nothing).
+      // reveal() asks the hidden element e2 for its ancestors (e3 is its row); mode.find answers every xpath, so it also serves this one.
+      if (req.method === 'POST' && req.url === '/session/s1/element/e2/elements') return send(200, [{ [ELEMENT]: 'e3' }]);
+      // Hovering (a pointer move) shows what mode.revealOnHover hides until then, as the app's group-hover does.
+      if (req.method === 'POST' && req.url === '/session/s1/actions') { if (mode.revealOnHover) mode.hiddenIds = []; return send(200, null); }
+      if (req.method === 'DELETE' && req.url === '/session/s1/actions') return send(200, null);
       if (req.method === 'POST' && req.url === '/session/s1/elements') {
         const xpath = JSON.parse(body).value;
         xpaths.push(xpath);
@@ -173,7 +178,7 @@ test('exit 64: unknown verb', async () => {
 });
 
 test('exit 64: a missing or empty argument is a usage mistake, and nothing is sent to the app', async () => {
-  for (const args of [['click'], ['click', '  '], ['type', 'Ask a question'], ['type'], ['wait'], ['wait', 'Welcome', 'soon']]) {
+  for (const args of [['click'], ['click', '  '], ['hover'], ['hover', '  '], ['type', 'Ask a question'], ['type'], ['wait'], ['wait', 'Welcome', 'soon']]) {
     const r = await ui(args);
     assert.equal(r.code, 64, `${args.join(' ')}: ${r.stderr}`);
     assert.match(r.stderr, new RegExp(`usage: ui.mjs ${args[0]} `));
@@ -392,4 +397,45 @@ test('exit 3: the app resets the connection on POST /session itself', async () =
   const r = await ui(['wait', 'Welcome', '20']);
   assert.equal(r.code, 3, r.stderr);
   assert.ok(r.ms < 5000, `took ${r.ms} ms`);
+});
+
+// e2 is a dismiss X that is opacity-0 (not displayed) until its row e3 is hovered; e1 is another text on screen.
+const dismissOnly = (hover) => { mode.find = (x) => (x.includes('dismiss') ? ['e2'] : []); mode.hiddenIds = ['e2']; mode.revealOnHover = hover; };
+const pointerMoves = () => calls.filter((c) => c === 'POST /session/s1/actions').length;
+
+test('exit 0: hover moves the pointer onto the displayed element, and presses nothing', async () => {
+  const r = await ui(['hover', 'Call the zoo']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(pointerMoves(), 1);
+  assert.ok(!calls.some((c) => c.endsWith('/click')));
+  assert.equal(deleted(), 1);
+});
+
+test('exit 1: hover on text that is not on screen says "nothing to hover"', async () => {
+  mode.elements = false;
+  const r = await ui(['hover', 'Nope']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /nothing to hover: Nope/);
+  assert.equal(pointerMoves(), 0);
+});
+
+test('exit 3: hover with nothing answering', async () => {
+  const r = await ui(['hover', 'x'], 1);
+  assert.equal(r.code, 3);
+});
+
+test('exit 0: click on an element hidden until hover hovers its displayed ancestor, then presses it', async () => {
+  dismissOnly(true);
+  const r = await ui(['click', 'Dismiss to-do: Call the zoo']);
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(pointerMoves(), 1);
+  assert.ok(calls.indexOf('POST /session/s1/actions') < calls.indexOf('POST /session/s1/element/e2/click'), 'clicked before hovering');
+});
+
+test('exit 1: click on an element that stays hidden after the hover never presses it', async () => {
+  dismissOnly(false);
+  const r = await ui(['click', 'Dismiss to-do: Call the zoo']);
+  assert.equal(r.code, 1);
+  assert.match(r.stderr, /nothing to click: Dismiss to-do: Call the zoo/);
+  assert.ok(!calls.some((c) => c.endsWith('/click')));
 });

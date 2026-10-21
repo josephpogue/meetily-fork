@@ -77,6 +77,25 @@ async function firstDisplayed(browser, xpath) {
   return null;
 }
 
+// A matching element that exists but is not displayed (a dismiss X that is opacity-0 until its row is hovered) is shown by
+// hovering the closest ancestor that is displayed, nearest first. The pointer does not survive between ui.mjs runs (each
+// opens its own WebDriver session), so `click` does this itself instead of relying on an earlier `hover`.
+// Returns the element once it is displayed, else null. It never presses an element that stays invisible.
+async function reveal(browser, t) {
+  const el = (await browser.$$(xpathExact(t)))[0];
+  if (!el) return null;
+  const ancestors = (await el.$$('./ancestor::*')).reverse();
+  for (const ancestor of ancestors) {
+    if (!(await ancestor.isDisplayed())) continue;
+    await ancestor.moveTo();
+    for (let i = 0; i < 4; i++) { // a hover transition takes a moment to finish
+      if (await el.isDisplayed()) return el;
+      await sleep(250);
+    }
+  }
+  return null;
+}
+
 // Poll until the text is displayed or `ms` run out. A dead app (connection error) propagates at once; any other
 // error, such as no such element, counts as "not there yet". A poll that times out propagates too, except for `wait`
 // (`retryTimeouts`): one slow poll must not end it, so it polls on until the deadline. At the deadline it throws the
@@ -122,9 +141,9 @@ async function readScreen(browser) {
 }
 
 async function run() {
-  if (!['wait', 'click', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|type|read'); return 64; }
+  if (!['wait', 'click', 'hover', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|hover|type|read'); return 64; }
   // A missing argument is the caller's mistake (64), not a screen that lacks the text (1).
-  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', type: 'type <field> <text>', read: 'read' };
+  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', hover: 'hover <text>', type: 'type <field> <text>', read: 'read' };
   const badArgs = (verb !== 'read' && !a?.trim()) || (verb === 'type' && b === undefined)
     || (verb === 'wait' && b !== undefined && !(Number(b) > 0));
   if (badArgs) { console.error(`usage: ui.mjs ${USAGE[verb]}`); return 64; }
@@ -136,7 +155,14 @@ async function run() {
       case 'wait':
         if (!(await find(browser, a, deadline - Date.now(), { retryTimeouts: true, contains: true }))) { console.error(`not found after ${secs}s: ${a}`); return 1; }
         break;
-      case 'click': { const el = await find(browser, a, 10000); if (!el) { console.error(`nothing to click: ${a}`); return 1; } await el.click(); break; }
+      case 'click': {
+        // Look 1.5 s for a displayed match, then try the hover reveal, then keep looking for the rest of the 10 s (a slow screen).
+        const el = (await find(browser, a, 1500)) ?? (await reveal(browser, a)) ?? (await find(browser, a, 8500));
+        if (!el) { console.error(`nothing to click: ${a}`); return 1; }
+        await el.click();
+        break;
+      }
+      case 'hover': { const el = await find(browser, a, 10000); if (!el) { console.error(`nothing to hover: ${a}`); return 1; } await el.moveTo(); break; }
       case 'type': { const el = await find(browser, a, 10000); if (!el) { console.error(`no field: ${a}`); return 1; } await el.setValue(b); break; }
       case 'read': console.log(await readScreen(browser)); break;
     }

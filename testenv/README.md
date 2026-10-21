@@ -16,9 +16,10 @@ The build is not yours. You are handed the path of the built app. It comes from 
 
 ## 3. Drive
 
-- Use the app with `testenv exec <id> -- node /Users/admin/testenv-ui/ui.mjs wait|click|type|read ...`
+- Use the app with `testenv exec <id> -- node /Users/admin/testenv-ui/ui.mjs wait|click|hover|type|read ...`
   - `wait "<text>"` waits until that text is on screen (30 seconds by default). `wait "<text>" 60` waits up to 60 seconds, for slow screens.
   - `click "<text>"` presses the element whose whole text, `aria-label` or placeholder is that text. Case and extra spaces do not matter, but part of a label does not count: `click "Start"` does not press "Get Started". Copy the label from `read`.
+  - `hover "<text>"` moves the pointer onto the element, matched the same way as `click`. It does not press anything, and the pointer does not stay put for the next command. You rarely need it: `click` on a button that only shows on hover (the to-do and Ask dismiss X buttons) hovers the row it sits in first, so `click "Dismiss to-do: <text>"` works as it is.
   - `type "<field>" "<text>"` types into the field whose whole label or placeholder is that text, matched the same way as `click`.
   - `wait` tries the same whole-label match first, then any text that contains yours.
   - `read` prints all the text on screen, then the labels of round icon buttons that have no text, one per line as `button: <label>`. Those lines are the buttons that look unlabeled on a screenshot but that `click` can press.
