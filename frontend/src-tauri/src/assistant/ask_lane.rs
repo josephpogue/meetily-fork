@@ -2393,7 +2393,7 @@ mod tests {
         assert_eq!(out.todos.len(), 2);
         let mine = todo(&out, "Send the design doc");
         assert_eq!((mine.owner, mine.who.as_str(), mine.due.as_str()), (TodoOwner::You, "", "By Friday"));
-        assert_eq!((mine.origin, mine.call_time), (TodoOrigin::Call, 2430.5));
+        assert_eq!((mine.origin, mine.call_time), (TodoOrigin::Call, 2440.0), "the still-open utterance is the newest");
         assert!(mine.done.is_none() && mine.at > 0);
         let theirs = todo(&out, "Send the host inventory export");
         assert_eq!((theirs.owner, theirs.who.as_str(), theirs.due.as_str()), (TodoOwner::Them, "Marcus", "Monday"));
@@ -2409,9 +2409,9 @@ mod tests {
         assert_eq!(out.asks[0].id, q_id, "TODO lines leave the question list alone");
         assert_eq!(out.todos.len(), 3);
         let done = todo(&out, "Send the design doc").done.clone().expect("marked done by the call");
-        assert_eq!((done.how.as_str(), done.call_time), ("said he sent it", 2510.0));
+        assert_eq!((done.how.as_str(), done.call_time), ("said he sent it", 2520.0));
         assert!(done.at > 0);
-        assert_eq!(todo(&out, "Send the runbook").call_time, 2510.0);
+        assert_eq!(todo(&out, "Send the runbook").call_time, 2520.0);
         assert!(todo(&out, "Send the host inventory export").done.is_none());
         assert!(out.dismissed_todos.is_empty());
         // newest first: the runbook landed last

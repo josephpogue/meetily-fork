@@ -170,10 +170,16 @@ impl TranscriptLog {
         (text, self.finals.len())
     }
 
-    /// Audio start time (seconds, recording scale) of the newest utterance
-    /// among the finals since `cursor`, or None when there are none.
+    /// Audio start time (seconds, recording scale) of the newest utterance a
+    /// turn since `cursor` saw: the still-open utterance when its committed
+    /// text is non-empty (a turn usually fires while the newest utterance is
+    /// still open, and its committed text is in what the model read), else
+    /// the newest of the finals since `cursor`. None when there is neither.
     pub fn newest_start_since(&self, cursor: usize) -> Option<f64> {
-        self.finals[cursor.min(self.finals.len())..].last().map(|f| f.2)
+        match self.open.as_ref().filter(|o| !o.committed_text.is_empty()) {
+            Some(open) => Some(open.start_time),
+            None => self.finals[cursor.min(self.finals.len())..].last().map(|f| f.2),
+        }
     }
 
     /// Audio start time of the newest utterance in the whole log, the open
@@ -349,10 +355,26 @@ mod tests {
         log.ingest(&tu("system", "second", 2430.5, 2432.0, false, 2));
         log.ingest(&tu("mic", "third, still open", 2440.0, 2441.0, false, 3));
         // Two closed finals (2405.0 and 2430.5); the third is still open.
-        assert_eq!(log.newest_start_since(0), Some(2430.5));
-        assert_eq!(log.newest_start_since(1), Some(2430.5));
-        assert_eq!(log.newest_start_since(2), None);
+        // The open one holds committed text the model saw, so it counts.
+        assert_eq!(log.newest_start_since(0), Some(2440.0));
+        assert_eq!(log.newest_start_since(1), Some(2440.0));
+        assert_eq!(log.newest_start_since(2), Some(2440.0));
         assert_eq!(log.latest_start(), 2440.0);
+    }
+
+    #[test]
+    fn the_open_utterance_beats_the_finals_since_the_cursor() {
+        let mut log = TranscriptLog::default();
+        log.ingest(&tu("mic", "earlier", 18.0, 19.0, false, 1));
+        log.ingest(&tu("system", "pancakes are done", 163.0, 165.0, false, 2));
+        // finals since 0: 18.0; open utterance with committed text: 163.0.
+        assert_eq!(log.newest_start_since(0), Some(163.0));
+        // With the open one closed by a speaker flip, the finals decide again.
+        log.ingest(&tu("mic", "ok", 170.0, 171.0, false, 3));
+        assert_eq!(log.newest_start_since(1), Some(170.0));
+        assert_eq!(log.newest_start_since(3), Some(170.0));
+        let empty = TranscriptLog::default();
+        assert_eq!(empty.newest_start_since(0), None);
     }
 
     #[test]

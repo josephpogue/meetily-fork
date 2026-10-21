@@ -84,6 +84,9 @@ pub struct TodoLines {
     pub done: Vec<(String, String)>,
     /// `NOT TODO:` lines: the to-do as listed.
     pub retract: Vec<String>,
+    /// A TODO-family line was read, usable or not. A reply of only unusable
+    /// ones is still a reply: it changes nothing and is not a failed turn.
+    pub seen: bool,
 }
 
 impl TodoLines {
@@ -106,6 +109,9 @@ pub fn parse_line(line: &str, out: &mut TodoLines) -> bool {
     let line = line.trim();
     let line = line.strip_prefix("- ").unwrap_or(line).trim();
     // TODO DONE: must be tried before TODO:
+    if strip_key(line, "TODO DONE:").is_some() || strip_key(line, "NOT TODO:").is_some() || strip_key(line, "TODO:").is_some() {
+        out.seen = true;
+    }
     if let Some(body) = strip_key(line, "TODO DONE:") {
         let (text, fields) = split_fields(body, &["how"]);
         if !text.is_empty() {
@@ -195,13 +201,20 @@ pub fn add_picked(todos: &mut Vec<TodoItem>, dismissed_texts: &[String], raw: Ve
 }
 
 /// The open to-do a reply's wording points at: an exact (case-insensitive)
-/// match first, else the first that `same_item` accepts.
+/// match first, else the one open to-do that `same_item` accepts. Two or more
+/// fuzzy matches and no exact one point at nothing, so a vague line never
+/// changes the wrong to-do. With `call_only`, typed to-dos are not candidates
+/// in either pass.
 fn find_open(todos: &[TodoItem], text: &str, call_only: bool) -> Option<usize> {
     let open = |t: &TodoItem| t.done.is_none() && (!call_only || t.origin == TodoOrigin::Call);
-    todos
-        .iter()
-        .position(|t| open(t) && t.text.trim().eq_ignore_ascii_case(text.trim()))
-        .or_else(|| todos.iter().position(|t| open(t) && same_item(&t.text, text)))
+    if let Some(i) = todos.iter().position(|t| open(t) && t.text.trim().eq_ignore_ascii_case(text.trim())) {
+        return Some(i);
+    }
+    let mut fuzzy = todos.iter().enumerate().filter(|(_, t)| open(t) && same_item(&t.text, text)).map(|(i, _)| i);
+    match (fuzzy.next(), fuzzy.next()) {
+        (Some(i), None) => Some(i),
+        _ => None,
+    }
 }
 
 /// Marks each named open to-do done (either owner, typed or not). Matching
@@ -385,6 +398,47 @@ mod tests {
         let dismissed = vec!["Send the design doc".to_string()];
         add_picked(&mut todos, &dismissed, vec![raw("Send the design doc", TodoOwner::Them)], 1.0, 1);
         assert!(todos.is_empty());
+    }
+
+    #[test]
+    fn not_todo_never_picks_a_typed_to_do_and_needs_a_single_fuzzy_match() {
+        let call_you = item("Send the design document with the domain layout", TodoOwner::You, TodoOrigin::Call);
+        let call_them = item("Send the design document review notes", TodoOwner::Them, TodoOrigin::Call);
+        let mut typed = item("Send the design document", TodoOwner::You, TodoOrigin::Typed);
+        typed.id = "typed".into();
+        let words = |t: &[TodoItem]| t.iter().map(|x| x.text.clone()).collect::<Vec<_>>();
+
+        // Two call to-dos match fuzzily and none exactly: nothing changes.
+        let mut todos = vec![call_you.clone(), call_them.clone()];
+        retract(&mut todos, &mut vec![], &mut vec![], vec!["Send the design document".into()]);
+        assert_eq!(todos.len(), 2);
+
+        // Only one open: it goes.
+        let mut todos = vec![call_you.clone()];
+        retract(&mut todos, &mut vec![], &mut vec![], vec!["Send the design document".into()]);
+        assert!(todos.is_empty());
+
+        // A typed exact match is untouched; the single fuzzy call one goes.
+        let mut todos = vec![typed.clone(), call_you.clone()];
+        retract(&mut todos, &mut vec![], &mut vec![], vec!["Send the design document".into()]);
+        assert_eq!(words(&todos), vec!["Send the design document".to_string()]);
+    }
+
+    #[test]
+    fn todo_done_changes_nothing_when_two_open_to_dos_match_only_fuzzily() {
+        let mut todos = vec![
+            item("Send the design document with the domain layout", TodoOwner::You, TodoOrigin::Call),
+            item("Send the design document review notes", TodoOwner::Them, TodoOrigin::Call),
+        ];
+        apply_done(&mut todos, vec![("Send the design document".into(), "sent".into())], 1.0, 1);
+        assert!(todos.iter().all(|t| t.done.is_none()));
+        // An exact match still wins over the fuzzy ones.
+        apply_done(&mut todos, vec![("send the design doc review notes".into(), "sent".into())], 1.0, 1);
+        assert!(todos[0].done.is_none() && todos[1].done.is_some());
+        // One fuzzy match among the open ones is enough.
+        let mut one = vec![item("Send the design document with the domain layout", TodoOwner::You, TodoOrigin::Call)];
+        apply_done(&mut one, vec![("Send the design document".into(), "sent".into())], 1.0, 1);
+        assert!(one[0].done.is_some());
     }
 
     #[test]

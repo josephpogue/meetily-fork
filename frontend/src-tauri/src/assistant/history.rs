@@ -161,43 +161,65 @@ impl HistoryCollector {
     /// The to-dos of one emit: a dismissed id is dropped for good (it was a
     /// wrong pick-up), every other id is upserted with the latest state. An
     /// id missing from `todos` is left alone, so an empty emit removes nothing.
+    /// An id not seen before still joins the entry with the same owner and
+    /// normalized text: a to-do re-said after the assistant was switched off
+    /// and on comes from a new lane with a new id, and updates the earlier
+    /// entry (keeping when it was first said) instead of adding a second.
     fn observe_todos(&mut self, todos: &[TodoItem], dismissed: &[String]) {
-        self.entries.retain(|e| !(e.kind == "todo" && dismissed.contains(&e.ids[0])));
+        self.entries.retain(|e| !(e.kind == "todo" && e.ids.iter().any(|x| dismissed.contains(x))));
         for t in todos.iter().filter(|t| !dismissed.contains(&t.id)) {
-            let idx = match self.entries.iter().position(|e| e.kind == "todo" && e.ids[0] == t.id) {
-                Some(i) => i,
-                None => {
-                    self.entries.push(Entry::blank("todo", false, &t.id, t.at));
-                    self.entries.len() - 1
-                }
+            let owner = match t.owner {
+                TodoOwner::You => "you",
+                TodoOwner::Them => "them",
             };
+            let by_id = self.entries.iter().position(|e| e.kind == "todo" && e.ids.contains(&t.id));
+            let norm = normalize_question(&t.text);
+            let by_text = || {
+                self.entries
+                    .iter()
+                    .position(|e| e.kind == "todo" && e.owner == owner && !norm.is_empty() && normalize_question(&e.lead) == norm)
+            };
+            let (idx, fresh) = match by_id {
+                Some(i) => (i, false),
+                None => match by_text() {
+                    Some(i) => {
+                        self.entries[i].ids.push(t.id.clone());
+                        (i, false)
+                    }
+                    None => {
+                        self.entries.push(Entry::blank("todo", false, &t.id, t.at));
+                        (self.entries.len() - 1, true)
+                    }
+                },
+            };
+            let merged = !fresh && !self.entries[idx].ids.is_empty() && self.entries[idx].ids[0] != t.id;
             let e = &mut self.entries[idx];
-            e.shown_ms = t.at;
+            if !merged {
+                e.shown_ms = t.at;
+                e.todo_call_time = Some(t.call_time);
+            }
             e.lead = t.text.clone();
             e.source = match t.origin {
                 TodoOrigin::Call => "call",
                 TodoOrigin::Typed => "typed",
             }
             .to_string();
-            e.owner = match t.owner {
-                TodoOwner::You => "you",
-                TodoOwner::Them => "them",
-            }
-            .to_string();
+            e.owner = owner.to_string();
             e.owner_name = t.who.clone();
             e.due = t.due.clone();
-            e.todo_call_time = Some(t.call_time);
             match &t.done {
                 Some(d) => {
                     e.answer = d.how.clone();
                     e.answered_how = "call".to_string();
                     e.todo_answered_call_time = Some(d.call_time);
                 }
-                None => {
+                // A merged later lane never un-does an earlier done state.
+                None if !merged => {
                     e.answer.clear();
                     e.answered_how.clear();
                     e.todo_answered_call_time = None;
                 }
+                None => {}
             }
         }
     }
@@ -789,6 +811,32 @@ mod tests {
         let items = c.finalize(0);
         assert_eq!((items[0].source.as_str(), items[0].owner.as_str(), items[0].owner_name.as_str()), ("typed", "them", "Marcus"));
         assert_eq!((items[0].answer.as_str(), items[0].answered_how.as_str(), items[0].answered_call_time), ("", "", None));
+    }
+
+    #[test]
+    fn a_todo_re_said_after_the_assistant_is_switched_off_and_on_saves_once() {
+        let mut c = HistoryCollector::default();
+        c.reset(0);
+        let first = todo("t1", TodoOwner::You, "Send the design doc", "", "", 2405.0, 2_405_000);
+        c.observe_asks(&with_todos(vec![first], vec![]), 2_406_000);
+        // New lane, new id, same owner and words (case and spacing differ),
+        // now done and with a due time.
+        let mut again = todo("t9", TodoOwner::You, "  send the  Design doc. ", "", "By Friday", 3000.0, 3_000_000);
+        again.done = Some(super::super::todo_list::TodoDone { how: "sent".into(), call_time: 3100.0, at: 3_100_000 });
+        c.observe_asks(&with_todos(vec![again.clone()], vec![]), 3_101_000);
+        let items = c.finalize(0);
+        assert_eq!(items.len(), 1, "one entry, not two");
+        assert_eq!((items[0].due.as_str(), items[0].answer.as_str()), ("By Friday", "sent"));
+        assert_eq!(items[0].call_time, 2405.0, "keeps when it was first said");
+        // The other owner with the same words is a different to-do.
+        let them = todo("t10", TodoOwner::Them, "Send the design doc", "Dana", "", 3200.0, 3_200_000);
+        c.observe_asks(&with_todos(vec![again, them], vec![]), 3_201_000);
+        assert_eq!(c.finalize(0).len(), 2);
+        // The new id is now an alias: dismissing it drops the entry it maps to.
+        c.observe_asks(&with_todos(vec![], vec!["t9"]), 3_300_000);
+        let left = c.finalize(0);
+        assert_eq!(left.len(), 1);
+        assert_eq!(left[0].owner, "them");
     }
 
     #[test]

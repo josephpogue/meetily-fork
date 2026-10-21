@@ -110,7 +110,7 @@ pub fn parse(raw: &str) -> Option<RawList> {
             }
         }
     }
-    if out.asks.is_empty() && out.for_you.is_empty() && out.done.is_empty() && out.todos.is_empty() && !saw_none {
+    if out.asks.is_empty() && out.for_you.is_empty() && out.done.is_empty() && !out.todos.seen && !saw_none {
         return None;
     }
     out.none = saw_none;
@@ -216,7 +216,7 @@ pub fn without_answered(list: &AskList, answered: &[AnsweredItem]) -> AskList {
 pub fn done_only(raw: &RawList) -> bool {
     raw.asks.is_empty()
         && raw.for_you.is_empty()
-        && (!raw.done.is_empty() || !raw.todos.is_empty())
+        && (!raw.done.is_empty() || raw.todos.seen)
         && !raw.none
 }
 
@@ -371,8 +371,20 @@ mod tests {
     }
 
     #[test]
-    fn a_todo_line_with_no_owner_does_not_make_a_reply_usable() {
-        assert_eq!(parse("TODO: Send it"), None);
+    fn a_reply_of_only_unusable_todo_lines_is_usable_and_changes_nothing() {
+        // Changed from "does not make a reply usable": a TODO-family line is
+        // recognised even when it cannot be used, so the turn is not failed.
+        for reply in ["TODO: Send it", "TODO: Send the export | OWNER: Joseph", "todo done:", "Not Todo:", "- TODO: x | OWNER: nobody"] {
+            let raw = parse(reply).expect(reply);
+            assert!(raw.todos.is_empty(), "{}", reply);
+            assert!(done_only(&raw), "{}", reply);
+        }
+        let prev = AskList {
+            asks: vec![AskItem { id: "a".into(), question: "Q?".into(), why: "w".into() }],
+            for_you: vec![],
+        };
+        let raw = parse("TODO: Send the export | OWNER: Joseph").unwrap();
+        assert_eq!(build(&prev, &mut Vec::new(), raw, &[], 1), prev);
     }
 
     #[test]

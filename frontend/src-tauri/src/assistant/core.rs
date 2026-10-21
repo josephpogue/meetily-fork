@@ -606,7 +606,9 @@ async fn rerun_asks(handle: &AssistantHandle) {
 
 pub async fn dismiss_ask(handle: &AssistantHandle, id: String) {
     let core = handle.0.lock().await;
-    if !core.ask_lane.dismiss(&id) {
+    // Between `recording-started` and the new lane the old lane is still
+    // installed; touching it would announce the old meeting to the new history.
+    if !core.session_open || !core.ask_lane.dismiss(&id) {
         return;
     }
     if core.session_open && core.enabled {
@@ -633,6 +635,15 @@ pub async fn answer_ask(handle: &AssistantHandle, id: String, answer: String) ->
 /// lists it as typed so the model never adds it again. The error text goes
 /// to the Ask box, so nothing is set on the status.
 pub async fn add_todo(handle: &AssistantHandle, text: String) -> Result<(), String> {
+    add_todo_at(handle, text, chrono::Utc::now().timestamp_millis()).await
+}
+
+/// `add_todo` with the clock passed in (epoch ms), so a test can set it. The
+/// to-do's call time is the recording clock now: seconds since the recording
+/// started (the collector's `opened_ms`, set on `recording-started`), never
+/// earlier than the newest utterance's start, and just that start when the
+/// recording start is unknown.
+async fn add_todo_at(handle: &AssistantHandle, text: String, now_ms: i64) -> Result<(), String> {
     let text = super::ask_list::collapse(&text);
     if text.is_empty() {
         return Err("Type the to-do after todo:".to_string());
@@ -641,14 +652,18 @@ pub async fn add_todo(handle: &AssistantHandle, text: String) -> Result<(), Stri
     if !core.session_open || !core.enabled {
         return Err("Start a recording with the assistant on to add a to-do.".to_string());
     }
-    core.ask_lane.add_todo(&text, core.transcript.latest_start());
+    let latest = core.transcript.latest_start();
+    let opened_ms = core.history.lock().unwrap().opened_ms();
+    let call_time = if opened_ms > 0 { latest.max((now_ms - opened_ms) as f64 / 1000.0) } else { latest };
+    core.ask_lane.add_todo(&text, call_time);
     Ok(())
 }
 
-/// Joseph dismissed a to-do. An unknown id changes nothing.
+/// Joseph dismissed a to-do. An unknown id, or no open session on the
+/// current lane (see `dismiss_ask`), changes nothing.
 pub async fn dismiss_todo(handle: &AssistantHandle, id: String) {
     let core = handle.0.lock().await;
-    if !core.ask_lane.dismiss_todo(&id) {
+    if !core.session_open || !core.ask_lane.dismiss_todo(&id) {
         return;
     }
     if core.session_open && core.enabled {
@@ -1936,6 +1951,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_typed_todo_is_stamped_with_the_recording_clock_not_the_last_utterance() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        handle.0.lock().await.transcript.ingest(&tu("mic", "ok", 18.0, 19.0));
+        let at = |h: &AssistantHandle, text: &str| {
+            h.0.try_lock().unwrap().ask_lane.snapshot().todos.iter().find(|t| t.text == text).unwrap().call_time
+        };
+
+        // No known recording start: the newest utterance's start.
+        history.lock().unwrap().reset(0);
+        add_todo_at(&handle, "No start known".to_string(), 5_000_000).await.unwrap();
+        assert_eq!(at(&handle, "No start known"), 18.0);
+
+        // Recording started at 1_000_000 ms; now is 150.5 s later.
+        history.lock().unwrap().reset(1_000_000);
+        add_todo_at(&handle, "Send Dana the runbook".to_string(), 1_150_500).await.unwrap();
+        assert_eq!(at(&handle, "Send Dana the runbook"), 150.5);
+
+        // A clock behind the newest utterance never goes earlier than it.
+        handle.0.lock().await.transcript.ingest(&tu("system", "late", 200.0, 201.0));
+        add_todo_at(&handle, "Book the venue".to_string(), 1_100_000).await.unwrap();
+        assert_eq!(at(&handle, "Book the venue"), 200.0);
+    }
+
+    #[tokio::test]
     async fn dismiss_todo_removes_it_and_tells_the_model_once() {
         let handle = AssistantHandle::new();
         let calls = Arc::new(StdMutex::new(Vec::new()));
@@ -2280,6 +2322,36 @@ mod tests {
         let items = history.lock().unwrap().finalize(50_000);
         let seen: Vec<_> = items.iter().map(|i| i.question.clone()).collect();
         assert_eq!(items.len(), 1, "only meeting 2's own item is saved, got {:?}", seen);
+    }
+
+    #[tokio::test]
+    async fn a_dismiss_or_add_between_recording_started_and_the_new_lane_leaks_nothing() {
+        let handle = AssistantHandle::new();
+        let history = handle.0.lock().await.history_handle_for_test();
+        {
+            let sink = history.clone();
+            handle.0.lock().await.ask_hooks.emit =
+                Arc::new(move |out| super::super::history::record_asks(&sink, &out));
+        }
+        let calls = Arc::new(StdMutex::new(Vec::new()));
+        history.lock().unwrap().reset(1_000); // meeting 1: recording-started
+        open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), ask_runner(calls)).await;
+        add_todo(&handle, "Send Dana the runbook".to_string()).await.unwrap();
+        add_todo(&handle, "Book the venue".to_string()).await.unwrap();
+        let ids: Vec<String> = handle.0.lock().await.ask_lane.snapshot().todos.iter().map(|t| t.id.clone()).collect();
+        close_session(&handle).await; // meeting 1: recording-stopped
+
+        // Meeting 2: recording-started has reset the collector, but the old
+        // lane is still installed until open_session replaces it.
+        history.lock().unwrap().reset(50_000);
+        dismiss_todo(&handle, ids[0].clone()).await;
+        assert_eq!(
+            add_todo(&handle, "Another".to_string()).await,
+            Err("Start a recording with the assistant on to add a to-do.".to_string())
+        );
+        assert_eq!(handle.0.lock().await.ask_lane.snapshot().todos.len(), 2, "the old lane was not touched");
+        assert!(history.lock().unwrap().is_empty(), "the fresh collector holds nothing from the old lane");
+        assert!(history.lock().unwrap().finalize(50_000).is_empty());
     }
 
     #[tokio::test]
