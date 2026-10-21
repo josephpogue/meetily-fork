@@ -15,6 +15,7 @@ use uuid::Uuid;
 use super::ask_lane::AsksOut;
 use super::ask_list::{AnswerHow, AnsweredItem, AskItem};
 use super::lanes::{CardKind, CardOut};
+use super::todo_list::{TodoItem, TodoOrigin, TodoOwner};
 use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
 
 pub type HistoryHandle = Arc<StdMutex<HistoryCollector>>;
@@ -45,6 +46,13 @@ struct Entry {
     answer: String,
     answered_how: String,
     answered_ms: Option<i64>,
+    /// To-do entries only: the call times arrive already on the recording's
+    /// audio scale, so they are kept as given and never derived from `shown_ms`.
+    todo_call_time: Option<f64>,
+    todo_answered_call_time: Option<f64>,
+    owner: String,
+    owner_name: String,
+    due: String,
 }
 
 impl Entry {
@@ -64,6 +72,11 @@ impl Entry {
             answer: String::new(),
             answered_how: String::new(),
             answered_ms: None,
+            todo_call_time: None,
+            todo_answered_call_time: None,
+            owner: String::new(),
+            owner_name: String::new(),
+            due: String::new(),
         }
     }
 }
@@ -142,13 +155,62 @@ impl HistoryCollector {
         for done in &out.answered {
             self.observe_answered(done);
         }
+        self.observe_todos(&out.todos, &out.dismissed_todos);
+    }
+
+    /// The to-dos of one emit: a dismissed id is dropped for good (it was a
+    /// wrong pick-up), every other id is upserted with the latest state. An
+    /// id missing from `todos` is left alone, so an empty emit removes nothing.
+    fn observe_todos(&mut self, todos: &[TodoItem], dismissed: &[String]) {
+        self.entries.retain(|e| !(e.kind == "todo" && dismissed.contains(&e.ids[0])));
+        for t in todos.iter().filter(|t| !dismissed.contains(&t.id)) {
+            let idx = match self.entries.iter().position(|e| e.kind == "todo" && e.ids[0] == t.id) {
+                Some(i) => i,
+                None => {
+                    self.entries.push(Entry::blank("todo", false, &t.id, t.at));
+                    self.entries.len() - 1
+                }
+            };
+            let e = &mut self.entries[idx];
+            e.shown_ms = t.at;
+            e.lead = t.text.clone();
+            e.source = match t.origin {
+                TodoOrigin::Call => "call",
+                TodoOrigin::Typed => "typed",
+            }
+            .to_string();
+            e.owner = match t.owner {
+                TodoOwner::You => "you",
+                TodoOwner::Them => "them",
+            }
+            .to_string();
+            e.owner_name = t.who.clone();
+            e.due = t.due.clone();
+            e.todo_call_time = Some(t.call_time);
+            match &t.done {
+                Some(d) => {
+                    e.answer = d.how.clone();
+                    e.answered_how = "call".to_string();
+                    e.todo_answered_call_time = Some(d.call_time);
+                }
+                None => {
+                    e.answer.clear();
+                    e.answered_how.clear();
+                    e.todo_answered_call_time = None;
+                }
+            }
+        }
     }
 
     /// The entry for an id seen before, else one in the same `kind` with the
     /// same wording: a gap question and a For-you question never merge.
     fn find_question(&self, id: &str, question: &str, kind: &str) -> Option<usize> {
         if !id.is_empty() {
-            if let Some(i) = self.entries.iter().position(|e| !e.is_card && e.ids.iter().any(|x| x == id)) {
+            if let Some(i) = self
+                .entries
+                .iter()
+                .position(|e| !e.is_card && e.kind != "todo" && e.ids.iter().any(|x| x == id))
+            {
                 return Some(i);
             }
         }
@@ -205,12 +267,14 @@ impl HistoryCollector {
             .iter()
             .filter(|e| !(e.is_card && e.lead.trim().is_empty()))
             .collect();
-        kept.sort_by_key(|e| e.shown_ms); // stable: ties keep first-seen order
+        let call_time = |e: &Entry| e.todo_call_time.unwrap_or_else(|| secs(e.shown_ms));
+        // Stable: ties keep first-seen order.
+        kept.sort_by(|a, b| call_time(a).total_cmp(&call_time(b)));
         kept.into_iter()
             .map(|e| AssistantItem {
                 id: Uuid::new_v4().to_string(),
                 kind: e.kind.clone(),
-                call_time: secs(e.shown_ms),
+                call_time: call_time(e),
                 shown_at: Utc
                     .timestamp_millis_opt(e.shown_ms)
                     .single()
@@ -225,7 +289,10 @@ impl HistoryCollector {
                 changed_lines: e.changed_lines.clone(),
                 answer: e.answer.clone(),
                 answered_how: e.answered_how.clone(),
-                answered_call_time: e.answered_ms.map(secs),
+                answered_call_time: e.todo_answered_call_time.or(e.answered_ms.map(secs)),
+                owner: e.owner.clone(),
+                owner_name: e.owner_name.clone(),
+                due: e.due.clone(),
             })
             .collect()
     }
@@ -648,5 +715,103 @@ mod tests {
         let h = seeded();
         assert_eq!(save_for_meeting(&pool, &h, "m1").await.unwrap(), 1);
         assert_eq!(AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap().len(), 1);
+    }
+
+    fn todo(id: &str, owner: TodoOwner, text: &str, who: &str, due: &str, call_time: f64, at: i64) -> TodoItem {
+        TodoItem {
+            id: id.into(),
+            text: text.into(),
+            owner,
+            who: who.into(),
+            due: due.into(),
+            origin: TodoOrigin::Call,
+            call_time,
+            at,
+            done: None,
+        }
+    }
+
+    fn with_todos(todos: Vec<TodoItem>, dismissed: Vec<&str>) -> AsksOut {
+        let mut out = asks_out(vec![], vec![], vec![]);
+        out.todos = todos;
+        out.dismissed_todos = dismissed.into_iter().map(String::from).collect();
+        out
+    }
+
+    fn collected_todos() -> HistoryCollector {
+        let mut c = HistoryCollector::default();
+        c.reset(0);
+        let t1 = todo("t1", TodoOwner::You, "Send the design doc", "", "By Friday", 2405.0, 2_405_000);
+        let t2 = todo("t2", TodoOwner::Them, "Send the export", "Marcus", "Monday", 2430.5, 2_430_500);
+        c.observe_asks(&with_todos(vec![t2.clone(), t1.clone()], vec![]), 2_431_000);
+        let mut t1_done = t1;
+        t1_done.done = Some(super::super::todo_list::TodoDone {
+            how: "said he sent it".into(),
+            call_time: 2530.0,
+            at: 2_530_000,
+        });
+        c.observe_asks(&with_todos(vec![t1_done], vec!["t2"]), 2_531_000);
+        c
+    }
+
+    #[test]
+    fn a_done_todo_saves_once_and_a_dismissed_one_never_does() {
+        let items = collected_todos().finalize(1_000_000);
+        assert_eq!(items.len(), 1);
+        let t = &items[0];
+        assert_eq!(t.kind, "todo");
+        assert_eq!(t.lead, "Send the design doc");
+        assert_eq!(t.call_time, 2405.0); // kept as given, not recomputed from `at`
+        assert_eq!((t.owner.as_str(), t.owner_name.as_str(), t.due.as_str()), ("you", "", "By Friday"));
+        assert_eq!(t.source, "call");
+        assert_eq!(t.answer, "said he sent it");
+        assert_eq!(t.answered_how, "call");
+        assert_eq!(t.answered_call_time, Some(2530.0));
+        assert!(t.question.is_empty() && t.why.is_empty() && t.phase.is_empty());
+        assert!(t.bullets.is_empty() && t.changed_lines.is_empty());
+    }
+
+    #[test]
+    fn an_empty_todos_emit_removes_nothing() {
+        let mut c = collected_todos();
+        c.observe_asks(&with_todos(vec![], vec![]), 3_000_000);
+        assert_eq!(c.finalize(0).len(), 1);
+    }
+
+    #[test]
+    fn an_open_todo_saves_with_no_answer_and_typed_origin() {
+        let mut c = HistoryCollector::default();
+        let mut t = todo("t1", TodoOwner::Them, "Send the export", "Marcus", "Monday", 2430.5, 2_430_500);
+        t.origin = TodoOrigin::Typed;
+        c.observe_asks(&with_todos(vec![t], vec![]), 0);
+        let items = c.finalize(0);
+        assert_eq!((items[0].source.as_str(), items[0].owner.as_str(), items[0].owner_name.as_str()), ("typed", "them", "Marcus"));
+        assert_eq!((items[0].answer.as_str(), items[0].answered_how.as_str(), items[0].answered_call_time), ("", "", None));
+    }
+
+    #[test]
+    fn todos_do_not_leak_into_the_next_session() {
+        let mut c = collected_todos();
+        c.reset(5);
+        assert!(c.is_empty());
+    }
+
+    #[tokio::test]
+    async fn todo_fields_reach_the_rows_and_assistant_json() {
+        let pool = test_pool().await;
+        let dir = tempfile::tempdir().unwrap();
+        add_meeting(&pool, "m1", Some(dir.path().to_str().unwrap())).await;
+        let h = new_handle();
+        h.lock().unwrap().reset(1_000_000);
+        let t = todo("t2", TodoOwner::Them, "Send the export", "Marcus", "Monday", 2430.5, 2_430_500);
+        record_asks(&h, &with_todos(vec![t], vec![]));
+        assert_eq!(save_for_meeting(&pool, &h, "m1").await.unwrap(), 1);
+        let rows = AssistantItemsRepository::list_for_meeting(&pool, "m1").await.unwrap();
+        assert_eq!((rows[0].owner.as_str(), rows[0].owner_name.as_str(), rows[0].due.as_str()), ("them", "Marcus", "Monday"));
+        let file: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.path().join("assistant.json")).unwrap()).unwrap();
+        assert_eq!(file["items"][0]["owner"], "them");
+        assert_eq!(file["items"][0]["ownerName"], "Marcus");
+        assert_eq!(file["items"][0]["due"], "Monday");
     }
 }

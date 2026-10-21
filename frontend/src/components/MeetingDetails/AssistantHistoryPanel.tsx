@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useRef, useState } from 'react';
+import { ClipboardList } from 'lucide-react';
 import type { MeetingAssistantItem, MeetingAssistantKind } from '@/types';
 import { cn } from '@/lib/utils';
 import { meetingAssistantService } from '@/services/meetingAssistantService';
@@ -90,6 +91,103 @@ function Item({ item }: { item: MeetingAssistantItem }) {
   );
 }
 
+const CHIP_BASE =
+  'inline-flex h-5 shrink-0 items-center gap-1 whitespace-nowrap rounded-full text-xs font-semibold leading-none ring-1 ring-inset';
+
+function OwnerPill({ owner }: { owner: 'you' | 'them' }) {
+  return owner === 'you' ? (
+    <span className="inline-flex h-[18px] shrink-0 items-center justify-center rounded-full bg-rose-600 px-2 text-[11px] font-bold leading-none text-white">
+      You
+    </span>
+  ) : (
+    <span className="inline-flex h-[18px] shrink-0 items-center justify-center rounded-full bg-white px-2 text-[11px] font-bold leading-none text-gray-700 ring-1 ring-inset ring-gray-300">
+      Them
+    </span>
+  );
+}
+
+function TodoColumn({
+  owner,
+  title,
+  todos,
+  className,
+}: {
+  owner: 'you' | 'them';
+  title: string;
+  todos: MeetingAssistantItem[];
+  className?: string;
+}) {
+  const open = todos.filter((t) => t.answeredHow === '');
+  const done = todos.filter((t) => t.answeredHow !== '');
+  return (
+    <div className={cn('min-w-0 px-3 py-2.5', className)}>
+      <div className="flex items-center gap-2 pb-1">
+        <OwnerPill owner={owner} />
+        <h3 className="text-xs font-semibold text-gray-700">{title}</h3>
+      </div>
+      <ul className="flex list-none flex-col p-0">
+        {open.map((t) => (
+          <li key={t.id} className="border-t border-gray-100 py-1.5 first:border-t-0">
+            <p className="break-words text-sm font-medium leading-snug text-gray-900">{t.lead}</p>
+            <p className="mt-0.5 text-xs tabular-nums text-gray-600">
+              {owner === 'them' && t.ownerName && <>{t.ownerName} &middot; </>}
+              {t.due && (
+                <>
+                  <b className="font-semibold text-gray-800">{t.due}</b> &middot;{' '}
+                </>
+              )}
+              {formatRecordingTime(t.callTime)}
+            </p>
+          </li>
+        ))}
+      </ul>
+      {done.length > 0 && (
+        <>
+          <div className="flex items-center gap-2 pb-1 pt-3">
+            <h4 className="text-xs font-semibold text-gray-700">Done</h4>
+            <span className="text-xs tabular-nums text-gray-600">{done.length}</span>
+          </div>
+          <ul className="flex list-none flex-col p-0">
+            {done.map((t) => (
+              <li key={t.id} className="border-t border-gray-100 py-1.5 first:border-t-0">
+                <p className="break-words text-sm leading-snug text-gray-600">{t.lead}</p>
+                <p className="mt-0.5 text-xs tabular-nums text-gray-600">
+                  Done{t.answeredCallTime !== null && <> {formatRecordingTime(t.answeredCallTime)}</>}
+                  {t.answer && <> &middot; {t.answer}</>}
+                </p>
+              </li>
+            ))}
+          </ul>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** The saved to-dos of a call: what Joseph promised and what the other side owes him. */
+function TodoLedger({ todos }: { todos: MeetingAssistantItem[] }) {
+  return (
+    <section aria-label="To do" className="overflow-hidden rounded-xl border border-rose-200 bg-white">
+      <div className="flex items-center gap-2 border-b border-rose-100 bg-rose-50 px-3 py-2">
+        <span className={cn(CHIP_BASE, 'bg-rose-50 pl-1.5 pr-2 text-rose-700 ring-rose-200')}>
+          <ClipboardList aria-hidden="true" className="h-3 w-3" />
+          To do
+        </span>
+        <span className="text-xs text-rose-900">{todos.length} from this call. Kept here only, never sent.</span>
+      </div>
+      <div className="grid grid-cols-2">
+        <TodoColumn owner="you" title="You promised" todos={todos.filter((t) => t.owner === 'you')} />
+        <TodoColumn
+          owner="them"
+          title="They owe you"
+          todos={todos.filter((t) => t.owner !== 'you')}
+          className="border-l border-gray-200"
+        />
+      </div>
+    </section>
+  );
+}
+
 type LoadState = 'loading' | 'ready' | 'failed';
 
 /** What the live assistant showed during one past call, in call-time order, with a way to delete it. */
@@ -140,6 +238,9 @@ export function AssistantHistoryPanel({ meetingId }: { meetingId: string }) {
     }
   }, [meetingId]);
 
+  const todos = items.filter((item) => item.kind === 'todo');
+  const others = items.filter((item) => item.kind !== 'todo');
+
   return (
     <div className="flex min-h-0 min-w-0 flex-1 flex-col bg-white">
       <div className="flex shrink-0 items-center justify-between gap-3 border-b border-gray-200 px-4 py-3">
@@ -172,11 +273,22 @@ export function AssistantHistoryPanel({ meetingId }: { meetingId: string }) {
           <p className="text-sm text-gray-600">No assistant items were saved for this meeting.</p>
         )}
         {state === 'ready' && items.length > 0 && (
-          <ol className="grid list-none gap-2.5 p-0">
-            {items.map((item) => (
-              <Item key={item.id} item={item} />
-            ))}
-          </ol>
+          <>
+            {todos.length > 0 && <TodoLedger todos={todos} />}
+            {todos.length > 0 && others.length > 0 && (
+              <div className="mb-2.5 mt-4 flex items-center gap-2 text-xs font-semibold text-gray-600">
+                Everything the assistant showed, in call order
+                <span aria-hidden="true" className="h-px flex-1 bg-gray-200" />
+              </div>
+            )}
+            {others.length > 0 && (
+              <ol className="grid list-none gap-2.5 p-0">
+                {others.map((item) => (
+                  <Item key={item.id} item={item} />
+                ))}
+              </ol>
+            )}
+          </>
         )}
       </div>
       <Dialog open={confirming} onOpenChange={(open) => { if (!deleting) setConfirming(open); }}>

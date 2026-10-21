@@ -42,6 +42,7 @@ function item(id: string, kind: string, callTime: number, extra: Record<string, 
   return {
     id, kind, callTime, shownAt: '2026-10-20T17:34:21.030Z', question: '', lead: `lead ${id}`, bullets: [],
     why: '', source: '', phase: 'checked', changedLines: [], answer: '', answeredHow: '', answeredCallTime: null,
+    owner: '', ownerName: '', due: '',
     ...extra,
   };
 }
@@ -90,6 +91,44 @@ describe('AssistantHistoryPanel', () => {
     }
     expect(text).toContain('it is open');
     expect(text).toContain('Assistant6');
+  });
+
+  test('shows a two-column To do ledger above the call-order list, and todos are not in the list', async () => {
+    stored = [
+      item('t1', 'todo', 2405, { lead: 'Send the design doc', owner: 'you', due: 'By Friday', source: 'call' }),
+      item('t2', 'todo', 2430, { lead: 'Send the export', owner: 'them', ownerName: 'Marcus', due: 'Monday', source: 'call' }),
+      item('t3', 'todo', 2170, {
+        lead: 'Check the licence count', owner: 'you', source: 'call',
+        answer: 'said it was checked', answeredHow: 'call', answeredCallTime: 2530,
+      }),
+      item('q', 'question', 600),
+    ];
+    await mount();
+    const ledger = renderer.root.findByProps({ 'aria-label': 'To do' });
+    const text = textOf(ledger);
+    expect(text).toContain('3 from this call. Kept here only, never sent.');
+    const [left, right] = ledger.findAll((n) => n.type === 'div' && String(n.props.className ?? '').startsWith('min-w-0 px-3'));
+    expect(textOf(left)).toContain('You promised');
+    expect(textOf(left)).toContain('Send the design doc');
+    expect(textOf(left)).toContain('By Friday');
+    expect(textOf(left)).toContain('[40:05]');
+    expect(textOf(left)).toContain('Done1');
+    expect(textOf(left)).toContain('Done [42:10] \u00b7 said it was checked');
+    expect(textOf(left)).not.toContain('Send the export');
+    expect(textOf(right)).toContain('They owe you');
+    expect(textOf(right)).toContain('Marcus \u00b7 Monday \u00b7 [40:30]');
+    // The call-order list holds only the question, and the ledger sits above it.
+    const list = renderer.root.findAll((n) => n.type === 'ol')[0];
+    expect(textOf(list)).toContain('lead q');
+    expect(textOf(list)).not.toContain('Send the design doc');
+    expect(allText().indexOf('3 from this call')).toBeLessThan(allText().indexOf('lead q'));
+  });
+
+  test('a meeting with no todos shows no ledger', async () => {
+    stored = [item('q', 'question', 600)];
+    await mount();
+    expect(renderer.root.findAllByProps({ 'aria-label': 'To do' })).toHaveLength(0);
+    expect(allText()).not.toContain('from this call');
   });
 
   test('shows the answer line of an answered question', async () => {
