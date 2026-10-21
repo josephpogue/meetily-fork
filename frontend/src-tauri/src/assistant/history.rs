@@ -268,8 +268,10 @@ impl HistoryCollector {
             .filter(|e| !(e.is_card && e.lead.trim().is_empty()))
             .collect();
         let call_time = |e: &Entry| e.todo_call_time.unwrap_or_else(|| secs(e.shown_ms));
-        // Stable: ties keep first-seen order.
-        kept.sort_by(|a, b| call_time(a).total_cmp(&call_time(b)));
+        // Ties (for example items shown before the recording start, which
+        // clamp to 0) fall back to when they were shown; stable after that,
+        // so equal ones keep first-seen order.
+        kept.sort_by(|a, b| call_time(a).total_cmp(&call_time(b)).then(a.shown_ms.cmp(&b.shown_ms)));
         kept.into_iter()
             .map(|e| AssistantItem {
                 id: Uuid::new_v4().to_string(),
