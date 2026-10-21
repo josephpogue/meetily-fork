@@ -314,3 +314,13 @@ export interface MeetingAssistantItem {
   // When it is due, as the call said it.
   due: string;
 }
+
+/** What a past meeting's Assistant tab shows besides its items (api_get_meeting_assistant_meta). */
+export interface MeetingAssistantMeta {
+  /** The call brief; '' when the meeting has none. */
+  brief: string;
+  /** Where the meeting was filed in the vault; null while it is not filed. */
+  vaultProject: string | null;
+  vaultNotePath: string | null;
+  filedAt: string | null;
+}
