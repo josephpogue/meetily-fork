@@ -45,13 +45,13 @@ pub struct ClaudeTurn {
     pub safe_mode: bool,
     /// Extra directories the turn may read.
     pub add_dirs: Vec<PathBuf>,
-    /// Pictures of the Zoom window that ride inside this turn's message.
+    /// Pictures of the Zoom or Teams window that ride inside this turn's message.
     /// Empty means the turn is exactly what it was before: the prompt is a
     /// positional argument and stdin is null. With images the prompt and the
     /// pictures go in one stream-json user message on stdin.
     pub images: Vec<ImageBlock>,
     /// A short caption written before each image (same order as `images`),
-    /// for example "Zoom window at 10:15:02:". A missing entry means no caption.
+    /// for example "Zoom window at 10:15:02:" or "Teams window at 10:15:02:". A missing entry means no caption.
     pub image_labels: Vec<String>,
 }
 

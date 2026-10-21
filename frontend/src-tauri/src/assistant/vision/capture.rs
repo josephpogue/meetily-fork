@@ -1,20 +1,44 @@
 // assistant/vision/capture.rs
 //
-// The capture task: finds the Zoom meeting window, grabs it about once a
-// second, keeps changed frames, saves them and records them in a FrameStore.
+// The capture task: finds the Zoom (or else the Teams) meeting window, grabs
+// it about once a second, keeps changed frames, saves them and records them
+// in a FrameStore.
 
 use std::path::PathBuf;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
-use super::store::FrameStore;
+use super::store::{CallApp, FrameStore};
 
 /// Zoom's bundle id on macOS.
 const ZOOM_BUNDLE_ID: &str = "us.zoom.xos";
-/// A Zoom window smaller than this (points) is a popover, not the meeting.
+/// Microsoft Teams: the new app, then classic Teams.
+const TEAMS_BUNDLE_IDS: [&str; 2] = ["com.microsoft.teams2", "com.microsoft.teams"];
+/// A Zoom or Teams window smaller than this (points) is a popover, not the meeting.
 const ZOOM_MIN_WIDTH: f64 = 400.0;
 const ZOOM_MIN_HEIGHT: f64 = 300.0;
+/// The sections Teams' main window starts its title with ("Chat | Acme |
+/// Microsoft Teams"). A meeting window has none of them.
+const TEAMS_SECTIONS: [&str; 17] = [
+    "activity",
+    "chat",
+    "teams",
+    "calendar",
+    "calls",
+    "onedrive",
+    "files",
+    "apps",
+    "copilot",
+    "communities",
+    "people",
+    "assignments",
+    "help",
+    "settings",
+    "search",
+    "viva engage",
+    "approvals",
+];
 /// Kept frames are saved at this JPEG quality, full size.
 const SAVE_QUALITY: f64 = 0.9;
 /// One grab never takes longer than this before the loop gives up and retries.
@@ -83,8 +107,8 @@ impl WindowTarget {
         }
     }
 
-    /// True for the production Zoom target, which has the meeting-window
-    /// rules; any other target takes its largest matching window.
+    /// True for the production target (Zoom, else Teams), which has the
+    /// meeting-window rules; any other target takes its largest matching window.
     fn is_zoom(&self) -> bool {
         self.bundle_id.as_deref() == Some(ZOOM_BUNDLE_ID)
             && self.app_name.is_none()
@@ -94,8 +118,10 @@ impl WindowTarget {
 
 #[derive(Debug, Clone)]
 pub struct CaptureConfig {
-    /// Kept frames are written here full-size. Created on first keep.
+    /// Kept Zoom frames are written here full-size. Created on first keep.
     pub frames_dir: PathBuf,
+    /// Kept Teams frames are written here. Created on first Teams keep.
+    pub teams_frames_dir: PathBuf,
     pub target: WindowTarget,
     /// Between grabs while the window is there (about 1s).
     pub interval: Duration,
@@ -104,9 +130,10 @@ pub struct CaptureConfig {
 }
 
 impl CaptureConfig {
-    pub fn new(frames_dir: PathBuf) -> Self {
+    pub fn new(frames_dir: PathBuf, teams_frames_dir: PathBuf) -> Self {
         Self {
             frames_dir,
+            teams_frames_dir,
             target: WindowTarget::from_env_or_zoom(),
             interval: Duration::from_secs(1),
             retry_interval: Duration::from_secs(5),
@@ -183,8 +210,52 @@ fn is_zoom_meeting(w: &WindowInfo) -> bool {
         && !contains_ci(&w.title, "chat")
 }
 
-/// Titles of Zoom's titled windows, for the "Zoom is open but no meeting
-/// window" log line.
+fn is_teams(w: &WindowInfo) -> bool {
+    TEAMS_BUNDLE_IDS.contains(&w.bundle_id.as_str())
+}
+
+/// A Teams main window title: "Microsoft Teams" alone, or a navigation
+/// section before " | " ("Chat | Acme | Microsoft Teams").
+fn is_teams_main_title(title: &str) -> bool {
+    let t = title.trim();
+    if t.eq_ignore_ascii_case("microsoft teams") {
+        return true;
+    }
+    match t.split_once(" | ") {
+        Some((section, _)) => {
+            let section = section.trim().to_lowercase();
+            TEAMS_SECTIONS.contains(&section.as_str())
+        }
+        None => false,
+    }
+}
+
+/// A Teams meeting window: Teams' own window, big enough, with a title that
+/// is neither the main window's, a control bar nor a notification. A blank
+/// title is refused: Teams keeps several big untitled helper windows.
+fn is_teams_meeting(w: &WindowInfo) -> bool {
+    is_teams(w)
+        && w.layer == 0
+        && w.width >= ZOOM_MIN_WIDTH
+        && w.height >= ZOOM_MIN_HEIGHT
+        && !w.title.trim().is_empty()
+        && !is_teams_main_title(&w.title)
+        && !contains_ci(&w.title, "sharing control bar")
+        && !contains_ci(&w.title, "notification")
+}
+
+/// Which app a chosen window belongs to. A test override pointed at some
+/// other app is filed with Zoom, like before.
+fn call_app(w: &WindowInfo) -> CallApp {
+    if is_teams(w) {
+        CallApp::Teams
+    } else {
+        CallApp::Zoom
+    }
+}
+
+/// Titles of Zoom's titled windows, for the "open but no meeting window"
+/// log line.
 fn zoom_titles(windows: &[WindowInfo]) -> Vec<String> {
     let mut t: Vec<String> = windows
         .iter()
@@ -194,6 +265,39 @@ fn zoom_titles(windows: &[WindowInfo]) -> Vec<String> {
     t.sort();
     t.dedup();
     t
+}
+
+/// Titles of Teams' titled windows, for the same log line.
+fn teams_titles(windows: &[WindowInfo]) -> Vec<String> {
+    let mut t: Vec<String> = windows
+        .iter()
+        .filter(|w| is_teams(w) && w.layer == 0 && !w.title.trim().is_empty())
+        .map(|w| w.title.clone())
+        .collect();
+    t.sort();
+    t.dedup();
+    t
+}
+
+/// Window titles of the call apps that are open, shown while no meeting
+/// window is found.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct OpenTitles {
+    zoom: Vec<String>,
+    teams: Vec<String>,
+}
+
+impl OpenTitles {
+    fn of(windows: &[WindowInfo]) -> Self {
+        Self {
+            zoom: zoom_titles(windows),
+            teams: teams_titles(windows),
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.zoom.is_empty() && self.teams.is_empty()
+    }
 }
 
 /// Index of the window to capture, or None when there is no (meeting) window.
@@ -212,15 +316,20 @@ fn choose_window(target: &WindowTarget, windows: &[WindowInfo]) -> Option<usize>
         // never a chat window. Not required to be on screen, so a full-screen
         // Zoom on another Space still counts (a grab of a minimized one fails
         // and lands in the quiet retry). Visible windows win over hidden ones.
-        let meeting: Vec<usize> = (0..windows.len())
-            .filter(|&i| is_zoom_meeting(&windows[i]))
-            .collect();
-        let visible: Vec<usize> = meeting
-            .iter()
-            .copied()
-            .filter(|&i| windows[i].on_screen)
-            .collect();
-        return largest(if visible.is_empty() { meeting } else { visible });
+        // A Zoom meeting window always wins; only without one does a Teams
+        // meeting window count, chosen the same way.
+        let pick = |is_meeting: fn(&WindowInfo) -> bool| {
+            let meeting: Vec<usize> = (0..windows.len())
+                .filter(|&i| is_meeting(&windows[i]))
+                .collect();
+            let visible: Vec<usize> = meeting
+                .iter()
+                .copied()
+                .filter(|&i| windows[i].on_screen)
+                .collect();
+            largest(if visible.is_empty() { meeting } else { visible })
+        };
+        return pick(is_zoom_meeting).or_else(|| pick(is_teams_meeting));
     }
 
     if target.bundle_id.is_none() && target.app_name.is_none() {
@@ -249,14 +358,19 @@ fn choose_window(target: &WindowTarget, windows: &[WindowInfo]) -> Option<usize>
     largest(matching)
 }
 
-/// Saved frames sort by time: `zoom-20261014-101502-123.jpg`.
-fn frame_file_name(captured_at_ms: i64) -> String {
+/// Saved frames sort by time: `zoom-20261014-101502-123.jpg`,
+/// `teams-20261014-101502-123.jpg`.
+fn frame_file_name(app: CallApp, captured_at_ms: i64) -> String {
     use chrono::TimeZone;
     let t = chrono::Local
         .timestamp_millis_opt(captured_at_ms)
         .single()
         .unwrap_or_else(chrono::Local::now);
-    format!("zoom-{}.jpg", t.format("%Y%m%d-%H%M%S-%3f"))
+    let prefix = match app {
+        CallApp::Zoom => "zoom",
+        CallApp::Teams => "teams",
+    };
+    format!("{}-{}.jpg", prefix, t.format("%Y%m%d-%H%M%S-%3f"))
 }
 
 // ---------------------------------------------------------------------------
@@ -267,11 +381,11 @@ fn frame_file_name(captured_at_ms: i64) -> String {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum State {
     NoPermission,
-    /// No window yet. Holds Zoom's window titles when Zoom is open but none
-    /// of them is a meeting window.
-    NoWindow(Vec<String>),
+    /// No window yet. Holds the window titles of Zoom and Teams when one of
+    /// them is open but none of its windows is a meeting window.
+    NoWindow(OpenTitles),
     Failed(String),
-    Capturing(String),
+    Capturing(CallApp, String),
 }
 
 fn log_state(state: &State) {
@@ -283,11 +397,14 @@ fn log_state(state: &State) {
             log::info!("vision: no window to capture yet, waiting")
         }
         State::NoWindow(titles) => log::info!(
-            "vision: Zoom is open but none of its windows is a meeting window, waiting. Zoom windows: {:?}",
-            titles
+            "vision: Zoom or Teams is open but none of its windows is a meeting window, waiting. Zoom windows: {:?}. Teams windows: {:?}",
+            titles.zoom,
+            titles.teams
         ),
         State::Failed(e) => log::info!("vision: capture failed, will retry: {}", e),
-        State::Capturing(title) => log::info!("vision: capturing window \"{}\"", title),
+        State::Capturing(app, title) => {
+            log::info!("vision: capturing {} window \"{}\"", app.name(), title)
+        }
     }
 }
 
@@ -309,9 +426,9 @@ async fn run(cfg: CaptureConfig, store: FrameStore, token: CancellationToken) {
                     mac::Outcome::NoPermission => (State::NoPermission, None, cfg.retry_interval),
                     mac::Outcome::NoWindow(t) => (State::NoWindow(t), None, cfg.retry_interval),
                     mac::Outcome::Failed(e) => (State::Failed(e), None, cfg.retry_interval),
-                    mac::Outcome::Seen { title, kept } => (
-                        State::Capturing(title),
-                        kept,
+                    mac::Outcome::Seen { app, title, kept } => (
+                        State::Capturing(app, title),
+                        kept.map(|k| (app, k)),
                         cfg.interval.saturating_sub(started.elapsed()),
                     ),
                 }
@@ -323,14 +440,18 @@ async fn run(cfg: CaptureConfig, store: FrameStore, token: CancellationToken) {
                 cfg.retry_interval,
             ),
         };
+        // Every grabbed meeting window's title is kept for naming the meeting.
+        if let State::Capturing(app, title) = &state {
+            store.record_title(*app, title);
+        }
         if last.as_ref() != Some(&state) {
             log_state(&state);
             last = Some(state);
         }
         // Pushed even after a stop: the frame is already on disk, and stopping
         // only means no new grabs.
-        if let Some((path, ms)) = kept {
-            store.push(path, ms);
+        if let Some((app, (path, ms))) = kept {
+            store.push_from(app, path, ms);
         }
         tokio::select! {
             _ = token.cancelled() => break,
@@ -352,16 +473,17 @@ mod mac {
     use tokio::runtime::Handle;
     use super::super::change::{ChangeFilter, Frame, PixelOrder};
     use super::super::encode::mac::{jpeg_bytes, Bitmap};
-    use super::{choose_window, frame_file_name, zoom_titles, CaptureConfig, WindowInfo, WindowTarget};
+    use super::{call_app, choose_window, frame_file_name, CallApp, CaptureConfig, OpenTitles, WindowInfo, WindowTarget};
     use super::{GRAB_TIMEOUT, SAVE_QUALITY};
 
     #[derive(Clone)]
     pub enum Outcome {
         NoPermission,
-        NoWindow(Vec<String>),
+        NoWindow(OpenTitles),
         Failed(String),
         /// A grab worked. `kept` is the saved file when the frame was kept.
         Seen {
+            app: CallApp,
             title: String,
             kept: Option<(PathBuf, i64)>,
         },
@@ -371,6 +493,7 @@ mod mac {
     pub struct Pipeline {
         filter: ChangeFilter,
         frames_dir: PathBuf,
+        teams_frames_dir: PathBuf,
         target: WindowTarget,
     }
 
@@ -384,6 +507,7 @@ mod mac {
             Self {
                 filter: ChangeFilter::new(),
                 frames_dir: cfg.frames_dir.clone(),
+                teams_frames_dir: cfg.teams_frames_dir.clone(),
                 target: cfg.target.clone(),
             }
         }
@@ -408,8 +532,8 @@ mod mac {
                     .await
                     .unwrap_or_else(|_| Err("the window grab timed out".to_string()))
             });
-            let (title, image) = match grabbed {
-                Ok(Grab::Got(title, image)) => (title, image),
+            let (app, title, image) = match grabbed {
+                Ok(Grab::Got(app, title, image)) => (app, title, image),
                 Ok(Grab::NoWindow(titles)) => return Outcome::NoWindow(titles),
                 Err(e) => return Outcome::Failed(e),
             };
@@ -429,13 +553,14 @@ mod mac {
             };
             let verdict = self.filter.observe(&frame);
             if !verdict.kept {
-                return Outcome::Seen { title, kept: None };
+                return Outcome::Seen { app, title, kept: None };
             }
-            match self.save(&image, captured_at_ms) {
+            match self.save(app, &image, captured_at_ms) {
                 Ok(k) => {
                     // Only a saved frame counts as kept for later dedup.
                     self.filter.commit_kept();
                     Outcome::Seen {
+                        app,
                         title,
                         kept: Some(k),
                     }
@@ -444,10 +569,15 @@ mod mac {
             }
         }
 
-        fn save(&self, image: &cg::Image, ms: i64) -> Result<(PathBuf, i64), String> {
-            std::fs::create_dir_all(&self.frames_dir)
-                .map_err(|e| format!("cannot create {}: {}", self.frames_dir.display(), e))?;
-            let path = self.frames_dir.join(frame_file_name(ms));
+        fn save(&self, app: CallApp, image: &cg::Image, ms: i64) -> Result<(PathBuf, i64), String> {
+            // Each app has its own folder, made on its first saved frame.
+            let dir = match app {
+                CallApp::Zoom => &self.frames_dir,
+                CallApp::Teams => &self.teams_frames_dir,
+            };
+            std::fs::create_dir_all(dir)
+                .map_err(|e| format!("cannot create {}: {}", dir.display(), e))?;
+            let path = dir.join(frame_file_name(app, ms));
             let bytes = jpeg_bytes(image, SAVE_QUALITY)?;
             std::fs::write(&path, bytes)
                 .map_err(|e| format!("cannot write {}: {}", path.display(), e))?;
@@ -456,9 +586,9 @@ mod mac {
     }
 
     enum Grab {
-        Got(String, arc::R<cg::Image>),
-        /// No window to capture; holds Zoom's titles when Zoom is open.
-        NoWindow(Vec<String>),
+        Got(CallApp, String, arc::R<cg::Image>),
+        /// No window to capture; holds the titles of Zoom and Teams windows.
+        NoWindow(OpenTitles),
     }
 
     /// Finds the target window and grabs it at full pixel size.
@@ -469,7 +599,7 @@ mod mac {
         let windows = content.windows();
         let infos: Vec<WindowInfo> = windows.iter().map(info_of).collect();
         let Some(idx) = choose_window(target, &infos) else {
-            let titles = if target.is_zoom() { zoom_titles(&infos) } else { Vec::new() };
+            let titles = if target.is_zoom() { OpenTitles::of(&infos) } else { OpenTitles::default() };
             return Ok(Grab::NoWindow(titles));
         };
         let window = &windows[idx];
@@ -482,7 +612,7 @@ mod mac {
             (frame.size.height as f64 * scale).round() as usize,
         );
         if w == 0 || h == 0 {
-            return Ok(Grab::NoWindow(Vec::new()));
+            return Ok(Grab::NoWindow(OpenTitles::default()));
         }
         let mut cfg = sc::StreamCfg::new();
         cfg.set_width(w);
@@ -492,7 +622,7 @@ mod mac {
         let image = sc::ScreenshotManager::capture_image(&filter, &cfg)
             .await
             .map_err(|e| format!("cannot grab the window: {:?}", e))?;
-        Ok(Grab::Got(infos[idx].title.clone(), image))
+        Ok(Grab::Got(call_app(&infos[idx]), infos[idx].title.clone(), image))
     }
 
     fn info_of(w: &sc::Window) -> WindowInfo {
@@ -624,11 +754,130 @@ mod tests {
         );
     }
 
+    const T: &str = "com.microsoft.teams2";
+
+    #[test]
+    fn teams_meeting_window_is_chosen_when_there_is_no_zoom_meeting() {
+        let ws = vec![
+            win(T, "Chat | Broadcom | Microsoft Teams", 1600.0, 1000.0),
+            win(Z, "Zoom Workplace", 1600.0, 1000.0),
+            win(T, "Storage roadmap review | Microsoft Teams", 1200.0, 800.0),
+            win("com.apple.Safari", "Meeting notes", 2000.0, 1200.0),
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(2));
+        assert_eq!(call_app(&ws[2]), CallApp::Teams);
+        assert_eq!(call_app(&win(Z, "Zoom Meeting", 900.0, 600.0)), CallApp::Zoom);
+    }
+
+    #[test]
+    fn classic_teams_bundle_counts_too() {
+        let ws = vec![win("com.microsoft.teams", "Standup | Microsoft Teams", 900.0, 600.0)];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(0));
+    }
+
+    #[test]
+    fn teams_main_window_is_never_chosen() {
+        let ws = vec![
+            win(T, "Chat | Broadcom | Microsoft Teams", 1600.0, 1000.0),
+            win(T, "Microsoft Teams", 1600.0, 1000.0),
+            win(T, "Activity | Kubernetes Level Up Program: Session #4 (External) | Microsoft Teams", 1400.0, 800.0),
+            win(T, "Calendar | Microsoft Teams", 1400.0, 800.0),
+            win(T, "Copilot | Microsoft Teams", 1400.0, 800.0),
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), None);
+        assert_eq!(
+            teams_titles(&ws).len(),
+            5,
+            "the log line still lists them so a wrong rule is visible"
+        );
+    }
+
+    #[test]
+    fn teams_non_meeting_windows_are_never_chosen() {
+        let ws = vec![
+            win(T, "Storage roadmap review | Microsoft Teams", 300.0, 200.0),
+            win(T, "Sharing control bar | Microsoft Teams", 900.0, 600.0),
+            win(T, "Notification", 900.0, 600.0),
+            win(T, "", 500.0, 500.0),
+            win("com.microsoft.teams2.helper", "Storage review | Microsoft Teams", 900.0, 600.0),
+            WindowInfo { layer: 25, ..win(T, "Storage review | Microsoft Teams", 900.0, 600.0) },
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), None);
+    }
+
+    #[test]
+    fn teams_visible_beats_hidden_then_largest() {
+        let hidden_big = WindowInfo {
+            on_screen: false,
+            ..win(T, "Big hidden | Microsoft Teams", 1800.0, 1100.0)
+        };
+        let ws = vec![
+            hidden_big,
+            win(T, "Small visible | Microsoft Teams", 800.0, 500.0),
+            win(T, "Large visible | Microsoft Teams", 1200.0, 800.0),
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(2));
+    }
+
+    #[test]
+    fn a_zoom_meeting_wins_over_a_bigger_teams_meeting() {
+        let ws = vec![
+            win(T, "Storage roadmap review | Microsoft Teams", 1900.0, 1100.0),
+            win(Z, "Zoom Meeting", 900.0, 600.0),
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(1));
+        // A hidden Zoom meeting still wins over a visible Teams one.
+        let ws = vec![
+            win(T, "Storage roadmap review | Microsoft Teams", 1900.0, 1100.0),
+            WindowInfo { on_screen: false, ..win(Z, "Zoom Meeting", 900.0, 600.0) },
+        ];
+        assert_eq!(choose_window(&WindowTarget::zoom(), &ws), Some(1));
+    }
+
+    #[test]
+    fn an_override_target_ignores_the_teams_rules() {
+        let ws = vec![win(T, "Chat | Microsoft Teams", 1600.0, 1000.0)];
+        let t = WindowTarget::from_overrides(Some("com.microsoft.teams2"), None);
+        assert_eq!(choose_window(&t, &ws), Some(0));
+    }
+
+    #[test]
+    fn teams_frame_file_name_matches_zoom_for_the_same_instant() {
+        use chrono::TimeZone;
+        let ms = chrono::Local
+            .with_ymd_and_hms(2026, 10, 14, 10, 15, 2)
+            .unwrap()
+            .timestamp_millis()
+            + 123;
+        assert_eq!(
+            frame_file_name(CallApp::Teams, ms),
+            "teams-20261014-101502-123.jpg"
+        );
+        assert_eq!(
+            frame_file_name(CallApp::Zoom, ms),
+            "zoom-20261014-101502-123.jpg"
+        );
+    }
+
+    #[test]
+    fn open_titles_list_both_apps() {
+        let ws = vec![
+            win(Z, "Zoom Workplace", 1600.0, 1000.0),
+            win(T, "Chat | Broadcom | Microsoft Teams", 1600.0, 1000.0),
+            win(T, "", 500.0, 500.0),
+        ];
+        let o = OpenTitles::of(&ws);
+        assert_eq!(o.zoom, vec!["Zoom Workplace"]);
+        assert_eq!(o.teams, vec!["Chat | Broadcom | Microsoft Teams"]);
+        assert!(!o.is_empty());
+        assert!(OpenTitles::of(&[]).is_empty());
+    }
+
     #[test]
     fn frame_names_sort_by_time() {
-        let a = frame_file_name(1_700_000_000_123);
-        let b = frame_file_name(1_700_000_000_456);
-        let c = frame_file_name(1_700_000_061_000);
+        let a = frame_file_name(CallApp::Zoom, 1_700_000_000_123);
+        let b = frame_file_name(CallApp::Zoom, 1_700_000_000_456);
+        let c = frame_file_name(CallApp::Zoom, 1_700_000_061_000);
         assert!(a < b && b < c, "{a} {b} {c}");
         assert!(a.starts_with("zoom-") && a.ends_with(".jpg"));
     }
@@ -636,7 +885,7 @@ mod tests {
     #[tokio::test]
     async fn start_returns_at_once_and_stops_on_stop() {
         let dir = tempfile::tempdir().unwrap();
-        let mut cfg = CaptureConfig::new(dir.path().join("frames"));
+        let mut cfg = CaptureConfig::new(dir.path().join("frames"), dir.path().join("teams-frames"));
         cfg.target = WindowTarget {
             bundle_id: Some("com.example.nothing".to_string()),
             app_name: None,
@@ -739,7 +988,7 @@ mod tests {
 
         let dir = tempfile::tempdir().unwrap();
         let frames = dir.path().join("frames");
-        let mut cfg = CaptureConfig::new(frames.clone());
+        let mut cfg = CaptureConfig::new(frames.clone(), dir.path().join("teams-frames"));
         cfg.target = WindowTarget {
             bundle_id: Some("com.apple.Preview".to_string()),
             app_name: None,

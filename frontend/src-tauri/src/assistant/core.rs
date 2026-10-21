@@ -1486,7 +1486,7 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
     open_lanes_with(handle, cfg, seed, brief, runner).await;
 }
 
-/// The Settings switch "see the Zoom window", applied to a running call.
+/// The Settings switch "see the Zoom or Teams window", applied to a running call.
 /// Off: stop the capture, empty and drop the store, take the frames away
 /// from both lanes. On, with a session open and no capture running: start
 /// one and hand its feed to both lanes. Without a session it only records
@@ -1498,7 +1498,7 @@ pub async fn apply_see_zoom_window(handle: &AssistantHandle, on: bool) {
             (core.app.clone(), core.session_open && core.capture.is_none())
         };
         if wanted {
-            zoom_frames_dir(app.as_ref()).await
+            frames_dirs(app.as_ref()).await
         } else {
             None
         }
@@ -1509,7 +1509,11 @@ pub async fn apply_see_zoom_window(handle: &AssistantHandle, on: bool) {
 }
 
 /// `apply_see_zoom_window` with the frames folder already resolved.
-async fn apply_see_zoom_window_in(handle: &AssistantHandle, on: bool, dir: Option<PathBuf>) {
+async fn apply_see_zoom_window_in(
+    handle: &AssistantHandle,
+    on: bool,
+    dirs: Option<(PathBuf, PathBuf)>,
+) {
     let mut core = handle.0.lock().await;
     core.settings.see_zoom_window = on;
     if !on {
@@ -1524,42 +1528,49 @@ async fn apply_see_zoom_window_in(handle: &AssistantHandle, on: bool, dir: Optio
     if !core.session_open || core.capture.is_some() {
         return;
     }
-    let Some(dir) = dir else {
-        log::warn!("assistant: no folder for Zoom frames, running without sight");
+    let Some((zoom_dir, teams_dir)) = dirs else {
+        log::warn!("assistant: no folder for call frames, running without sight");
         return;
     };
     let store = FrameStore::new();
-    core.capture = Some(capture::start(CaptureConfig::new(dir), store.clone()));
+    core.capture = Some(capture::start(
+        CaptureConfig::new(zoom_dir, teams_dir),
+        store.clone(),
+    ));
     core.frames = Some(store.clone());
     let feed = FrameFeed::new(store);
     core.lanes.set_frames(Some(feed.clone()));
     core.ask_lane.set_frames(Some(feed));
 }
 
-/// Where this recording's kept Zoom frames are saved: `zoom-frames` inside
-/// the meeting folder, or when the folder is not known yet, `zoom-frames/
-/// <date_time>` under the app data dir. Never the temp session dir.
-async fn zoom_frames_dir(app: Option<&AppHandle<Wry>>) -> Option<PathBuf> {
+/// Where this recording's kept frames are saved, as (Zoom folder, Teams
+/// folder): `zoom-frames` and `teams-frames` inside the meeting folder, or
+/// when the folder is not known yet, `zoom-frames/<date_time>` and
+/// `teams-frames/<date_time>` under the app data dir. Never the temp session
+/// dir. A folder is only made when its first frame is saved.
+async fn frames_dirs(app: Option<&AppHandle<Wry>>) -> Option<(PathBuf, PathBuf)> {
     if let Ok(Some(folder)) = crate::audio::recording_commands::get_meeting_folder_path().await {
-        return Some(PathBuf::from(folder).join("zoom-frames"));
+        let folder = PathBuf::from(folder);
+        return Some((folder.join("zoom-frames"), folder.join("teams-frames")));
     }
     let base = app?.path().app_data_dir().ok()?;
-    Some(
-        base.join("zoom-frames")
-            .join(chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string()),
-    )
+    let stamp = chrono::Local::now().format("%Y-%m-%d_%H%M%S").to_string();
+    Some((
+        base.join("zoom-frames").join(&stamp),
+        base.join("teams-frames").join(&stamp),
+    ))
 }
 
 /// Makes this recording's frame store and starts the capture task (it
 /// returns at once). A missing folder only means no frames: the assistant
 /// carries on without sight.
 async fn start_capture(handle: &AssistantHandle, app: Option<&AppHandle<Wry>>) {
-    let Some(dir) = zoom_frames_dir(app).await else {
-        log::warn!("assistant: no folder for Zoom frames, running without sight");
+    let Some((zoom_dir, teams_dir)) = frames_dirs(app).await else {
+        log::warn!("assistant: no folder for call frames, running without sight");
         return;
     };
     let store = FrameStore::new();
-    let capture = capture::start(CaptureConfig::new(dir), store.clone());
+    let capture = capture::start(CaptureConfig::new(zoom_dir, teams_dir), store.clone());
     let mut core = handle.0.lock().await;
     core.frames = Some(store);
     core.capture = Some(capture);
@@ -2064,7 +2075,7 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("meetily-zoom-switch-{}", uuid::Uuid::new_v4()));
 
         // On, session open, no capture: one starts and the lanes get the feed.
-        apply_see_zoom_window_in(&handle, true, Some(dir.clone())).await;
+        apply_see_zoom_window_in(&handle, true, Some((dir.clone(), dir.join("teams-frames")))).await;
         {
             let core = handle.0.lock().await;
             assert!(core.capture.is_some());
@@ -2073,7 +2084,7 @@ mod tests {
         }
 
         // On again: nothing restarts.
-        apply_see_zoom_window_in(&handle, true, Some(dir.clone())).await;
+        apply_see_zoom_window_in(&handle, true, Some((dir.clone(), dir.join("teams-frames")))).await;
         assert!(handle.0.lock().await.capture.is_some());
 
         // Off: capture stopped, store emptied and dropped, lanes blind.
@@ -2090,7 +2101,7 @@ mod tests {
     #[tokio::test]
     async fn the_zoom_switch_does_nothing_to_capture_without_a_session() {
         let handle = AssistantHandle::new();
-        apply_see_zoom_window_in(&handle, true, Some(std::env::temp_dir())).await;
+        apply_see_zoom_window_in(&handle, true, Some((std::env::temp_dir(), std::env::temp_dir()))).await;
         let core = handle.0.lock().await;
         assert!(core.capture.is_none() && core.frames.is_none());
     }
