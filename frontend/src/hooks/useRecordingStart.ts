@@ -5,6 +5,8 @@ import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useConfig } from '@/contexts/ConfigContext';
 import { useRecordingState, RecordingStatus } from '@/contexts/RecordingStateContext';
 import { recordingService } from '@/services/recordingService';
+import { callAudioStore, AUTO_START_CALL_APP_KEY } from '@/services/meetingDetectService';
+import type { CallApp } from '@/types';
 import Analytics from '@/lib/analytics';
 import { showRecordingNotification } from '@/lib/recordingNotification';
 import {
@@ -16,6 +18,10 @@ import { toast } from 'sonner';
 
 // How long a sidebar auto-start request stays valid.
 const AUTO_START_MAX_AGE_MS = 15000;
+
+// A card's Record from another page names its app in sessionStorage; the picker value covers the rest.
+const takeAutoStartCallApp = (stored: string | null): CallApp | null =>
+  stored === 'zoom' || stored === 'teams' ? stored : callAudioStore.get();
 
 const TRANSCRIPTION_RUNTIME_START_ERROR_CODE = 'TRANSCRIPTION_RUNTIME_INITIALIZATION_FAILED';
 const TRANSCRIPTION_RUNTIME_USER_MESSAGE = 'Speech recognition could not initialize. Restart Meetily. If the problem continues, repair or reinstall the app.';
@@ -160,10 +166,12 @@ export function useRecordingStart(
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
+      const callApp = callAudioStore.get();
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
-        randomTitle
+        randomTitle,
+        callApp
       );
       console.log('Backend recording started successfully');
 
@@ -218,6 +226,8 @@ export function useRecordingStart(
         // sidebar set it. A bare 'true' could survive webview state restoration
         // and auto-start a ghost recording on the next launch.
         const flag = sessionStorage.getItem('autoStartRecording');
+        const autoStartCallApp = sessionStorage.getItem(AUTO_START_CALL_APP_KEY);
+        sessionStorage.removeItem(AUTO_START_CALL_APP_KEY);
         sessionStorage.removeItem('autoStartRecording'); // Single use, always
         const requestedAt = flag ? Number(flag) : NaN;
         const isFresh = Number.isFinite(requestedAt) && Date.now() - requestedAt < AUTO_START_MAX_AGE_MS;
@@ -260,11 +270,14 @@ export function useRecordingStart(
             setStatus(RecordingStatus.STARTING, 'Initializing recording...');
 
             console.log('Auto-starting backend recording with meeting:', generatedMeetingTitle);
+            const callApp = takeAutoStartCallApp(autoStartCallApp);
             const result = await recordingService.startRecordingWithDevices(
               selectedDevices?.micDevice || null,
               selectedDevices?.systemDevice || null,
-              generatedMeetingTitle
+              generatedMeetingTitle,
+              callApp
             );
+            callAudioStore.set(callApp);
             console.log('Auto-start backend recording result:', result);
 
             // Update UI state after successful backend start
@@ -318,7 +331,10 @@ export function useRecordingStart(
 
   // Listen for direct recording trigger from sidebar when already on home page
   useEffect(() => {
-    const handleDirectStart = async () => {
+    const handleDirectStart = async (event?: Event) => {
+      // A meeting card's Record names its app in the event; the sidebar and tray use the picker.
+      const detail = (event as CustomEvent<{ callApp?: CallApp } | null> | undefined)?.detail;
+      const callApp: CallApp | null = detail?.callApp ?? callAudioStore.get();
       if (isRecording || isAutoStarting) {
         console.log('Recording already in progress, ignoring direct start event');
         return;
@@ -361,8 +377,10 @@ export function useRecordingStart(
         const result = await recordingService.startRecordingWithDevices(
           selectedDevices?.micDevice || null,
           selectedDevices?.systemDevice || null,
-          generatedMeetingTitle
+          generatedMeetingTitle,
+          callApp
         );
+        callAudioStore.set(callApp);
         console.log('Backend recording result:', result);
 
         // Update UI state after successful backend start

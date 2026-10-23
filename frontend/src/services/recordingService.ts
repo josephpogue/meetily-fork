@@ -7,6 +7,7 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, UnlistenFn } from '@tauri-apps/api/event';
+import type { CallApp } from '@/types';
 
 export interface RecordingState {
   is_recording: boolean;
@@ -76,8 +77,8 @@ export class RecordingService {
    * Start recording (no device configuration)
    * @returns Promise<void>
    */
-  async startRecording(): Promise<void> {
-    return withStartTimeout(invoke('start_recording'));
+  async startRecording(callApp: CallApp | null = null): Promise<void> {
+    return withStartTimeout(invoke('start_recording', { callApp }));
   }
 
   /**
@@ -85,19 +86,22 @@ export class RecordingService {
    * @param micDeviceName - Microphone device name (null for default)
    * @param systemDeviceName - System audio device name (null for default)
    * @param meetingName - Meeting name/title
+   * @param callApp - Record only this call app's sound (null for all apps)
    * @returns Promise<void>
    */
   async startRecordingWithDevices(
     micDeviceName: string | null,
     systemDeviceName: string | null,
-    meetingName: string
+    meetingName: string,
+    callApp: CallApp | null = null
   ): Promise<void> {
     // Tauri v2 renames command arguments to camelCase, so snake_case keys here
     // deserialize as None and silently drop the devices and the meeting name.
     return withStartTimeout(invoke('start_recording_with_devices_and_meeting', {
       micDeviceName,
       systemDeviceName,
-      meetingName
+      meetingName,
+      callApp
     }));
   }
 
