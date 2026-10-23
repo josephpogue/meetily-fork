@@ -120,6 +120,7 @@ export function MeetingPrompt() {
             <button
               type="button"
               onClick={() => record(c.app)}
+              aria-label={`Record ${c.label} meeting`}
               className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-red-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2"
             >
               Record {c.label} meeting

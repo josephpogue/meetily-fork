@@ -40,6 +40,7 @@ pub mod api;
 pub mod assistant;
 pub mod audio;
 pub mod config;
+mod meeting_detect;
 pub mod meeting_saved;
 pub mod console_utils;
 pub mod database;
@@ -539,6 +540,7 @@ pub fn run() {
         .manage(assistant_history.clone())
         .manage(assistant::AssistantHandle::with_history(assistant_history))
         .setup(|_app| {
+            meeting_detect::start(_app.handle());
             #[cfg(target_os = "windows")]
             match _app.path().resolve(
                 "onnxruntime.dll",
@@ -715,6 +717,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            meeting_detect::meeting_detect_dismiss,
+            meeting_detect::meeting_detect_current,
             start_recording,
             stop_recording,
             is_recording,
