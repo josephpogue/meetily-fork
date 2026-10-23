@@ -58,7 +58,8 @@ audio/
 ├── capture/                   # Audio stream capture
 │   ├── microphone.rs          # Microphone capture stream
 │   ├── system.rs              # System audio capture stream
-│   └── core_audio.rs          # macOS ScreenCaptureKit integration
+│   └── core_audio.rs          # macOS Core Audio process tap (global, or one call app's processes)
+├── call_apps.rs               # Zoom/Teams registry, Core Audio process list, which processes belong to which app
 ├── pipeline.rs                # Audio mixing and VAD processing
 ├── recording_manager.rs       # High-level recording coordination
 ├── recording_commands.rs      # Tauri command interface
@@ -71,6 +72,7 @@ audio/
 - Audio capture issues → `capture/microphone.rs` or `capture/system.rs`
 - Mixing/processing problems → `pipeline.rs`
 - Recording workflow → `recording_manager.rs`
+- One call app's sound → `call_apps.rs` (ownership: the process's executable sits inside the running app's bundle) and `capture/core_audio.rs` (`new_for_app`; the choice is held in `RecordingState.call_app`, the tap's process list is re-resolved every 2 s and set in place). No app chosen means the global tap.
 
 ## Rust to Frontend Communication (Tauri Architecture)
 
