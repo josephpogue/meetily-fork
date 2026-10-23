@@ -52,3 +52,6 @@ Decisions Joseph has made for this version. Every feature follows them.
 - Gap questions and Ask follow the answer cards: a fast answer shows first and the deep model, with read-only access to the vault, replaces or corrects it. The fast lane runs at medium effort.
 - A new meeting is named from its call window title, kept whole (a ": <name> 1:1" tail stays, since it says who the call is with); only app chrome such as " - Zoom" is dropped.
 - Each meeting shows what it saved (times, length, pictures, disk space) and the meeting list shows totals. The keep rule for pictures stays as it is.
+- When a Zoom or Teams call starts, the app shows a macOS notification naming the app ("Zoom meeting started", "Teams meeting started") with a way to record that meeting. Each app is tracked on its own, so two calls in two apps give two notifications. The detection follows Fluid Voice's approach, written fresh for the fork: Fluid Voice is GPL-3 and the fork is MIT, so none of its code is used.
+- One recording at a time. While recording, the app does not prompt for other meetings, as Fluid Voice does. Recording two meetings side by side is a later step.
+- A recording started from a detected meeting records only that app's sound, plus the microphone. A manual start records every app's sound by default, and a Call audio picker can narrow it to Zoom or Teams.

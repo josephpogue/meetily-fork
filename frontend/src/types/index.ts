@@ -324,3 +324,21 @@ export interface MeetingAssistantMeta {
   vaultNotePath: string | null;
   filedAt: string | null;
 }
+
+// Call apps Meetily can detect and record on their own (meeting-detect feature).
+export type CallApp = 'zoom' | 'teams';
+export type CallAppLabel = 'Zoom' | 'Teams';
+
+/** Payload of `meeting-detected`, `meeting-detect-record` and the rows of `meeting_detect_current`. */
+export interface MeetingDetectedPayload {
+  app: CallApp;
+  label: CallAppLabel;
+  title: string | null;
+}
+
+/** Row of `list_call_apps`. */
+export interface CallAppStatus {
+  id: CallApp;
+  label: CallAppLabel;
+  running: boolean;
+}

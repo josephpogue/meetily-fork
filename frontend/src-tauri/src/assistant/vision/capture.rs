@@ -16,8 +16,8 @@ const ZOOM_BUNDLE_ID: &str = "us.zoom.xos";
 /// Microsoft Teams: the new app, then classic Teams.
 const TEAMS_BUNDLE_IDS: [&str; 2] = ["com.microsoft.teams2", "com.microsoft.teams"];
 /// A Zoom or Teams window smaller than this (points) is a popover, not the meeting.
-const ZOOM_MIN_WIDTH: f64 = 400.0;
-const ZOOM_MIN_HEIGHT: f64 = 300.0;
+pub(crate) const ZOOM_MIN_WIDTH: f64 = 400.0;
+pub(crate) const ZOOM_MIN_HEIGHT: f64 = 300.0;
 /// The sections Teams' main window starts its title with ("Chat | Acme |
 /// Microsoft Teams"). A meeting window has none of them.
 const TEAMS_SECTIONS: [&str; 34] = [
@@ -198,14 +198,14 @@ pub fn start(cfg: CaptureConfig, store: FrameStore) -> CaptureHandle {
 
 /// What the window choice needs to know about one on-screen-capable window.
 #[derive(Debug, Clone)]
-struct WindowInfo {
-    bundle_id: String,
-    app_name: String,
-    title: String,
-    layer: i64,
-    on_screen: bool,
-    width: f64,
-    height: f64,
+pub(crate) struct WindowInfo {
+    pub(crate) bundle_id: String,
+    pub(crate) app_name: String,
+    pub(crate) title: String,
+    pub(crate) layer: i64,
+    pub(crate) on_screen: bool,
+    pub(crate) width: f64,
+    pub(crate) height: f64,
 }
 
 impl WindowInfo {
@@ -218,7 +218,7 @@ fn contains_ci(hay: &str, needle: &str) -> bool {
     hay.to_lowercase().contains(&needle.to_lowercase())
 }
 
-fn is_zoom_meeting(w: &WindowInfo) -> bool {
+pub(crate) fn is_zoom_meeting(w: &WindowInfo) -> bool {
     w.bundle_id == ZOOM_BUNDLE_ID
         && w.layer == 0
         && w.width >= ZOOM_MIN_WIDTH
@@ -227,7 +227,7 @@ fn is_zoom_meeting(w: &WindowInfo) -> bool {
         && !contains_ci(&w.title, "chat")
 }
 
-fn is_teams(w: &WindowInfo) -> bool {
+pub(crate) fn is_teams(w: &WindowInfo) -> bool {
     TEAMS_BUNDLE_IDS.contains(&w.bundle_id.as_str())
 }
 
@@ -250,7 +250,7 @@ fn is_teams_main_title(title: &str) -> bool {
 /// A Teams meeting window: Teams' own window, big enough, with a title that
 /// is neither the main window's, a control bar nor a notification. A blank
 /// title is refused: Teams keeps several big untitled helper windows.
-fn is_teams_meeting(w: &WindowInfo) -> bool {
+pub(crate) fn is_teams_meeting(w: &WindowInfo) -> bool {
     is_teams(w)
         && w.layer == 0
         && w.width >= ZOOM_MIN_WIDTH
@@ -482,6 +482,17 @@ async fn run(_cfg: CaptureConfig, _store: FrameStore, _token: CancellationToken)
     log::info!("vision: window capture is only available on macOS");
 }
 
+/// Every window ScreenCaptureKit lists, or why it cannot (no Screen Recording grant).
+#[cfg(target_os = "macos")]
+pub(crate) async fn list_windows() -> Result<Vec<WindowInfo>, String> {
+    mac::list_windows().await
+}
+
+#[cfg(not(target_os = "macos"))]
+pub(crate) async fn list_windows() -> Result<Vec<WindowInfo>, String> {
+    Ok(Vec::new())
+}
+
 #[cfg(target_os = "macos")]
 mod mac {
     use std::path::PathBuf;
@@ -640,6 +651,19 @@ mod mac {
             .await
             .map_err(|e| format!("cannot grab the window: {:?}", e))?;
         Ok(Grab::Got(call_app(&infos[idx]), infos[idx].title.clone(), image))
+    }
+
+    pub async fn list_windows() -> Result<Vec<WindowInfo>, String> {
+        // Preflight never shows the permission prompt.
+        // SAFETY: CGPreflightScreenCaptureAccess takes no arguments and only reads the permission state.
+        if !unsafe { CGPreflightScreenCaptureAccess() } {
+            return Err("Screen Recording is not granted".to_string());
+        }
+        let content = tokio::time::timeout(GRAB_TIMEOUT, sc::ShareableContent::current())
+            .await
+            .map_err(|_| "the window listing timed out".to_string())?
+            .map_err(|e| format!("cannot list windows: {:?}", e))?;
+        Ok(content.windows().iter().map(info_of).collect())
     }
 
     fn info_of(w: &sc::Window) -> WindowInfo {

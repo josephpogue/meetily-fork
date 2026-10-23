@@ -225,6 +225,12 @@ impl RecordingManager {
     /// * `microphone_device` - Optional microphone device to use
     /// * `system_device` - Optional system audio device to use
     /// * `auto_save` - Whether to save audio checkpoints (true) or just transcripts/metadata (false)
+    /// Record only this call app's sound on the system side (None: all system audio).
+    /// Call before `start_recording`.
+    pub(crate) fn set_call_app(&self, app: Option<super::call_apps::CallAppId>) {
+        self.state.set_call_app(app);
+    }
+
     pub(crate) async fn start_recording(
         &mut self,
         microphone_device: Option<Arc<AudioDevice>>,

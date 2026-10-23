@@ -37,6 +37,20 @@ pub struct AudioStream {
 // SAFETY: AudioStream contains StreamBackend which we've marked as Send
 unsafe impl Send for AudioStream {}
 
+/// Which path the system stream takes on macOS. A recording for one call app always uses the
+/// Core Audio app tap, whatever the backend setting says: the other backends can only capture all
+/// apps, and an app recording must never fall back to that silently. With no app chosen the
+/// backend setting decides, as before. The microphone never uses Core Audio.
+#[cfg(target_os = "macos")]
+fn use_core_audio_path(
+    device_type: &DeviceType,
+    backend: AudioCaptureBackend,
+    call_app: Option<super::call_apps::CallAppId>,
+) -> bool {
+    *device_type == DeviceType::System
+        && (backend == AudioCaptureBackend::CoreAudio || call_app.is_some())
+}
+
 impl AudioStream {
     /// Create a new audio stream for the given device
     pub async fn create(
@@ -64,8 +78,15 @@ impl AudioStream {
         // For system audio devices, use the selected backend
         // For microphone devices, always use CPAL
         #[cfg(target_os = "macos")]
-        let use_core_audio = device_type == DeviceType::System
-            && backend_type == AudioCaptureBackend::CoreAudio;
+        let use_core_audio = use_core_audio_path(&device_type, backend_type, state.call_app());
+
+        #[cfg(target_os = "macos")]
+        if device_type == DeviceType::System
+            && state.call_app().is_some()
+            && backend_type != AudioCaptureBackend::CoreAudio
+        {
+            info!("🎵 Stream: a call app was chosen, so its Core Audio app tap overrides the {:?} backend setting", backend_type);
+        }
 
         #[cfg(not(target_os = "macos"))]
         let use_core_audio = false;
@@ -152,7 +173,14 @@ impl AudioStream {
 
         // Create Core Audio capture
         info!("🔊 Stream: Calling CoreAudioCapture::new()...");
-        let capture_impl = CoreAudioCapture::new()
+        // The call app is held in the recording state, so a re-created stream taps the same app.
+        let capture_impl = match state.call_app() {
+            Some(app) => CoreAudioCapture::new_for_app(app),
+            None => {
+                info!("System audio: all apps");
+                CoreAudioCapture::new()
+            }
+        }
             .map_err(|e| {
                 error!("❌ Stream: CoreAudioCapture::new() failed: {}", e);
                 anyhow::anyhow!("Failed to create Core Audio capture: {}", e)
@@ -490,6 +518,35 @@ impl Drop for AudioStreamManager {
     fn drop(&mut self) {
         if let Err(e) = self.stop_streams() {
             error!("Error stopping streams during drop: {}", e);
+        }
+    }
+}
+#[cfg(all(test, target_os = "macos"))]
+mod backend_choice_tests {
+    use super::*;
+    use crate::audio::call_apps::CallAppId;
+
+    const BACKENDS: [AudioCaptureBackend; 2] =
+        [AudioCaptureBackend::CoreAudio, AudioCaptureBackend::ScreenCaptureKit];
+
+    #[test]
+    fn app_recording_uses_core_audio_whatever_the_backend_setting() {
+        for backend in BACKENDS {
+            assert!(use_core_audio_path(&DeviceType::System, backend, Some(CallAppId::Zoom)));
+        }
+    }
+
+    #[test]
+    fn no_app_keeps_the_backend_setting() {
+        assert!(use_core_audio_path(&DeviceType::System, AudioCaptureBackend::CoreAudio, None));
+        assert!(!use_core_audio_path(&DeviceType::System, AudioCaptureBackend::ScreenCaptureKit, None));
+    }
+
+    #[test]
+    fn microphone_never_uses_core_audio() {
+        for backend in BACKENDS {
+            assert!(!use_core_audio_path(&DeviceType::Microphone, backend, Some(CallAppId::Teams)));
+            assert!(!use_core_audio_path(&DeviceType::Microphone, backend, None));
         }
     }
 }

@@ -40,6 +40,7 @@ pub mod api;
 pub mod assistant;
 pub mod audio;
 pub mod config;
+mod meeting_detect;
 pub mod meeting_saved;
 pub mod console_utils;
 pub mod database;
@@ -145,8 +146,9 @@ async fn start_recording<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    call_app: Option<String>,
 ) -> Result<(), String> {
-    log_info!("🔥 CALLED start_recording with meeting: {:?}", meeting_name);
+    log_info!("🔥 CALLED start_recording with meeting: {:?}, call app: {:?}", meeting_name, call_app);
     log_info!(
         "📋 Backend received parameters - mic: {:?}, system: {:?}, meeting: {:?}",
         mic_device_name,
@@ -164,6 +166,7 @@ async fn start_recording<R: Runtime>(
         mic_device_name,
         system_device_name,
         meeting_name.clone(),
+        call_app,
     )
     .await
     {
@@ -359,7 +362,7 @@ async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
 }
 
 #[tauri::command]
@@ -368,6 +371,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    call_app: Option<String>,
 ) -> Result<(), String> {
     log_info!("🚀 CALLED start_recording_with_devices_and_meeting - Mic: {:?}, System: {:?}, Meeting: {:?}",
              mic_device_name, system_device_name, meeting_name);
@@ -377,7 +381,8 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Call the recording module functions that support meeting names
     let recording_result = match (mic_device_name.clone(), system_device_name.clone()) {
-        (None, None) => {
+        // A call app choice needs the devices path, which carries it; defaults resolve the same.
+        (None, None) if call_app.is_none() => {
             log_info!(
                 "No devices specified, starting with defaults and meeting: {:?}",
                 meeting_name
@@ -397,6 +402,7 @@ async fn start_recording_with_devices_and_meeting<R: Runtime>(
                 mic_device_name,
                 system_device_name,
                 meeting_name,
+                call_app,
             )
             .await
         }
@@ -534,6 +540,7 @@ pub fn run() {
         .manage(assistant_history.clone())
         .manage(assistant::AssistantHandle::with_history(assistant_history))
         .setup(|_app| {
+            meeting_detect::start(_app.handle());
             #[cfg(target_os = "windows")]
             match _app.path().resolve(
                 "onnxruntime.dll",
@@ -710,6 +717,8 @@ pub fn run() {
             }
         })
         .invoke_handler(tauri::generate_handler![
+            meeting_detect::meeting_detect_dismiss,
+            meeting_detect::meeting_detect_current,
             start_recording,
             stop_recording,
             is_recording,
@@ -784,6 +793,7 @@ pub fn run() {
             trigger_microphone_permission,
             start_recording_with_devices,
             start_recording_with_devices_and_meeting,
+            audio::call_apps::list_call_apps,
             start_audio_level_monitoring,
             stop_audio_level_monitoring,
             is_audio_level_monitoring,

@@ -23,6 +23,7 @@ import { loadBetaFeatures } from '@/types/betaFeatures'
 import { DownloadProgressToastProvider } from '@/components/shared/DownloadProgressToast'
 import { UpdateCheckProvider } from '@/components/UpdateCheckProvider'
 import { RecordingPostProcessingProvider } from '@/contexts/RecordingPostProcessingProvider'
+import { MeetingPrompt } from '@/components/MeetingPrompt'
 import { ImportAudioDialog, ImportDropOverlay } from '@/components/ImportAudio'
 import { ImportDialogProvider } from '@/contexts/ImportDialogContext'
 import { isAudioExtension, getAudioFormatsDisplayList } from '@/constants/audioFormats'
@@ -258,6 +259,7 @@ export default function RootLayout({
                                     <MainContent>{children}</MainContent>
                                   </div>
                                 )}
+                                <MeetingPrompt suppressed={showOnboarding} />
                                 {/* Import audio overlay and dialog */}
                                 <ImportDropOverlay visible={showDropOverlay} />
                                 <ConditionalImportDialog
