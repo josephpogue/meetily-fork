@@ -115,9 +115,9 @@ pub fn signals(
             if let Some(w) = windows.iter().find(|w| is_teams_meeting(w)) {
                 s.meeting_window = true;
                 s.title = clean(app, &w.title);
-            } else if let Some(w) = windows.iter().find(|w| is_plain_teams_window(w)) {
+            } else if windows.iter().any(is_plain_teams_window) {
+                // A plain window is not a meeting: its title ("Chat | Acme") is never shown.
                 s.plain_window = true;
-                s.title = clean(app, &w.title);
             }
         }
     }
@@ -172,6 +172,14 @@ mod tests {
         let s = signals(CallAppId::Teams, true, None, Some(&call));
         assert!(s.meeting_window && !s.plain_window);
         assert_eq!(s.title.as_deref(), Some("Design review"));
+    }
+
+    #[test]
+    fn teams_plain_window_never_gives_a_title() {
+        let main = [win("com.microsoft.teams2", "Chat | Acme | Microsoft Teams")];
+        let s = signals(CallAppId::Teams, true, Some("com.microsoft.teams2"), Some(&main));
+        assert!(s.plain_window);
+        assert_eq!(s.title, None);
     }
 
     #[test]

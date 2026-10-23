@@ -10,7 +10,7 @@ pub mod rules;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, Runtime, State};
@@ -23,12 +23,13 @@ const TICK: Duration = Duration::from_secs(2);
 /// Tracker plus the clock its whole-second times come from.
 pub struct DetectState {
     inner: Mutex<Rules>,
-    started: Instant,
 }
 
 impl DetectState {
+    /// Wall-clock seconds, so a 30-minute dismissal keeps counting while the Mac sleeps
+    /// (a monotonic Instant stops during sleep on macOS).
     fn now(&self) -> u64 {
-        self.started.elapsed().as_secs()
+        SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs())
     }
 }
 
@@ -50,7 +51,7 @@ fn payload(app: CallAppId, title: Option<String>) -> DetectedPayload {
 
 /// Starts detection. macOS only: elsewhere there is nothing to watch.
 pub fn start<R: Runtime>(app: &AppHandle<R>) {
-    let state = Arc::new(DetectState { inner: Mutex::new(Rules::new()), started: Instant::now() });
+    let state = Arc::new(DetectState { inner: Mutex::new(Rules::new()) });
     app.manage(state.clone());
     #[cfg(target_os = "macos")]
     {
@@ -68,21 +69,26 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
 
 /// What the user did with a banner.
 #[cfg(target_os = "macos")]
-fn on_banner<R: Runtime>(app: &AppHandle<R>, state: &DetectState, key: &str, response: notify::Response) {
+fn on_banner<R: Runtime>(app: &AppHandle<R>, state: &Arc<DetectState>, key: &str, response: notify::Response) {
     let Some(id) = CallAppId::parse(key) else { return };
     match response {
         notify::Response::Dismiss => dismiss_app(app, state, id),
         notify::Response::Open => crate::tray::focus_main_window(app),
         notify::Response::Record => {
-            let title = state
-                .inner
-                .lock()
-                .ok()
-                .and_then(|r| r.prompted().into_iter().find(|(a, _)| *a == id).and_then(|(_, t)| t));
-            crate::tray::focus_main_window(app);
-            if let Err(e) = app.emit("meeting-detect-record", payload(id, title)) {
-                log::error!("meeting_detect: cannot emit meeting-detect-record: {}", e);
-            }
+            // A stale banner must not start a recording: Record only counts while that app is
+            // prompted right now and nothing is recording. Otherwise it just opens the window.
+            let (app, state) = (app.clone(), state.clone());
+            tauri::async_runtime::spawn(async move {
+                let recording = crate::is_recording().await;
+                let prompted = state.inner.lock().ok().map(|r| r.prompted()).unwrap_or_default();
+                let title = prompted.into_iter().find(|(a, _)| *a == id).map(|(_, t)| t);
+                crate::tray::focus_main_window(&app);
+                if let (Some(title), false) = (title, recording) {
+                    if let Err(e) = app.emit("meeting-detect-record", payload(id, title)) {
+                        log::error!("meeting_detect: cannot emit meeting-detect-record: {}", e);
+                    }
+                }
+            });
         }
     }
 }
@@ -155,8 +161,18 @@ async fn run<R: Runtime>(app: AppHandle<R>, state: Arc<DetectState>) {
             }
         }
         let w = windows.as_deref();
+        // The listing can take seconds: read the recording state again so a banner is never raised
+        // just after a recording started.
+        let recording = crate::is_recording().await;
         // A failed read is not a quiet tick: hold the last known state until the next good read.
+        // It still applies a recording start, so a prompt never outlives one.
         if !readings_complete(view.is_some(), needs, windows.is_some()) {
+            if recording {
+                let events = state.inner.lock().map(|mut r| r.recording_started()).unwrap_or_default();
+                for e in events {
+                    apply(&app, e);
+                }
+            }
             continue;
         }
         let tick = Tick {

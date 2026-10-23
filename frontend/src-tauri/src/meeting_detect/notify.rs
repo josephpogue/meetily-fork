@@ -144,6 +144,8 @@ mod mac {
         let delegate = Delegate::new();
         center.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
         let _ = DELEGATE.set(delegate);
+        // Banners left from an earlier run point at calls this run knows nothing about.
+        center.removeAllDeliveredNotifications();
 
         let record = UNNotificationAction::actionWithIdentifier_title_options(
             &NSString::from_str(RECORD_ACTION),

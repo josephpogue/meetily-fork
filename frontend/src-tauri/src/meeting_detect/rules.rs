@@ -89,11 +89,27 @@ impl Rules {
     }
 
     /// Whether this tick needs a window listing: only when some app has the
-    /// mic on or is prompted, so an idle Mac costs no listing.
+    /// mic on or has an open call, so an idle Mac costs no listing.
     pub fn needs_windows(&self, zoom_mic: bool, teams_mic: bool) -> bool {
-        zoom_mic
-            || teams_mic
-            || self.apps.iter().any(|a| a.call.as_ref().is_some_and(|c| c.prompted))
+        // Any open call needs its window checked, prompted or not: a seen or dismissed call whose
+        // mic drops must not end while its meeting window is still open.
+        zoom_mic || teams_mic || self.apps.iter().any(|a| a.call.is_some())
+    }
+
+    /// A recording is on and this tick could not be read: still mark every open call seen and clear its
+    /// prompt, so no prompt outlives a recording start. Call start and end wait for a good read.
+    pub fn recording_started(&mut self) -> Vec<Event> {
+        let mut events = Vec::new();
+        for app in ALL {
+            if let Some(call) = self.apps[index(app)].call.as_mut() {
+                call.seen = true;
+                if call.prompted {
+                    call.prompted = false;
+                    events.push(Event::Cleared { app });
+                }
+            }
+        }
+        events
     }
 
     /// Calls prompted right now, with the title shown for each.
@@ -365,6 +381,41 @@ mod tests {
         assert_eq!(prompts(&all), vec![App::Zoom]);
         assert!(cleared(&all).is_empty());
         assert_eq!(r.prompted().len(), 1);
+    }
+
+    #[test]
+    fn seen_call_with_open_window_survives_a_long_mic_gap_without_reprompt() {
+        let mut r = Rules::new();
+        let mut all = Vec::new();
+        // Seen while recording, then the recording stops.
+        for t in [2, 4] {
+            all.extend(r.tick(&tick(t, true, sig(true, true), AppSignals::default())));
+        }
+        assert!(r.needs_windows(false, false), "an open call keeps the windows listed");
+        // Mic off for four ticks, meeting window still open: the call does not end.
+        for t in [6, 8, 10, 12] {
+            all.extend(r.tick(&zoom_only(t, false, true)));
+        }
+        all.extend(r.tick(&zoom_only(14, true, true)));
+        all.extend(r.tick(&zoom_only(16, true, true)));
+        assert!(prompts(&all).is_empty(), "a seen call never prompts again: {:?}", all);
+    }
+
+    #[test]
+    fn idle_mac_lists_no_windows() {
+        assert!(!Rules::new().needs_windows(false, false));
+    }
+
+    #[test]
+    fn recording_started_clears_a_prompt_and_marks_the_call_seen() {
+        let mut r = Rules::new();
+        r.tick(&zoom_only(2, true, true));
+        assert_eq!(r.prompted().len(), 1);
+        assert_eq!(cleared(&r.recording_started()), vec![App::Zoom]);
+        assert!(r.prompted().is_empty());
+        // Recording stops; the same call must not prompt again.
+        let events = r.tick(&zoom_only(4, true, true));
+        assert!(prompts(&events).is_empty());
     }
 
     #[test]
