@@ -195,10 +195,31 @@ async function readScreen(browser) {
   return browser.$('body').getText();
 }
 
+// The options of a native <select>, which `read` cannot show (a closed select's options are not page text). The select is
+// found by its label: a <label> with that text (its `for` id, or the select inside it), the select's own aria-label, or
+// the id. Returns null when no select matches, else one entry per option with its text, selected and disabled state.
+// Pure page code, stringified into the page by execute, so it uses nothing outside itself.
+function selectOptions(label) {
+  const norm = (x) => (x ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+  const want = norm(label);
+  const selects = [...document.querySelectorAll('select')];
+  let sel = selects.find((el) => norm(el.getAttribute('aria-label')) === want || norm(el.id) === want);
+  if (!sel) {
+    for (const l of document.querySelectorAll('label')) {
+      if (norm(l.textContent) !== want) continue;
+      sel = (l.htmlFor && document.getElementById(l.htmlFor)) || l.querySelector('select');
+      if (sel?.tagName === 'SELECT') break;
+      sel = null;
+    }
+  }
+  if (!sel) return null;
+  return [...sel.options].map((o) => ({ text: o.text.trim(), selected: o.selected, disabled: o.disabled }));
+}
+
 async function run() {
-  if (!['wait', 'click', 'type', 'read'].includes(verb)) { console.error('usage: ui.mjs wait|click|type|read'); return 64; }
+  if (!['wait', 'click', 'type', 'read', 'options'].includes(verb)) { console.error('usage: ui.mjs wait|click|type|read|options'); return 64; }
   // A missing argument is the caller's mistake (64), not a screen that lacks the text (1).
-  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', type: 'type <field> <text>', read: 'read' };
+  const USAGE = { wait: 'wait <text> [seconds]', click: 'click <text>', type: 'type <field> <text>', read: 'read', options: 'options <select label>' };
   const badArgs = (verb !== 'read' && !a?.trim()) || (verb === 'type' && b === undefined)
     || (verb === 'wait' && b !== undefined && !(Number(b) > 0));
   if (badArgs) { console.error(`usage: ui.mjs ${USAGE[verb]}`); return 64; }
@@ -228,6 +249,12 @@ async function run() {
       }
       case 'type': { const el = await find(browser, a, 10000); if (!el) { console.error(`no field: ${a}`); return 1; } await el.setValue(b); break; }
       case 'read': console.log(await readScreen(browser)); break;
+      case 'options': {
+        const list = await browser.execute(selectOptions, a);
+        if (!list) { console.error(`no select: ${a}`); return 1; }
+        for (const o of list) console.log(`option: ${o.text}${o.selected ? ' [selected]' : ''}${o.disabled ? ' [disabled]' : ''}`);
+        break;
+      }
     }
     return 0;
   } catch (e) {

@@ -28,7 +28,23 @@ func show() {
 show()
 Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { _ in show() }
 // A call in progress: open the default input so Core Audio reports this process as running input (the data is
-// thrown away), and loop this app's own clip (speech, then about 4 s of silence) on the default output.
+// thrown away), and play this app's own clip on the default output in its own slot of every 20 s (see scheduleClip).
+// The clip plays at fixed seconds of the wall clock, never as a free-running loop: every `period` seconds starting at
+// `offset` (Zoom 0, Teams 4), so each one speaks in its own slot of about 3 s and everything after second 8 is quiet.
+// A walk that plays you.wav and them.wav waits for that quiet part (README 5c). When fake-microphone speech overlaps speech from the call
+// apps, Meetily files the overlapping speech as one Them line and no You line, so a free-running loop
+// would make the You line unreliable.
+let period = 20.0
+func scheduleClip(_ p: AVAudioPlayer, offset: Double) {
+  let now = Date().timeIntervalSince1970
+  var next = (now / period).rounded(.down) * period + offset
+  if next <= now + 0.05 { next += period }
+  Timer.scheduledTimer(withTimeInterval: next - now, repeats: false) { _ in
+    p.currentTime = 0
+    p.play()
+    scheduleClip(p, offset: offset)
+  }
+}
 var engine: AVAudioEngine?
 var player: AVAudioPlayer?
 if !home {
@@ -38,9 +54,8 @@ if !home {
   engine = e
   if let url = Bundle.main.url(forResource: "teams-call", withExtension: "wav"),
      let p = try? AVAudioPlayer(contentsOf: url) {
-    p.numberOfLoops = -1
-    p.play()
     player = p
+    scheduleClip(p, offset: 4)
   } else {
     FileHandle.standardError.write(Data("call clip missing from the bundle\n".utf8))
   }
