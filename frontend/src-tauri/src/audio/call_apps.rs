@@ -155,6 +155,7 @@ fn exe_path_of_pid(pid: i32) -> Option<PathBuf> {
         return None;
     }
     let mut buf = vec![0u8; 4096];
+    // SAFETY: buf is a live, writable buffer of exactly buf.len() bytes, and proc_pidpath writes at most that many.
     let n = unsafe { proc_pidpath(pid, buf.as_mut_ptr(), buf.len() as u32) };
     if n <= 0 {
         return None;
