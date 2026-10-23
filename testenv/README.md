@@ -49,6 +49,20 @@ The build is not yours. You are handed the path of the built app. It comes from 
 - During a recording, run `testenv exec <id> -- bash -c 'ls /Users/admin/Movies/meetily-recordings/*/teams-frames/ 2>/dev/null | head'`. It must list `teams-*.jpg` files.
 - The app saves the frames in `teams-frames` inside the meeting folder, next to `zoom-frames`. With only the Teams stand-in open, `zoom-frames` does not exist. If both stand-ins are open, the Zoom one is captured and `teams-frames` stays empty or missing.
 
+## 5c. Meeting detection and one app's audio
+
+Each stand-in is a call in progress for as long as it runs: its meeting window, its own process holding the microphone (the fake mic, BlackHole 16ch, data thrown away), and its own clip looping on the fake speakers (BlackHole 2ch). Zoom Stand-in says "The purple kangaroo plays the violin." and Teams Stand-in says "The green tractor drives to Denver.", each followed by about 4 s of silence, in different voices from `you.wav` and `them.wav`. The image already allows the microphone for both and allows Meetily's notifications as banners, so no permission prompt appears.
+
+1. With Meetily open and no recording running, open both stand-ins: `testenv exec <id> -- open -a "Zoom Stand-in"` and `testenv exec <id> -- open -a "Teams Stand-in"`.
+2. Bring Meetily back: `testenv exec <id> -- open -a meetily-fork`.
+3. Within about 15 s take `testenv shot <id> banners` (and a second one a few seconds later if a banner is hidden). Expect two banners, "Zoom meeting started" and "Teams meeting started". Banners show only in a `testenv shot` screenshot, never in `ui.mjs read`.
+4. `ui.mjs read` shows the in-app card for each app. Record from the Teams card (button "Record Teams meeting").
+5. Play `them.wav` as call audio once (`testenv play <id> call /Users/admin/clips/them.wav`) and wait about 20 s, then stop the recording.
+6. The Them lines must contain "tractor" or "Denver", and must not contain "kangaroo", "violin" or "submarine". `afplay` is a third process, so a Teams-only recording does not hear it, and the Zoom stand-in's clip is another app's sound.
+7. A manual start with Call audio set to "All apps" hears all three: Them lines with kangaroo, tractor and submarine words. With a stand-in open, any all-apps recording also hears its clip as Them, so the standing You and Them check (section 6) still passes but the Them text has extra words.
+8. `--home` is the app's home window, not a call: `testenv exec <id> -- open -a "Zoom Stand-in" --args --home` shows a window titled "Zoom Workplace", and the Teams one a window titled "Chat | Acme | Microsoft Teams". Neither opens the microphone or makes sound, and neither gives a notification or a card.
+9. Quit a stand-in to end its call: `testenv exec <id> -- osascript -e 'quit app "Zoom Stand-in"'`.
+
 ## 6. The three standing checks
 
 Every Meetily run makes these first three checks:
