@@ -259,7 +259,7 @@ export default function RootLayout({
                                     <MainContent>{children}</MainContent>
                                   </div>
                                 )}
-                                <MeetingPrompt />
+                                <MeetingPrompt suppressed={showOnboarding} />
                                 {/* Import audio overlay and dialog */}
                                 <ImportDropOverlay visible={showDropOverlay} />
                                 <ConditionalImportDialog

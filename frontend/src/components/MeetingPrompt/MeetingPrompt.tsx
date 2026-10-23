@@ -15,13 +15,16 @@ import type { CallApp, MeetingDetectedPayload } from '@/types';
 const ORDER: CallApp[] = ['zoom', 'teams'];
 
 /** One card per detected call app while Meetily is not recording. */
-export function MeetingPrompt() {
+export function MeetingPrompt({ suppressed = false }: { suppressed?: boolean }) {
   const { isRecording } = useRecordingState();
   const pathname = usePathname();
   const router = useRouter();
   const [calls, setCalls] = useState<Partial<Record<CallApp, MeetingDetectedPayload>>>({});
   const routeRef = useRef({ pathname, router });
   routeRef.current = { pathname, router };
+  // While onboarding shows there is no start listener, so no card and no Record.
+  const suppressedRef = useRef(suppressed);
+  suppressedRef.current = suppressed;
   const isRecordingRef = useRef(isRecording);
   const wasRecording = useRef(isRecording);
 
@@ -36,7 +39,7 @@ export function MeetingPrompt() {
   }, [isRecording]);
 
   const record = useCallback((app: CallApp) => {
-    if (isRecordingRef.current) return;
+    if (isRecordingRef.current || suppressedRef.current) return;
     const { pathname: here, router: nav } = routeRef.current;
     if (here !== '/') {
       // The start flow lives on the home page: go there and let its auto-start take over.
@@ -55,7 +58,7 @@ export function MeetingPrompt() {
       p.then((fn) => (alive ? unlistens.push(fn) : fn())).catch((e) => console.error('[MeetingPrompt] listen failed', e));
 
     keep(meetingDetectService.onDetected((p) => {
-      if (isRecordingRef.current) return;
+      if (isRecordingRef.current || suppressedRef.current) return;
       setCalls((prev) => ({ ...prev, [p.app]: p }));
     }));
     keep(meetingDetectService.onCleared(({ app }) => {
@@ -93,7 +96,7 @@ export function MeetingPrompt() {
   }, []);
 
   const cards = ORDER.map((a) => calls[a]).filter((c): c is MeetingDetectedPayload => !!c);
-  if (isRecording || cards.length === 0) return null;
+  if (isRecording || suppressed || cards.length === 0) return null;
 
   return (
     <div

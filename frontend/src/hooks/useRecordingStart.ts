@@ -131,6 +131,8 @@ export function useRecordingStart(
       return;
     }
     isStartingRef.current = true;
+    // Read the picker once, at press time: the label shows what this start sends.
+    const callApp = callAudioStore.get();
     try {
       console.log('handleRecordingStart called - checking selected transcription model status');
 
@@ -166,7 +168,6 @@ export function useRecordingStart(
 
       // Start the actual backend recording
       console.log('Starting backend recording with meeting:', randomTitle);
-      const callApp = callAudioStore.get();
       await recordingService.startRecordingWithDevices(
         selectedDevices?.micDevice || null,
         selectedDevices?.systemDevice || null,
@@ -174,6 +175,7 @@ export function useRecordingStart(
         callApp
       );
       console.log('Backend recording started successfully');
+      callAudioStore.set(callApp);
 
       // Update state after successful backend start
       // Note: RECORDING status will be set by RecordingStateContext event listener
@@ -234,8 +236,9 @@ export function useRecordingStart(
         if (flag && !isFresh) {
           console.log('Ignoring a stale autoStartRecording flag:', flag);
         }
-        if (isFresh && !isRecording && !isAutoStarting) {
+        if (isFresh && !isRecording && !isAutoStarting && !isStartingRef.current) {
           console.log('Auto-starting recording from navigation...');
+          isStartingRef.current = true;
           setIsAutoStarting(true);
 
           // Check the selected transcription model before starting.
@@ -257,7 +260,8 @@ export function useRecordingStart(
               Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_auto');
             }
             setStatus(RecordingStatus.IDLE);
-            setIsAutoStarting(false);
+            isStartingRef.current = false;
+          setIsAutoStarting(false);
             return;
           }
 
@@ -307,7 +311,8 @@ export function useRecordingStart(
             }
             Analytics.trackButtonClick('start_recording_error', 'sidebar_auto');
           } finally {
-            setIsAutoStarting(false);
+            isStartingRef.current = false;
+          setIsAutoStarting(false);
           }
         }
       }
@@ -335,13 +340,15 @@ export function useRecordingStart(
       // A meeting card's Record names its app in the event; the sidebar and tray use the picker.
       const detail = (event as CustomEvent<{ callApp?: CallApp } | null> | undefined)?.detail;
       const callApp: CallApp | null = detail?.callApp ?? callAudioStore.get();
-      if (isRecording || isAutoStarting) {
+      // One in-flight guard for every start path: a second press while a start runs is ignored.
+      if (isRecording || isAutoStarting || isStartingRef.current) {
         console.log('Recording already in progress, ignoring direct start event');
         return;
       }
 
       console.log('Direct start from sidebar - checking selected transcription model status');
-      setIsAutoStarting(true);
+      isStartingRef.current = true;
+          setIsAutoStarting(true);
 
       // Check the selected transcription model before starting.
       const modelReady = await checkModelReady();
@@ -362,7 +369,8 @@ export function useRecordingStart(
           Analytics.trackButtonClick('start_recording_blocked_missing', 'sidebar_direct');
         }
         setStatus(RecordingStatus.IDLE);
-        setIsAutoStarting(false);
+        isStartingRef.current = false;
+          setIsAutoStarting(false);
         return;
       }
 
@@ -410,7 +418,8 @@ export function useRecordingStart(
         }
         Analytics.trackButtonClick('start_recording_error', 'sidebar_direct');
       } finally {
-        setIsAutoStarting(false);
+        isStartingRef.current = false;
+          setIsAutoStarting(false);
       }
     };
 

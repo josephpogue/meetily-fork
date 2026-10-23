@@ -26,6 +26,9 @@ afterAll(() => {
 let currentCalls: unknown[] = [];
 let startError: Error | null = null;
 let teamsRunning = false;
+let suppressedNow = false;
+// When set, the model check waits on it so a test can act while a start is in flight.
+let modelGate: Promise<void> | null = null;
 const invoke = mock(async (command: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'meeting_detect_current') return currentCalls;
   if (command === 'list_call_apps') return [
@@ -33,7 +36,7 @@ const invoke = mock(async (command: string, _args?: Record<string, unknown>): Pr
     { id: 'teams', label: 'Teams', running: teamsRunning },
   ];
   if (command === 'api_get_transcript_config') return { provider: 'parakeet' };
-  if (command === 'parakeet_has_available_models') return true;
+  if (command === 'parakeet_has_available_models') { if (modelGate) await modelGate; return true; }
   if (command === 'start_recording_with_devices_and_meeting' && startError) throw startError;
   return undefined;
 });
@@ -103,7 +106,7 @@ function Harness() {
   startManual = handleRecordingStart;
   return (
     <>
-      <MeetingPrompt />
+      <MeetingPrompt suppressed={suppressedNow} />
       <CallAudioPicker isRecording={rec} />
     </>
   );
@@ -134,6 +137,8 @@ beforeEach(async () => {
   currentCalls = [];
   startError = null;
   teamsRunning = false;
+  suppressedNow = false;
+  modelGate = null;
   pathname = '/';
   recNow = false;
   callAudioStore.set(null);
@@ -247,5 +252,66 @@ describe('Call audio picker', () => {
     await act(async () => { (g.window as { dispatchEvent: (e: unknown) => void }).dispatchEvent(new (g.CustomEvent as typeof CustomEvent)('start-recording-from-sidebar')); });
     await act(async () => { await new Promise((r) => setTimeout(r, 10)); });
     expect(startCalls()[0][1]).toMatchObject({ callApp: 'zoom' });
+  });
+});
+
+describe('one start at a time', () => {
+  const sidebarStart = (detail?: unknown) =>
+    (g.window as { dispatchEvent: (e: unknown) => void }).dispatchEvent(new (g.CustomEvent as typeof CustomEvent)('start-recording-from-sidebar', detail ? { detail } : undefined));
+  const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 10)); });
+
+  test('a card Record pressed while the button start is in flight is ignored', async () => {
+    let release!: () => void;
+    modelGate = new Promise<void>((r) => { release = r; });
+    await mount();
+    await fire('meeting-detected', zoom('Q3 storage review'));
+    let first!: Promise<void>;
+    await act(async () => { first = startManual(); });
+    await act(async () => { button('Record Zoom meeting').props.onClick(); });
+    await settle();
+    expect(cardText()).toEqual([['Zoom meeting started', 'Q3 storage review']]);
+    await act(async () => { release(); await first; });
+    await settle();
+    expect(startCalls()).toHaveLength(1);
+    expect(startCalls()[0][1]).toMatchObject({ callApp: null });
+    expect(cardText()).toEqual([]);
+  });
+
+  test('the button start is ignored while a sidebar start is in flight', async () => {
+    let release!: () => void;
+    modelGate = new Promise<void>((r) => { release = r; });
+    await mount();
+    await act(async () => { sidebarStart({ callApp: 'zoom' }); });
+    await act(async () => { await startManual(); });
+    await act(async () => { release(); });
+    await settle();
+    expect(startCalls()).toHaveLength(1);
+    expect(startCalls()[0][1]).toMatchObject({ callApp: 'zoom' });
+  });
+
+  test('changing the picker during a start leaves the label on what was sent', async () => {
+    let release!: () => void;
+    modelGate = new Promise<void>((r) => { release = r; });
+    await mount();
+    let first!: Promise<void>;
+    await act(async () => { first = startManual(); });
+    await act(async () => { callAudioStore.set('zoom'); });
+    await act(async () => { release(); await first; });
+    expect(startCalls()[0][1]).toMatchObject({ callApp: null });
+    expect(callAudioStore.get()).toBeNull();
+  });
+});
+
+describe('onboarding', () => {
+  test('no card shows and a native Record is ignored while onboarding is up', async () => {
+    suppressedNow = true;
+    await mount();
+    await fire('meeting-detected', zoom('Q3 storage review'));
+    expect(cardText()).toEqual([]);
+    await fire('meeting-detect-record', zoom('Q3 storage review'));
+    await act(async () => { await new Promise((r) => setTimeout(r, 10)); });
+    expect(startCalls()).toHaveLength(0);
+    expect(push).not.toHaveBeenCalled();
+    expect(store.get('autoStartRecording')).toBeUndefined();
   });
 });
