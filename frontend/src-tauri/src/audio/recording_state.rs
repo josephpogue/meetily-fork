@@ -111,6 +111,9 @@ pub struct RecordingState {
     // Audio devices
     microphone_device: Mutex<Option<Arc<AudioDevice>>>,
     system_device: Mutex<Option<Arc<AudioDevice>>>,
+    // Call app whose sound the system stream taps; None means all system audio.
+    // Held for the whole recording so every stream re-creation taps the same app.
+    call_app: Mutex<Option<super::call_apps::CallAppId>>,
 
     // Audio pipeline
     audio_sender: Mutex<Option<mpsc::UnboundedSender<AudioChunk>>>,
@@ -141,6 +144,7 @@ impl RecordingState {
             is_paused: AtomicBool::new(false),
             microphone_device: Mutex::new(None),
             system_device: Mutex::new(None),
+            call_app: Mutex::new(None),
             audio_sender: Mutex::new(None),
             buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),
@@ -152,6 +156,14 @@ impl RecordingState {
             pause_start: Mutex::new(None),
             total_pause_duration: Mutex::new(std::time::Duration::ZERO),
         })
+    }
+
+    pub fn set_call_app(&self, app: Option<super::call_apps::CallAppId>) {
+        *self.call_app.lock().unwrap() = app;
+    }
+
+    pub fn call_app(&self) -> Option<super::call_apps::CallAppId> {
+        *self.call_app.lock().unwrap()
     }
 
     // Recording control
@@ -403,6 +415,7 @@ impl Default for RecordingState {
             is_paused: AtomicBool::new(false),
             microphone_device: Mutex::new(None),
             system_device: Mutex::new(None),
+            call_app: Mutex::new(None),
             audio_sender: Mutex::new(None),
             buffer_pool: AudioBufferPool::new(16, 48000), // Pool of 16 buffers with 48kHz samples capacity
             error_count: AtomicU32::new(0),

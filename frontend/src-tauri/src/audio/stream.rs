@@ -152,7 +152,14 @@ impl AudioStream {
 
         // Create Core Audio capture
         info!("🔊 Stream: Calling CoreAudioCapture::new()...");
-        let capture_impl = CoreAudioCapture::new()
+        // The call app is held in the recording state, so a re-created stream taps the same app.
+        let capture_impl = match state.call_app() {
+            Some(app) => CoreAudioCapture::new_for_app(app),
+            None => {
+                info!("System audio: all apps");
+                CoreAudioCapture::new()
+            }
+        }
             .map_err(|e| {
                 error!("❌ Stream: CoreAudioCapture::new() failed: {}", e);
                 anyhow::anyhow!("Failed to create Core Audio capture: {}", e)

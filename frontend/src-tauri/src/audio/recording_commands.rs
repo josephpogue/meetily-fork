@@ -298,6 +298,16 @@ async fn prepare_audio_for_recording(
 // RECORDING COMMANDS
 // ============================================================================
 
+/// Parse the optional call app choice sent by the UI; an unknown value is an error.
+pub(crate) fn parse_call_app(value: Option<String>) -> Result<Option<super::call_apps::CallAppId>, String> {
+    match value {
+        None => Ok(None),
+        Some(v) => super::call_apps::CallAppId::parse(&v)
+            .map(Some)
+            .ok_or_else(|| format!("Unknown call app: {}", v)),
+    }
+}
+
 /// Start recording with default devices
 pub async fn start_recording<R: Runtime>(app: AppHandle<R>) -> Result<(), String> {
     start_recording_with_meeting_name(app, None).await
@@ -488,7 +498,7 @@ pub async fn start_recording_with_devices<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
 ) -> Result<(), String> {
-    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None).await
+    start_recording_with_devices_and_meeting(app, mic_device_name, system_device_name, None, None).await
 }
 
 /// Start recording with specific devices and optional meeting name
@@ -497,7 +507,10 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
     mic_device_name: Option<String>,
     system_device_name: Option<String>,
     meeting_name: Option<String>,
+    call_app: Option<String>,
 ) -> Result<(), String> {
+    // Reject an unknown call app before anything starts.
+    let call_app = parse_call_app(call_app)?;
     info!(
         "Starting recording with specific devices: mic={:?}, system={:?}, meeting={:?}",
         mic_device_name, system_device_name, meeting_name
@@ -558,6 +571,7 @@ pub async fn start_recording_with_devices_and_meeting<R: Runtime>(
 
     // Create new recording manager
     let mut manager = RecordingManager::new();
+    manager.set_call_app(call_app);
 
     // Load recording preferences to check auto_save setting
     let auto_save = match super::recording_preferences::load_recording_preferences(&app).await {
@@ -1730,5 +1744,18 @@ async fn trigger_mic_fallback_to_default<R: Runtime>(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod call_app_arg_tests {
+    use super::parse_call_app;
+    use crate::audio::call_apps::CallAppId;
+
+    #[test]
+    fn call_app_argument_is_parsed_or_rejected() {
+        assert_eq!(parse_call_app(None), Ok(None));
+        assert_eq!(parse_call_app(Some("zoom".into())), Ok(Some(CallAppId::Zoom)));
+        assert_eq!(parse_call_app(Some("webex".into())), Err("Unknown call app: webex".to_string()));
     }
 }
