@@ -74,6 +74,7 @@ pub async fn assistant_save_settings(
         .map_err(|e| e.to_string())?;
     // The switch also reaches a call that is already running.
     core::apply_see_zoom_window(handle.inner(), settings.see_zoom_window).await;
+    core::apply_standing_rules(handle.inner(), &settings.standing_rules).await;
     Ok(())
 }
 

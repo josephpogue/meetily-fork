@@ -277,6 +277,7 @@ export interface AssistantSettings {
   vaultRoot: string;
   deepReadDirs: string;
   seeZoomWindow: boolean;
+  standingRules: string;
 }
 
 export interface AssistantClaudeProbe {
