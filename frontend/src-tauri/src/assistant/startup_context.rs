@@ -29,11 +29,28 @@ fn current(handle: &ContextHandle) -> Arc<str> {
     handle.read().unwrap_or_else(|p| p.into_inner()).clone()
 }
 
-/// Wraps `inner` so each turn's system prompt is `"{lane prompt}\n\n{context}"`.
-/// An empty context leaves the turn untouched.
-pub fn with_context(inner: Runner, handle: ContextHandle) -> Runner {
+/// Frames Joseph's standing rules for the system prompt: rules for every reply,
+/// not the goal of the call. Blank rules give an empty string, which adds nothing.
+pub fn render_rules(rules: &str) -> String {
+    let rules = rules.trim();
+    if rules.is_empty() {
+        return String::new();
+    }
+    format!("# Standing rules\n\nJoseph set these rules once, for every call. Follow them on every reply you give, in every lane (suggested answers, questions to ask, Ask, Explain, Catch-up, to-dos and the note). They are rules for how you work, not the goal of this call.\n\n{rules}")
+}
+
+/// Wraps `inner` so each turn's system prompt is `"{lane prompt}\n\n{context}\n\n{rules}"`.
+/// Empty context and empty rules leave the turn untouched. Both handles are
+/// read at call time, so a change reaches the next turn of every lane.
+pub fn with_context(inner: Runner, handle: ContextHandle, rules: ContextHandle) -> Runner {
     Arc::new(move |mut turn, on_delta, register| {
-        let ctx = current(&handle);
+        let base = current(&handle);
+        let rules = current(&rules);
+        let ctx: Arc<str> = match (base.is_empty(), rules.is_empty()) {
+            (_, true) => base,
+            (true, false) => rules,
+            (false, false) => Arc::from(format!("{base}\n\n{rules}")),
+        };
         if !ctx.is_empty() {
             turn.append_system_prompt = Some(match turn.append_system_prompt.take() {
                 Some(p) if !p.is_empty() => format!("{p}\n\n{ctx}"),
@@ -390,7 +407,7 @@ mod tests {
     async fn wrapper_appends_after_the_lane_prompt_and_reads_at_call_time() {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let handle = new_handle();
-        let run = with_context(recording_runner(seen.clone()), handle.clone());
+        let run = with_context(recording_runner(seen.clone()), handle.clone(), new_handle());
         let turn = |sp: Option<&str>| ClaudeTurn {
             append_system_prompt: sp.map(str::to_string),
             ..Default::default()
@@ -404,6 +421,34 @@ mod tests {
         assert_eq!(calls[0].append_system_prompt.as_deref(), Some("LANE"));
         assert_eq!(calls[1].append_system_prompt.as_deref(), Some("LANE\n\nCTX1"));
         assert_eq!(calls[2].append_system_prompt.as_deref(), Some("CTX2"));
+    }
+
+    #[tokio::test]
+    async fn rules_ride_every_turn_and_blank_rules_add_nothing() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let (ctx, rules) = (new_handle(), new_handle());
+        let run = with_context(recording_runner(seen.clone()), ctx.clone(), rules.clone());
+        let turn = |sp: Option<&str>| ClaudeTurn {
+            append_system_prompt: sp.map(str::to_string),
+            ..Default::default()
+        };
+        // Blank and whitespace-only rules: the turn is untouched.
+        set_context(&rules, &render_rules("  \n "));
+        run(turn(Some("LANE")), Box::new(|_| {}), Box::new(|_| {})).await;
+        // Rules alone, and rules after a context.
+        set_context(&rules, &render_rules("Skip project logistics."));
+        run(turn(Some("LANE")), Box::new(|_| {}), Box::new(|_| {})).await;
+        set_context(&ctx, "CTX");
+        run(turn(Some("LANE")), Box::new(|_| {}), Box::new(|_| {})).await;
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls[0].append_system_prompt.as_deref(), Some("LANE"));
+        let alone = calls[1].append_system_prompt.as_deref().unwrap();
+        assert!(alone.starts_with("LANE\n\n# Standing rules"));
+        assert!(alone.contains("every reply"));
+        assert!(alone.ends_with("Skip project logistics."));
+        let both = calls[2].append_system_prompt.as_deref().unwrap();
+        assert!(both.starts_with("LANE\n\nCTX\n\n# Standing rules"));
+        assert!(both.ends_with("Skip project logistics."));
     }
 
     // ---- live checks, real claude, gated on ASSISTANT_CLAUDE_TEST=1 ----
@@ -439,7 +484,7 @@ mod tests {
             return;
         }
         let handle = new_handle();
-        let run = with_context(live_runner(), handle.clone());
+        let run = with_context(live_runner(), handle.clone(), new_handle());
         // A codeword read twice reads like an injection to the model, so the seed
         // only says READY and the later turns ask for a plain reference fact.
         let ask = "What is the meeting room called today, per your reference notes? One word.";
@@ -492,7 +537,7 @@ mod tests {
         println!("context chars={} project={:?}", ctx.chars().count(), slug);
         let handle = new_handle();
         set_context(&handle, &ctx);
-        let run = with_context(live_runner(), handle);
+        let run = with_context(live_runner(), handle, new_handle());
         let out = run_one(&run, fast_turn("What year was FESCO founded?")).await;
         println!("fast reply: {}", out.text);
         assert!(out.text.contains("1958"), "{}", out.text);
@@ -512,7 +557,7 @@ mod tests {
             let on = i % 2 == 0;
             let handle = new_handle();
             set_context(&handle, if on { &ctx } else { "" });
-            let run = with_context(live_runner(), handle);
+            let run = with_context(live_runner(), handle, new_handle());
             let t = std::time::Instant::now();
             run_one(&run, fast_turn("What year was FESCO founded?")).await;
             let ms = t.elapsed().as_millis();

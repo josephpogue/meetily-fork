@@ -103,6 +103,9 @@ pub struct AssistantCore {
     /// the project page when the brief changes.
     startup_ctx: super::startup_context::ContextHandle,
     startup: Option<super::startup_context::Startup>,
+    /// Joseph's standing rules, framed for the system prompt (empty when none);
+    /// read by the wrapped runner at call time, like `startup_ctx`.
+    rules_ctx: super::startup_context::ContextHandle,
     voice: VoiceAsk,
     /// The open You-utterance's text at the moment voice-ask's hotkey was
     /// pressed, if any. Stripped as a prefix from transcript text fed to
@@ -185,6 +188,7 @@ impl AssistantCore {
             brief: String::new(),
             startup_ctx: super::startup_context::new_handle(),
             startup: None,
+            rules_ctx: super::startup_context::new_handle(),
             voice: VoiceAsk::new(|_| {}, |_| {}),
             voice_baseline: String::new(),
             app: None,
@@ -1489,10 +1493,22 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         };
         super::startup_context::set_context(&core.startup_ctx, ctx);
         core.startup = startup;
-        core.startup_ctx.clone()
+        super::startup_context::set_context(
+            &core.rules_ctx,
+            &super::startup_context::render_rules(&settings.standing_rules),
+        );
+        (core.startup_ctx.clone(), core.rules_ctx.clone())
     };
-    let runner = super::startup_context::with_context(claude_runner(bin), ctx_handle);
+    let runner = super::startup_context::with_context(claude_runner(bin), ctx_handle.0, ctx_handle.1);
     open_lanes_with(handle, cfg, seed, brief, runner).await;
+}
+
+/// A saved change to the standing rules, applied to a running call: the next
+/// turn of every lane carries the new text.
+pub async fn apply_standing_rules(handle: &AssistantHandle, rules: &str) {
+    let mut core = handle.0.lock().await;
+    core.settings.standing_rules = rules.to_string();
+    super::startup_context::set_context(&core.rules_ctx, &super::startup_context::render_rules(rules));
 }
 
 /// The Settings switch "see the Zoom or Teams window", applied to a running call.
@@ -1735,6 +1751,38 @@ fn register_listeners(app: AppHandle<Wry>, handle: AssistantHandle) {
 mod tests {
     use super::*;
     use crate::assistant::claude_cli::ClaudeOutcome;
+
+    #[tokio::test]
+    async fn a_rules_change_mid_call_reaches_the_next_turn() {
+        use crate::assistant::startup_context::with_context;
+        let seen: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>> = Arc::default();
+        let inner: Runner = {
+            let seen = seen.clone();
+            Arc::new(move |turn, _d, _r| {
+                seen.lock().unwrap().push(turn);
+                Box::pin(async { ClaudeOutcome::default() })
+            })
+        };
+        let handle = AssistantHandle::new();
+        let (ctx, rules) = {
+            let core = handle.0.lock().await;
+            (core.startup_ctx.clone(), core.rules_ctx.clone())
+        };
+        let run = with_context(inner, ctx, rules);
+        let turn = || crate::assistant::claude_cli::ClaudeTurn {
+            append_system_prompt: Some("LANE".into()),
+            ..Default::default()
+        };
+        run(turn(), Box::new(|_| {}), Box::new(|_| {})).await;
+        apply_standing_rules(&handle, "Skip project logistics.").await;
+        run(turn(), Box::new(|_| {}), Box::new(|_| {})).await;
+        apply_standing_rules(&handle, "  ").await;
+        run(turn(), Box::new(|_| {}), Box::new(|_| {})).await;
+        let calls = seen.lock().unwrap();
+        assert_eq!(calls[0].append_system_prompt.as_deref(), Some("LANE"));
+        assert!(calls[1].append_system_prompt.as_deref().unwrap().ends_with("Skip project logistics."));
+        assert_eq!(calls[2].append_system_prompt.as_deref(), Some("LANE"));
+    }
 
     fn tu(source: &str, text: &str, start: f64, end: f64) -> TranscriptUpdate {
         TranscriptUpdate {

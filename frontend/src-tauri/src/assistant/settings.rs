@@ -25,6 +25,8 @@ pub struct AssistantSettings {
     /// "See the Zoom or Teams window": capture the Zoom (else Teams) meeting window and send
     /// changed frames to the lanes. On by default.
     pub see_zoom_window: bool,
+    /// Rules every assistant turn carries on every call, set once. Empty adds nothing.
+    pub standing_rules: String,
 }
 
 impl Default for AssistantSettings {
@@ -42,6 +44,7 @@ impl Default for AssistantSettings {
             vault_root: String::new(),
             deep_read_dirs: String::new(),
             see_zoom_window: true,
+            standing_rules: String::new(),
         }
     }
 }
@@ -51,7 +54,8 @@ impl AssistantSettings {
         sqlx::query_as::<_, Self>(
             r#"
             SELECT enabled, claude_path, fast_model, fast_effort, deep_model, deep_effort,
-                   trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs, see_zoom_window
+                   trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs, see_zoom_window,
+                   standing_rules
             FROM assistant_settings WHERE id = '1'
             "#,
         )
@@ -64,8 +68,8 @@ impl AssistantSettings {
             r#"
             INSERT INTO assistant_settings (
                 id, enabled, claude_path, fast_model, fast_effort, deep_model, deep_effort,
-                trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs, see_zoom_window
-            ) VALUES ('1', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+                trigger_mode, quiet_gap_secs, names, vault_root, deep_read_dirs, see_zoom_window, standing_rules
+            ) VALUES ('1', $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
             ON CONFLICT(id) DO UPDATE SET
                 enabled = excluded.enabled,
                 claude_path = excluded.claude_path,
@@ -78,7 +82,8 @@ impl AssistantSettings {
                 names = excluded.names,
                 vault_root = excluded.vault_root,
                 deep_read_dirs = excluded.deep_read_dirs,
-                see_zoom_window = excluded.see_zoom_window
+                see_zoom_window = excluded.see_zoom_window,
+                standing_rules = excluded.standing_rules
             "#,
         )
         .bind(self.enabled)
@@ -93,6 +98,7 @@ impl AssistantSettings {
         .bind(&self.vault_root)
         .bind(&self.deep_read_dirs)
         .bind(self.see_zoom_window)
+        .bind(&self.standing_rules)
         .execute(pool)
         .await?;
 
@@ -228,6 +234,19 @@ mod tests {
         s.see_zoom_window = false;
         s.save(&pool).await.unwrap();
         assert!(!AssistantSettings::load(&pool).await.unwrap().see_zoom_window);
+    }
+
+    #[tokio::test]
+    async fn standing_rules_default_empty_and_round_trip() {
+        let pool = test_pool().await;
+        let mut s = AssistantSettings::load(&pool).await.unwrap();
+        assert_eq!(s.standing_rules, "");
+        s.standing_rules = "Skip project logistics.\nKeep answers short.".to_string();
+        s.save(&pool).await.unwrap();
+        assert_eq!(
+            AssistantSettings::load(&pool).await.unwrap().standing_rules,
+            "Skip project logistics.\nKeep answers short."
+        );
     }
 
     #[tokio::test]

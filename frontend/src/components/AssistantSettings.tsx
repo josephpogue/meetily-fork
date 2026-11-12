@@ -7,6 +7,7 @@ import { Switch } from '@/components/ui/switch';
 import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select';
 import { assistantService } from '@/services/assistantService';
 import { AssistantClaudeProbe, AssistantSettings as AssistantSettingsData } from '@/types';
@@ -24,6 +25,7 @@ const DEFAULT_SETTINGS: AssistantSettingsData = {
   vaultRoot: '',
   deepReadDirs: '',
   seeZoomWindow: true,
+  standingRules: '',
 };
 
 const MODEL_OPTIONS = [
@@ -281,6 +283,20 @@ export function AssistantSettings() {
             placeholder="joseph,joe"
           />
           <p className="mt-1 text-xs text-gray-500">Names the room calls you, comma separated.</p>
+        </div>
+
+        <div>
+          <Label htmlFor="standing-rules" className="mb-1.5 block">Standing rules</Label>
+          <Textarea
+            id="standing-rules"
+            value={settings.standingRules}
+            onChange={(e) => update('standingRules', e.target.value)}
+            rows={5}
+            placeholder="When suggesting questions, skip project logistics and project management."
+          />
+          <p className="mt-1 text-xs text-gray-500">
+            Rules the assistant follows on every reply, on every call. Set once; a change reaches the next reply of a call already running. The meeting brief stays for what one call is about.
+          </p>
         </div>
 
         <div>
