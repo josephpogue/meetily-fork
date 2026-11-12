@@ -1,30 +1,28 @@
 import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestRenderer } from 'react-test-renderer';
 
-const originalService = { ...await import('../../src/services/assistantService') };
+const originalCore = { ...await import('@tauri-apps/api/core') };
 const originalSonner = { ...await import('sonner') };
 afterAll(() => {
-  mock.module('../../src/services/assistantService', () => originalService);
+  mock.module('@tauri-apps/api/core', () => originalCore);
   mock.module('sonner', () => originalSonner);
 });
 
+// Only the Tauri boundary is faked: the real assistantService runs, so the test sees the
+// exact command and payload the backend would receive.
 const base = {
   enabled: true, claudePath: '', fastModel: 'claude-sonnet-5', fastEffort: 'medium',
   deepModel: 'claude-opus-5', deepEffort: 'medium', triggerMode: 'gated', quietGapSecs: 2,
   names: 'joseph,joe', vaultRoot: '', deepReadDirs: '', seeZoomWindow: false,
   standingRules: 'Skip project logistics.',
 };
-const saveSettings = mock((_s: unknown) => Promise.resolve());
+const invoke = mock((cmd: string, _args?: unknown): Promise<unknown> => {
+  if (cmd === 'assistant_get_settings') return Promise.resolve(base);
+  if (cmd === 'assistant_screen_recording_allowed') return Promise.resolve(true);
+  return Promise.resolve(null);
+});
+mock.module('@tauri-apps/api/core', () => ({ invoke }));
 mock.module('sonner', () => ({ toast: { success: () => {}, error: () => {} } }));
-mock.module('../../src/services/assistantService', () => ({
-  assistantService: {
-    getSettings: () => Promise.resolve(base),
-    saveSettings,
-    screenRecordingAllowed: () => Promise.resolve(true),
-    openScreenRecordingSettings: () => Promise.resolve(),
-    testClaude: () => Promise.resolve({ ok: true, version: '1', error: null }),
-  },
-}));
 const { AssistantSettings } = await import('../../src/components/AssistantSettings');
 
 // The component listens for window focus; bun has no DOM, so give it a bare window (and the timers Radix Select uses) for this file.
@@ -36,7 +34,7 @@ afterAll(() => { if (!hadWindow) delete g.window; });
 let renderer: ReactTestRenderer;
 afterEach(async () => {
   if (renderer) await act(async () => renderer.unmount());
-  saveSettings.mockClear();
+  invoke.mockClear();
 });
 
 describe('Standing rules setting', () => {
@@ -49,7 +47,8 @@ describe('Standing rules setting', () => {
     const save = renderer.root.findAll(n => n.type === 'button' && n.children.includes('Save settings'))[0];
     await act(async () => { await save.props.onClick(); });
 
-    expect(saveSettings).toHaveBeenCalledTimes(1);
-    expect((saveSettings.mock.calls[0][0] as { standingRules: string }).standingRules).toBe('Keep answers short.');
+    const saves = invoke.mock.calls.filter(c => c[0] === 'assistant_save_settings');
+    expect(saves).toHaveLength(1);
+    expect(saves[0][1]).toEqual({ settings: { ...base, standingRules: 'Keep answers short.' } });
   });
 });
