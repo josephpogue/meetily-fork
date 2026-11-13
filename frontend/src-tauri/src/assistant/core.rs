@@ -987,22 +987,26 @@ fn start_draft(core: &mut AssistantCore, picker: &str) -> (String, String, u64) 
 const PICKER_HINTS: i64 = 8;
 
 async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Result<(), String> {
-    let (vault_root, app) = {
+    let (vault_root, app, history) = {
         let core = handle.0.lock().await;
-        (resolve_vault_root(&core.settings.vault_root), core.app.clone())
+        (resolve_vault_root(&core.settings.vault_root), core.app.clone(), core.history.clone())
     };
-    // The writer also picks the project: it sees the main pages and the last few filings.
-    let filed = match app.as_ref().and_then(|a| a.try_state::<crate::state::AppState>()) {
-        Some(state) => AssistantMetaRepository::recent_filed(state.db_manager.pool(), PICKER_HINTS)
-            .await
-            .unwrap_or_else(|e| {
+    // The writer also picks the project: it sees the main pages, this meeting's
+    // title and Brief, and the last few filings.
+    let (this, filed) = match app.as_ref().and_then(|a| a.try_state::<crate::state::AppState>()) {
+        Some(state) => {
+            let pool = state.db_manager.pool();
+            let this = meeting_facts(pool, &history).await.ok().map(|f| (f.title.unwrap_or_default(), f.brief));
+            let filed = AssistantMetaRepository::recent_filed(pool, PICKER_HINTS).await.unwrap_or_else(|e| {
                 log::warn!("assistant: no filing hints for the project pick: {}", e);
                 Vec::new()
-            }),
-        None => Vec::new(),
+            });
+            (this, filed)
+        }
+        None => (None, Vec::new()),
     };
     let projects = note::list_projects(&vault_root);
-    let picker = note::picker_input(&vault_root, &filed);
+    let picker = note::picker_input(&vault_root, this.as_ref().map(|(t, b)| (t.as_str(), b.as_str())), &filed);
     let (mut transcript_text, mut qa_log_text, mut generation) = {
         let mut core = handle.0.lock().await;
         if only_if_ready && !matches!(core.note_state, NoteState::Ready) {
@@ -2779,6 +2783,7 @@ mod tests {
     #[tokio::test]
     async fn the_draft_sees_the_project_list_and_its_pick_is_the_suggestion_only_when_listed() {
         let vault = git_vault();
+        std::fs::write(vault.path().join("Wiki/Projects/mission.md"), "# M\n\nGroup.\n").unwrap();
         std::fs::write(vault.path().join("Wiki/Projects/mission-control-ui.md"), "# UI\n\nSub-page.\n").unwrap();
         for (pick, expected) in [("mission-control", Some("mission-control")), ("mission-control-ui", None), ("none", None)] {
             let handle = AssistantHandle::new();

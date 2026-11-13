@@ -145,9 +145,10 @@ fn is_project_slug(name: &str) -> bool {
 }
 
 /// Slugs of the main pages in `<vault_root>/Wiki/Projects/*.md`, sorted,
-/// kebab-case names only. A page is a sub-page, and left out, when another
-/// page's slug plus "-" is a prefix of its slug. A missing folder gives an
-/// empty list.
+/// kebab-case names only. A page is a sub-page, and left out, when two or more
+/// other pages' slugs plus "-" are prefixes of its slug: `broadcom` groups the
+/// client pages (`broadcom-pnc-bank`), which own their sub-pages
+/// (`broadcom-pnc-bank-wave-plan`). A missing folder gives an empty list.
 pub fn list_projects(vault_root: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(projects_dir(vault_root)) else {
         return Vec::new();
@@ -160,13 +161,14 @@ pub fn list_projects(vault_root: &Path) -> Vec<String> {
         .collect();
     all.sort();
     all.iter()
-        .filter(|slug| !all.iter().any(|other| slug.starts_with(&format!("{other}-"))))
+        .filter(|slug| all.iter().filter(|other| slug.starts_with(&format!("{other}-"))).count() < 2)
         .cloned()
         .collect()
 }
 
 const BLURB_CHARS: usize = 240;
 const HINT_BRIEF_CHARS: usize = 160;
+const THIS_BRIEF_CHARS: usize = 400;
 
 /// The first paragraph of a project page after its H1 (front matter skipped),
 /// on one line and cut to `BLURB_CHARS`; empty when unreadable.
@@ -184,15 +186,23 @@ fn page_blurb(vault_root: &Path, slug: &str) -> String {
 }
 
 /// The section of the draft input that lets the note writer pick the project:
-/// every main page with its blurb, then past filings (only those under a page
-/// still on the list). Empty when the vault has no projects.
-pub fn picker_input(vault_root: &Path, filed: &[FiledMeeting]) -> String {
+/// every main page with its blurb, this meeting's title and Brief, then past
+/// filings (only those under a page still on the list). Empty when the vault
+/// has no projects.
+pub fn picker_input(vault_root: &Path, this: Option<(&str, &str)>, filed: &[FiledMeeting]) -> String {
     let projects = list_projects(vault_root);
     if projects.is_empty() {
         return String::new();
     }
     let pages: Vec<String> = projects.iter().map(|slug| format!("- {}: {}", slug, page_blurb(vault_root, slug))).collect();
     let mut out = format!("VAULT PROJECTS (the PROJECT section names one slug from this list, or none):\n{}", pages.join("\n"));
+    if let Some((title, brief)) = this {
+        let (title, brief) = (super::ask_list::collapse(title), super::ask_list::collapse(brief));
+        let brief: String = brief.chars().take(THIS_BRIEF_CHARS).collect();
+        if !title.is_empty() || !brief.is_empty() {
+            out.push_str(&format!("\n\nTHIS MEETING:\n- title: {title}\n- brief: {brief}"));
+        }
+    }
     let past: Vec<String> = filed
         .iter()
         .filter(|f| projects.contains(&f.project))
@@ -768,25 +778,29 @@ mod tests {
     #[test]
     fn only_main_pages_are_listed() {
         let dir = picker_vault();
-        // A page is a sub-page when another slug plus "-" is a prefix of it.
-        assert_eq!(list_projects(dir.path()), vec!["broadcom", "homelab", "homelabs-extra"]);
+        // A page is a sub-page when two other slugs plus "-" are prefixes of it.
+        assert_eq!(
+            list_projects(dir.path()),
+            vec!["broadcom", "broadcom-csl-behring", "broadcom-pnc-bank", "homelab", "homelab-facts", "homelabs-extra"]
+        );
     }
 
     #[test]
     fn the_picker_input_lists_each_main_page_with_its_first_paragraph() {
         let dir = picker_vault();
-        let out = picker_input(dir.path(), &[]);
+        let out = picker_input(dir.path(), None, &[]);
         assert!(out.contains("- broadcom: The employer."));
         assert!(out.contains("- homelab: Two hosts."));
-        assert!(!out.contains("wave-plan"));
+        assert!(out.contains("- broadcom-pnc-bank: VCF migration for PNC. Second line."));
+        assert!(!out.contains("wave-plan") && !out.contains("box-index"));
         assert!(!out.contains("MEETINGS JOSEPH FILED BEFORE"));
         let pnc = tempfile::tempdir().unwrap();
         fs::create_dir_all(pnc.path().join("Wiki/Projects")).unwrap();
         fs::write(pnc.path().join("Wiki/Projects/p.md"), "---\nk: v\n---\n# P\n\nLine one.\nLine two.\n\nNext paragraph.\n").unwrap();
-        assert!(picker_input(pnc.path(), &[]).ends_with("- p: Line one. Line two."));
+        assert!(picker_input(pnc.path(), None, &[]).ends_with("- p: Line one. Line two."));
         fs::write(pnc.path().join("Wiki/Projects/p.md"), format!("# P\n\n{}\n", "word ".repeat(100))).unwrap();
         assert_eq!(page_blurb(pnc.path(), "p").chars().count(), BLURB_CHARS);
-        assert_eq!(picker_input(&dir.path().join("nowhere"), &[]), "");
+        assert_eq!(picker_input(&dir.path().join("nowhere"), None, &[]), "");
     }
 
     #[test]
@@ -795,12 +809,14 @@ mod tests {
         let filed = |title: &str, brief: &str, project: &str| FiledMeeting { title: title.into(), brief: brief.into(), project: project.into() };
         let out = picker_input(
             dir.path(),
+            Some(("PNC call", "Wave order")),
             &[
                 filed("CSL sprint planning", "Plan the sprint", "broadcom"),
                 filed("Long brief", &"x".repeat(HINT_BRIEF_CHARS + 1), "homelab"),
-                filed("Filed under a sub-page", "", "homelab-facts"),
+                filed("Filed under a sub-page", "", "broadcom-pnc-bank-wave-plan"),
             ],
         );
+        assert!(out.contains("THIS MEETING:\n- title: PNC call\n- brief: Wave order"));
         assert!(out.contains("MEETINGS JOSEPH FILED BEFORE"));
         assert!(out.contains("- \"CSL sprint planning\" (brief: Plan the sprint) -> broadcom"));
         assert!(out.contains("- \"Long brief\" -> homelab"));

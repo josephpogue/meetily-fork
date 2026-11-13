@@ -29,7 +29,7 @@ one slug from the VAULT PROJECTS list, or none
 <the note body, in markdown>
 ```
 
-PROJECT is the vault project this meeting belongs to, one slug copied exactly from the VAULT PROJECTS list at the end of the input. Go by what the meeting was about: who it was with and what for. The MEETINGS JOSEPH FILED BEFORE list shows how he filed similar meetings; follow it when a meeting looks like one of those. Write none when no project fits.
+PROJECT is the vault project this meeting belongs to, one slug copied exactly from the VAULT PROJECTS list at the end of the input. Go by what the meeting was about: who it was with and what for. THIS MEETING gives its title and Brief. The MEETINGS JOSEPH FILED BEFORE list shows how he filed similar meetings; follow it when a meeting looks like one of those. Write none when no project fits.
 
 The NOTE body has these sections, in this order, and no others. Skip a section entirely if it is genuinely empty rather than writing "none".
 
