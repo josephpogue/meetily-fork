@@ -71,9 +71,14 @@ dest="$INSTALL_DIR/$APP_NAME"
 old_req=""
 [ -d "$dest" ] && old_req="$(requirement "$dest")"
 
-rm -rf "$dest"
-ditto "$APP" "$dest"
-echo "Installed $dest"
+# --app pointing at the installed copy (to just repair its grant) must not delete its own source.
+if [ "$(cd "$APP" && pwd -P)" = "$(cd "$dest" 2>/dev/null && pwd -P)" ]; then
+  echo "$dest is already the app to install."
+else
+  rm -rf "$dest"
+  ditto "$APP" "$dest"
+  echo "Installed $dest"
+fi
 
 run() { if [ "$DRY" = 1 ]; then echo "[dry run] $*"; else "$@"; fi; }
 
