@@ -946,7 +946,7 @@ async fn draft_note_if_ready(handle: &AssistantHandle) -> Result<(), String> {
 /// now (the transcript, the Q&A log, the answered and open questions less the
 /// deleted ones). Returns them with the collector's delete generation as it
 /// stood, so a delete that lands while the draft runs can be told apart.
-fn start_draft(core: &mut AssistantCore) -> (String, String, u64) {
+fn start_draft(core: &mut AssistantCore, picker: &str) -> (String, String, u64) {
     core.note_state = NoteState::Drafting;
     core.note_error = None;
     core.emit_note();
@@ -976,11 +976,33 @@ fn start_draft(core: &mut AssistantCore) -> (String, String, u64) {
             .join("\n");
         draft_input = format!("{}\n\nSUGGESTED QUESTIONS STILL OPEN AT THE END:\n{}", draft_input, list);
     }
+    if !picker.is_empty() {
+        draft_input = format!("{}\n\n{}", draft_input, picker);
+    }
     core.session_transcript = transcript_text.clone();
     (transcript_text, draft_input, generation)
 }
 
+/// Past filings shown to the note writer as hints.
+const PICKER_HINTS: i64 = 8;
+
 async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Result<(), String> {
+    let (vault_root, app) = {
+        let core = handle.0.lock().await;
+        (resolve_vault_root(&core.settings.vault_root), core.app.clone())
+    };
+    // The writer also picks the project: it sees the main pages and the last few filings.
+    let filed = match app.as_ref().and_then(|a| a.try_state::<crate::state::AppState>()) {
+        Some(state) => AssistantMetaRepository::recent_filed(state.db_manager.pool(), PICKER_HINTS)
+            .await
+            .unwrap_or_else(|e| {
+                log::warn!("assistant: no filing hints for the project pick: {}", e);
+                Vec::new()
+            }),
+        None => Vec::new(),
+    };
+    let projects = note::list_projects(&vault_root);
+    let picker = note::picker_input(&vault_root, &filed);
     let (mut transcript_text, mut qa_log_text, mut generation) = {
         let mut core = handle.0.lock().await;
         if only_if_ready && !matches!(core.note_state, NoteState::Ready) {
@@ -989,7 +1011,7 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
         if core.session_open {
             return Err("stop the recording before drafting a note".to_string());
         }
-        start_draft(&mut core)
+        start_draft(&mut core, &picker)
     };
 
     loop {
@@ -1001,7 +1023,8 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
         let mut core = handle.0.lock().await;
         match result {
             Ok(raw) => match note::parse_note(&raw) {
-                Ok(draft) => {
+                Ok(mut draft) => {
+                    draft.project = note::keep_listed(draft.project.take(), &projects);
                     // An item deleted while this draft ran may be named in the
                     // model's text, which was written from the old inputs: draft
                     // again from what is left, staying Drafting until that lands.
@@ -1010,7 +1033,7 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
                             // A new call opened meanwhile and reset the note.
                             return Ok(());
                         }
-                        (transcript_text, qa_log_text, generation) = start_draft(&mut core);
+                        (transcript_text, qa_log_text, generation) = start_draft(&mut core, &picker);
                         continue;
                     }
                     // The preview carries the answered list as it stands, built in
@@ -1080,21 +1103,9 @@ pub async fn list_vault_projects(handle: &AssistantHandle) -> Vec<String> {
     note::list_projects(&root)
 }
 
-/// The project the finished meeting looks like it belongs to, if any.
-pub async fn suggest_vault_project(handle: &AssistantHandle, pool: &SqlitePool) -> Option<String> {
-    let (root, history, transcript) = {
-        let core = handle.0.lock().await;
-        let transcript = if core.session_transcript.is_empty() { core.transcript.all() } else { core.session_transcript.clone() };
-        (resolve_vault_root(&core.settings.vault_root), core.history.clone(), transcript)
-    };
-    let facts = match meeting_facts(pool, &history).await {
-        Ok(f) => f,
-        Err(e) => {
-            log::warn!("assistant: no vault project suggestion, meeting data unreadable: {}", e);
-            return None;
-        }
-    };
-    note::suggest_project(&root, facts.title.as_deref().unwrap_or(""), &facts.brief, &transcript)
+/// The project the note writer picked for the drafted note, if it is on the list.
+pub async fn suggest_vault_project(handle: &AssistantHandle) -> Option<String> {
+    handle.0.lock().await.note_draft.as_ref().and_then(|d| d.project.clone())
 }
 
 /// What a save returns to the note bar.
@@ -2749,6 +2760,40 @@ mod tests {
             .map(|t| t.prompt.clone())
             .expect("a note turn ran");
         assert!(note_prompt.contains("QUESTIONS ANSWERED DURING THE CALL:\n- What are your fees? Answer: Ten percent of rent."));
+    }
+
+    /// A runner whose note turn answers with the given PROJECT section.
+    fn project_runner(pick: &'static str, calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
+        Arc::new(move |turn, _on_delta, _register| {
+            let is_note = turn.prompt.starts_with("TRANSCRIPT:");
+            calls.lock().unwrap().push(turn);
+            let text = if is_note {
+                format!("=== SLUG ===\nkickoff\n=== PROJECT ===\n{pick}\n=== NOTE ===\n## Summary\n\nx")
+            } else {
+                "READY".to_string()
+            };
+            Box::pin(async move { ClaudeOutcome { session_id: Some(uuid::Uuid::new_v4().to_string()), text, error: None } })
+        })
+    }
+
+    #[tokio::test]
+    async fn the_draft_sees_the_project_list_and_its_pick_is_the_suggestion_only_when_listed() {
+        let vault = git_vault();
+        std::fs::write(vault.path().join("Wiki/Projects/mission-control-ui.md"), "# UI\n\nSub-page.\n").unwrap();
+        for (pick, expected) in [("mission-control", Some("mission-control")), ("mission-control-ui", None), ("none", None)] {
+            let handle = AssistantHandle::new();
+            let calls = Arc::new(StdMutex::new(Vec::new()));
+            open_lanes_with(&handle, test_lane_cfg(), "seed".to_string(), String::new(), project_runner(pick, calls.clone())).await;
+            close_session(&handle).await;
+            handle.0.lock().await.settings.vault_root = vault.path().to_string_lossy().into_owned();
+            assert_eq!(suggest_vault_project(&handle).await, None, "no suggestion before a draft");
+            assert!(draft_note(&handle).await.is_ok());
+            let prompt = last_note_prompt(&calls);
+            assert!(prompt.contains("VAULT PROJECTS"), "{prompt}");
+            assert!(prompt.contains("- mission-control: "), "{prompt}");
+            assert!(!prompt.contains("mission-control-ui"), "sub-pages are not offered: {prompt}");
+            assert_eq!(suggest_vault_project(&handle).await.as_deref(), expected, "pick {pick}");
+        }
     }
 
     #[tokio::test]

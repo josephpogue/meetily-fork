@@ -15,6 +15,14 @@ pub struct AssistantMeta {
     pub filed_at: Option<String>,
 }
 
+/// A meeting Joseph filed before, for the note writer's project hints.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FiledMeeting {
+    pub title: String,
+    pub brief: String,
+    pub project: String,
+}
+
 pub struct AssistantMetaRepository;
 
 impl AssistantMetaRepository {
@@ -34,6 +42,23 @@ impl AssistantMetaRepository {
             vault_transcript_path: r.get("vault_transcript_path"),
             filed_at: r.get("filed_at"),
         }))
+    }
+
+    /// The `limit` most recently filed meetings that were put under a project, newest first.
+    pub async fn recent_filed(pool: &SqlitePool, limit: i64) -> Result<Vec<FiledMeeting>, sqlx::Error> {
+        let rows = sqlx::query(
+            "SELECT m.title, a.brief, a.vault_project FROM meeting_assistant_meta a \
+             JOIN meetings m ON m.id = a.meeting_id \
+             WHERE a.vault_project IS NOT NULL AND a.filed_at IS NOT NULL \
+             ORDER BY a.filed_at DESC LIMIT ?",
+        )
+        .bind(limit)
+        .fetch_all(pool)
+        .await?;
+        Ok(rows
+            .into_iter()
+            .map(|r| FiledMeeting { title: r.get("title"), brief: r.get("brief"), project: r.get("vault_project") })
+            .collect())
     }
 
     /// Inserts the row, or updates only `brief` so the vault columns stay.
@@ -110,6 +135,26 @@ mod tests {
         AssistantMetaRepository::set_filed(&pool, "m1", None, "/n", "/t", "x").await.unwrap();
         let m = AssistantMetaRepository::get(&pool, "m1").await.unwrap().unwrap();
         assert_eq!((m.brief.as_str(), m.vault_project), ("", None));
+    }
+
+    #[tokio::test]
+    async fn recent_filed_lists_project_filings_newest_first() {
+        let pool = test_pool().await;
+        for id in ["m1", "m2", "m3", "m4"] {
+            add_meeting(&pool, id, None).await;
+        }
+        let file = |id: &'static str, project: Option<&'static str>, at: &'static str| {
+            let pool = pool.clone();
+            async move { AssistantMetaRepository::set_filed(&pool, id, project, "/n", "/t", at).await.unwrap() }
+        };
+        file("m1", Some("a"), "2026-11-01T10:00:00Z").await;
+        file("m2", Some("b"), "2026-11-03T10:00:00Z").await;
+        file("m3", None, "2026-11-04T10:00:00Z").await;
+        AssistantMetaRepository::set_brief(&pool, "m2", "second").await.unwrap();
+        let got = AssistantMetaRepository::recent_filed(&pool, 10).await.unwrap();
+        let seen: Vec<(&str, &str)> = got.iter().map(|f| (f.project.as_str(), f.brief.as_str())).collect();
+        assert_eq!(seen, vec![("b", "second"), ("a", "")]);
+        assert_eq!(AssistantMetaRepository::recent_filed(&pool, 1).await.unwrap().len(), 1);
     }
 
     #[tokio::test]
