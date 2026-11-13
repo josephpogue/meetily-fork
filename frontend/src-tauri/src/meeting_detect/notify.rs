@@ -18,6 +18,8 @@ pub enum Response {
     Open,
     /// The close button.
     Dismiss,
+    /// The Stop recording button on a "meeting ended" banner.
+    Stop,
 }
 
 /// Banner identifier for an app key ("zoom" | "teams").
@@ -35,6 +37,7 @@ const ID_PREFIX: &str = "meeting-detect-";
 /// Action identifiers: ours, and the two the system uses for a click on the
 /// banner body and for the close button.
 pub const RECORD_ACTION: &str = "meeting-detect-record";
+pub const STOP_ACTION: &str = "meeting-detect-stop";
 pub const DEFAULT_ACTION: &str = "com.apple.UNNotificationDefaultActionIdentifier";
 pub const DISMISS_ACTION: &str = "com.apple.UNNotificationDismissActionIdentifier";
 
@@ -42,6 +45,7 @@ pub fn response_for_action(action: &str) -> Option<Response> {
     match action {
         DEFAULT_ACTION => Some(Response::Open),
         RECORD_ACTION => Some(Response::Record),
+        STOP_ACTION => Some(Response::Stop),
         DISMISS_ACTION => Some(Response::Dismiss),
         _ => None,
     }
@@ -53,13 +57,13 @@ pub use mac::{init, show, withdraw};
 #[cfg(not(target_os = "macos"))]
 pub fn init(_on_response: Box<dyn Fn(&str, Response) + Send + Sync>) {}
 #[cfg(not(target_os = "macos"))]
-pub fn show(_app_key: &str, _title: &str, _body: &str) {}
+pub fn show(_app_key: &str, _title: &str, _body: &str, _ended: bool) {}
 #[cfg(not(target_os = "macos"))]
 pub fn withdraw(_app_key: &str) {}
 
 #[cfg(target_os = "macos")]
 mod mac {
-    use super::{app_of_banner, banner_id, response_for_action, Response, RECORD_ACTION};
+    use super::{app_of_banner, banner_id, response_for_action, Response, RECORD_ACTION, STOP_ACTION};
     use block2::{DynBlock, RcBlock};
     use objc2::rc::Retained;
     use objc2::runtime::{Bool, ProtocolObject};
@@ -80,6 +84,7 @@ mod mac {
     static DELEGATE: OnceLock<Retained<Delegate>> = OnceLock::new();
 
     const CATEGORY: &str = "meeting-detect";
+    const ENDED_CATEGORY: &str = "meeting-ended";
 
     define_class!(
         #[unsafe(super(NSObject))]
@@ -159,7 +164,18 @@ mod mac {
             // The close button reports back, so it counts as Dismiss.
             UNNotificationCategoryOptions::CustomDismissAction,
         );
-        center.setNotificationCategories(&NSSet::from_retained_slice(&[category]));
+        let stop = UNNotificationAction::actionWithIdentifier_title_options(
+            &NSString::from_str(STOP_ACTION),
+            &NSString::from_str("Stop recording"),
+            UNNotificationActionOptions::empty(),
+        );
+        let ended_category = UNNotificationCategory::categoryWithIdentifier_actions_intentIdentifiers_options(
+            &NSString::from_str(ENDED_CATEGORY),
+            &NSArray::from_retained_slice(&[stop]),
+            &NSArray::new(),
+            UNNotificationCategoryOptions::CustomDismissAction,
+        );
+        center.setNotificationCategories(&NSSet::from_retained_slice(&[category, ended_category]));
 
         // A grant already on file answers at once with no prompt.
         let done = RcBlock::new(|granted: Bool, error: *mut NSError| {
@@ -170,7 +186,8 @@ mod mac {
         center.requestAuthorizationWithOptions_completionHandler(UNAuthorizationOptions::Alert, &done);
     }
 
-    pub fn show(app_key: &str, title: &str, body: &str) {
+    /// `ended` picks the "meeting ended" banner (Stop recording button) over the "started" one (Record).
+    pub fn show(app_key: &str, title: &str, body: &str, ended: bool) {
         if DELEGATE.get().is_none() {
             return;
         }
@@ -178,7 +195,7 @@ mod mac {
         let content = UNMutableNotificationContent::new();
         content.setTitle(&NSString::from_str(title));
         content.setBody(&NSString::from_str(body));
-        content.setCategoryIdentifier(&NSString::from_str(CATEGORY));
+        content.setCategoryIdentifier(&NSString::from_str(if ended { ENDED_CATEGORY } else { CATEGORY }));
         let request = UNNotificationRequest::requestWithIdentifier_content_trigger(
             &NSString::from_str(&banner_id(app_key)),
             &content,
@@ -214,6 +231,7 @@ mod tests {
     fn actions_map_to_responses() {
         assert_eq!(response_for_action(DEFAULT_ACTION), Some(Response::Open));
         assert_eq!(response_for_action(RECORD_ACTION), Some(Response::Record));
+        assert_eq!(response_for_action(STOP_ACTION), Some(Response::Stop));
         assert_eq!(response_for_action(DISMISS_ACTION), Some(Response::Dismiss));
         assert_eq!(response_for_action("something-else"), None);
     }

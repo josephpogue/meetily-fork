@@ -1148,6 +1148,11 @@ pub async fn stop_recording<R: Runtime>(
     Ok(())
 }
 
+/// The call app the current recording is tied to, if any.
+pub fn recording_call_app() -> Option<super::call_apps::CallAppId> {
+    RECORDING_MANAGER.lock().unwrap().as_ref().and_then(|m| m.get_state().call_app())
+}
+
 /// Check if recording is active
 pub async fn is_recording() -> bool {
     IS_RECORDING.load(Ordering::SeqCst)
