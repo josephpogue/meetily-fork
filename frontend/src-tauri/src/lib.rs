@@ -719,6 +719,9 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             meeting_detect::meeting_detect_dismiss,
             meeting_detect::meeting_detect_current,
+            meeting_detect::meeting_detect_keep,
+            meeting_detect::meeting_detect_stop,
+            meeting_detect::meeting_detect_ended_current,
             start_recording,
             stop_recording,
             is_recording,

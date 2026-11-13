@@ -14,12 +14,16 @@ import type { CallApp, MeetingDetectedPayload } from '@/types';
 
 const ORDER: CallApp[] = ['zoom', 'teams'];
 
-/** One card per detected call app while Meetily is not recording. */
+/**
+ * One card per detected call app while Meetily is not recording ("<app> meeting started"), and one per
+ * ended call while it is ("<app> meeting ended": Stop recording or Keep recording).
+ */
 export function MeetingPrompt({ suppressed = false }: { suppressed?: boolean }) {
   const { isRecording } = useRecordingState();
   const pathname = usePathname();
   const router = useRouter();
   const [calls, setCalls] = useState<Partial<Record<CallApp, MeetingDetectedPayload>>>({});
+  const [endedCalls, setEndedCalls] = useState<Partial<Record<CallApp, MeetingDetectedPayload>>>({});
   const routeRef = useRef({ pathname, router });
   routeRef.current = { pathname, router };
   // While onboarding shows there is no start listener, so no card and no Record.
@@ -32,8 +36,9 @@ export function MeetingPrompt({ suppressed = false }: { suppressed?: boolean }) 
     isRecordingRef.current = isRecording;
     if (isRecording) {
       setCalls({});
-    } else if (wasRecording.current) {
-      callAudioStore.set(null); // After Stop the picker is back on All apps.
+    } else {
+      setEndedCalls({}); // A recording that stopped any way takes its ended cards with it.
+      if (wasRecording.current) callAudioStore.set(null); // After Stop the picker is back on All apps.
     }
     wasRecording.current = isRecording;
   }, [isRecording]);
@@ -70,6 +75,26 @@ export function MeetingPrompt({ suppressed = false }: { suppressed?: boolean }) 
       });
     }));
     keep(meetingDetectService.onRecord((p) => record(p.app)));
+    keep(meetingDetectService.onEnded((p) => {
+      if (!isRecordingRef.current || suppressedRef.current) return;
+      setEndedCalls((prev) => ({ ...prev, [p.app]: p }));
+    }));
+    keep(meetingDetectService.onEndedCleared(({ app }) => {
+      setEndedCalls((prev) => {
+        if (!prev[app]) return prev;
+        const next = { ...prev };
+        delete next[app];
+        return next;
+      });
+    }));
+    meetingDetectService.endedCurrent().then((list) => {
+      if (!alive || !isRecordingRef.current || !Array.isArray(list)) return;
+      setEndedCalls((prev) => {
+        const next = { ...prev };
+        for (const p of list) if (!next[p.app]) next[p.app] = p;
+        return next;
+      });
+    }).catch((e) => console.error('[MeetingPrompt] meeting_detect_ended_current failed', e));
 
     meetingDetectService.current().then((list) => {
       if (!alive || isRecordingRef.current || !Array.isArray(list)) return;
@@ -95,8 +120,18 @@ export function MeetingPrompt({ suppressed = false }: { suppressed?: boolean }) 
     meetingDetectService.dismiss(app).catch((e) => console.error('[MeetingPrompt] dismiss failed', e));
   }, []);
 
-  const cards = ORDER.map((a) => calls[a]).filter((c): c is MeetingDetectedPayload => !!c);
-  if (isRecording || suppressed || cards.length === 0) return null;
+  const answerEnded = useCallback((app: CallApp, action: 'keep' | 'stop') => {
+    setEndedCalls((prev) => {
+      const next = { ...prev };
+      delete next[app];
+      return next;
+    });
+    meetingDetectService[action](app).catch((e) => console.error(`[MeetingPrompt] ${action} failed`, e));
+  }, []);
+
+  // Start cards only while idle, ended cards only while recording, so a card is one kind or the other.
+  const cards = ORDER.map((a) => (isRecording ? endedCalls[a] : calls[a])).filter((c): c is MeetingDetectedPayload => !!c);
+  if (suppressed || cards.length === 0) return null;
 
   return (
     <div
@@ -106,7 +141,38 @@ export function MeetingPrompt({ suppressed = false }: { suppressed?: boolean }) 
       role="region"
       aria-label="Detected meetings"
     >
-      {cards.map((c) => (
+      {cards.map((c) => isRecording ? (
+        <section
+          key={`${c.app}-ended`}
+          aria-label={`${c.label} meeting ended`}
+          className="rounded-lg border border-gray-200 bg-white p-4 shadow-lg"
+        >
+          <div className="flex items-start gap-3">
+            <Video size={20} className="mt-0.5 shrink-0 text-blue-600" aria-hidden="true" />
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-gray-900">{c.label} meeting ended</p>
+            </div>
+          </div>
+          <div className="mt-3 flex gap-2">
+            <button
+              type="button"
+              onClick={() => answerEnded(c.app, 'stop')}
+              aria-label={`Stop recording after ${c.label} meeting`}
+              className="rounded-md bg-red-600 px-3 py-1.5 text-sm font-medium text-white transition-colors hover:bg-red-700 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-500 focus-visible:ring-offset-2"
+            >
+              Stop recording
+            </button>
+            <button
+              type="button"
+              onClick={() => answerEnded(c.app, 'keep')}
+              aria-label={`Keep recording after ${c.label} meeting`}
+              className="rounded-md border border-gray-300 px-3 py-1.5 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-100 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500 focus-visible:ring-offset-2"
+            >
+              Keep recording
+            </button>
+          </div>
+        </section>
+      ) : (
         <section
           key={c.app}
           aria-label={`${c.label} meeting`}

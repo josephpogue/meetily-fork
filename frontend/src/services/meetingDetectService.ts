@@ -22,6 +22,28 @@ class MeetingDetectService {
     return invoke('meeting_detect_dismiss', { app });
   }
 
+  endedCurrent(): Promise<MeetingDetectedPayload[]> {
+    return invoke<MeetingDetectedPayload[]>('meeting_detect_ended_current');
+  }
+
+  /** Keep recording on an ended card. */
+  keep(app: CallApp): Promise<void> {
+    return invoke('meeting_detect_keep', { app });
+  }
+
+  /** Stop recording on an ended card: the tray's Stop path, so everything Stop does still happens. */
+  stop(app: CallApp): Promise<void> {
+    return invoke('meeting_detect_stop', { app });
+  }
+
+  onEnded(cb: (p: MeetingDetectedPayload) => void): Promise<UnlistenFn> {
+    return listen<MeetingDetectedPayload>('meeting-ended', (e) => cb(e.payload));
+  }
+
+  onEndedCleared(cb: (p: { app: CallApp }) => void): Promise<UnlistenFn> {
+    return listen<{ app: CallApp }>('meeting-ended-cleared', (e) => cb(e.payload));
+  }
+
   onDetected(cb: (p: MeetingDetectedPayload) => void): Promise<UnlistenFn> {
     return listen<MeetingDetectedPayload>('meeting-detected', (e) => cb(e.payload));
   }

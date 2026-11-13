@@ -72,7 +72,15 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
 fn on_banner<R: Runtime>(app: &AppHandle<R>, state: &Arc<DetectState>, key: &str, response: notify::Response) {
     let Some(id) = CallAppId::parse(key) else { return };
     match response {
-        notify::Response::Dismiss => dismiss_app(app, state, id),
+        notify::Response::Dismiss => {
+            // Closing a "meeting ended" banner is Keep recording, not a 30-minute silence.
+            if state.inner.lock().ok().is_some_and(|r| r.ended().contains(&id)) {
+                keep_app(app, state, id);
+            } else {
+                dismiss_app(app, state, id);
+            }
+        }
+        notify::Response::Stop => stop_app(app, state, id),
         notify::Response::Open => crate::tray::focus_main_window(app),
         notify::Response::Record => {
             // A stale banner must not start a recording: Record only counts while that app is
@@ -93,6 +101,25 @@ fn on_banner<R: Runtime>(app: &AppHandle<R>, state: &Arc<DetectState>, key: &str
     }
 }
 
+/// Keep recording after a "meeting ended" prompt: removes the card and the banner.
+fn keep_app<R: Runtime>(app: &AppHandle<R>, state: &DetectState, id: CallAppId) {
+    let event = state.inner.lock().ok().and_then(|mut r| r.keep(id));
+    if let Some(e) = event {
+        apply(app, e);
+    }
+}
+
+/// Stop recording after a "meeting ended" prompt, by the tray's Stop path so everything Stop does still
+/// happens. A stale banner does nothing: it counts only while that app's ended prompt is showing.
+fn stop_app<R: Runtime>(app: &AppHandle<R>, state: &DetectState, id: CallAppId) {
+    let showing = state.inner.lock().ok().is_some_and(|r| r.ended().contains(&id));
+    if !showing {
+        return;
+    }
+    keep_app(app, state, id);
+    crate::tray::stop_recording_handler(app);
+}
+
 fn dismiss_app<R: Runtime>(app: &AppHandle<R>, state: &DetectState, id: CallAppId) {
     let event = match state.inner.lock() {
         Ok(mut r) => r.dismiss(id, state.now()),
@@ -109,9 +136,23 @@ fn apply<R: Runtime>(app: &AppHandle<R>, event: Event) {
         Event::Prompted { app: id, title } => {
             log::info!("meeting_detect: {} meeting started", id.label());
             let body = title.clone().unwrap_or_else(|| "Record it with meetily-fork".to_string());
-            notify::show(id.as_str(), &format!("{} meeting started", id.label()), &body);
+            notify::show(id.as_str(), &format!("{} meeting started", id.label()), &body, false);
             if let Err(e) = app.emit("meeting-detected", payload(id, title)) {
                 log::error!("meeting_detect: cannot emit meeting-detected: {}", e);
+            }
+        }
+        Event::Ended { app: id } => {
+            log::info!("meeting_detect: {} meeting ended while recording", id.label());
+            notify::show(id.as_str(), &format!("{} meeting ended", id.label()), "Stop recording with meetily-fork?", true);
+            if let Err(e) = app.emit("meeting-ended", payload(id, None)) {
+                log::error!("meeting_detect: cannot emit meeting-ended: {}", e);
+            }
+        }
+        Event::EndedCleared { app: id } => {
+            log::info!("meeting_detect: {} meeting-ended prompt cleared", id.label());
+            notify::withdraw(id.as_str());
+            if let Err(e) = app.emit("meeting-ended-cleared", ClearedPayload { app: id.as_str() }) {
+                log::error!("meeting_detect: cannot emit meeting-ended-cleared: {}", e);
             }
         }
         Event::Cleared { app: id } => {
@@ -168,7 +209,7 @@ async fn run<R: Runtime>(app: AppHandle<R>, state: Arc<DetectState>) {
         // It still applies a recording start, so a prompt never outlives one.
         if !readings_complete(view.is_some(), needs, windows.is_some()) {
             if recording {
-                let events = state.inner.lock().map(|mut r| r.recording_started()).unwrap_or_default();
+                let events = state.inner.lock().map(|mut r| r.recording_started(crate::audio::recording_commands::recording_call_app())).unwrap_or_default();
                 for e in events {
                     apply(&app, e);
                 }
@@ -178,6 +219,7 @@ async fn run<R: Runtime>(app: AppHandle<R>, state: Arc<DetectState>) {
         let tick = Tick {
             now: state.now(),
             recording,
+            recording_app: if recording { crate::audio::recording_commands::recording_call_app() } else { None },
             zoom: probe::signals(CallAppId::Zoom, zoom_mic, front.as_deref(), w),
             teams: probe::signals(CallAppId::Teams, teams_mic, front.as_deref(), w),
         };
@@ -229,6 +271,40 @@ pub fn meeting_detect_dismiss(
     let id = CallAppId::parse(&app).ok_or_else(|| format!("unknown call app: {}", app))?;
     dismiss_app(&handle, &state, id);
     Ok(())
+}
+
+/// Keep recording on an ended card: removes it, and that ended call never prompts again.
+#[tauri::command]
+pub fn meeting_detect_keep(
+    app: String,
+    handle: AppHandle,
+    state: State<'_, Arc<DetectState>>,
+) -> Result<(), String> {
+    let id = CallAppId::parse(&app).ok_or_else(|| format!("unknown call app: {}", app))?;
+    keep_app(&handle, &state, id);
+    Ok(())
+}
+
+/// Stop recording on an ended card: the same Stop path as the tray.
+#[tauri::command]
+pub fn meeting_detect_stop(
+    app: String,
+    handle: AppHandle,
+    state: State<'_, Arc<DetectState>>,
+) -> Result<(), String> {
+    let id = CallAppId::parse(&app).ok_or_else(|| format!("unknown call app: {}", app))?;
+    stop_app(&handle, &state, id);
+    Ok(())
+}
+
+/// Ended prompts showing right now, so a window that loads late still shows them.
+#[tauri::command]
+pub fn meeting_detect_ended_current(state: State<'_, Arc<DetectState>>) -> Vec<DetectedPayload> {
+    state
+        .inner
+        .lock()
+        .map(|r| r.ended().into_iter().map(|a| payload(a, None)).collect())
+        .unwrap_or_default()
 }
 
 /// Calls prompted right now, so a window that loads late still shows them.

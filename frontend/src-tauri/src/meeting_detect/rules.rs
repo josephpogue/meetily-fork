@@ -42,6 +42,9 @@ pub struct AppSignals {
 pub struct Tick {
     pub now: u64,
     pub recording: bool,
+    /// The one app the recording is tied to (started from a detected call, or Call audio set to
+    /// one app); None watches both.
+    pub recording_app: Option<App>,
     pub zoom: AppSignals,
     pub teams: AppSignals,
 }
@@ -59,6 +62,15 @@ impl Tick {
 pub enum Event {
     Prompted { app: App, title: Option<String> },
     Cleared { app: App },
+    /// A call seen during this recording ended: ask whether to stop recording.
+    Ended { app: App },
+    /// The ended prompt is gone: kept, the app's call came back, or the recording stopped.
+    EndedCleared { app: App },
+}
+
+/// Whether a recording tied to `recording_app` watches `app`.
+fn watches(recording_app: Option<App>, app: App) -> bool {
+    recording_app.map_or(true, |r| r == app)
 }
 
 #[derive(Debug, Default)]
@@ -69,6 +81,8 @@ struct Call {
     prompted: bool,
     /// Never prompt this call: recording was on, or it was dismissed.
     seen: bool,
+    /// Open at some point during the current recording (and inside its app scope).
+    in_recording: bool,
     title: Option<String>,
 }
 
@@ -76,6 +90,10 @@ struct Call {
 struct AppState {
     call: Option<Call>,
     dismissed_until: Option<u64>,
+    /// The ended prompt is showing for this app.
+    ended: bool,
+    /// A call seen during the recording ended on this tick.
+    just_ended: bool,
 }
 
 #[derive(Debug, Default)]
@@ -98,11 +116,12 @@ impl Rules {
 
     /// A recording is on and this tick could not be read: still mark every open call seen and clear its
     /// prompt, so no prompt outlives a recording start. Call start and end wait for a good read.
-    pub fn recording_started(&mut self) -> Vec<Event> {
+    pub fn recording_started(&mut self, recording_app: Option<App>) -> Vec<Event> {
         let mut events = Vec::new();
         for app in ALL {
             if let Some(call) = self.apps[index(app)].call.as_mut() {
                 call.seen = true;
+                call.in_recording |= watches(recording_app, app);
                 if call.prompted {
                     call.prompted = false;
                     events.push(Event::Cleared { app });
@@ -120,6 +139,17 @@ impl Rules {
                 c.prompted.then(|| (app, c.title.clone()))
             })
             .collect()
+    }
+
+    /// Apps whose ended prompt is showing right now.
+    pub fn ended(&self) -> Vec<App> {
+        ALL.iter().copied().filter(|&a| self.apps[index(a)].ended).collect()
+    }
+
+    /// The user kept recording. Returns EndedCleared when the prompt was showing.
+    pub fn keep(&mut self, app: App) -> Option<Event> {
+        let st = &mut self.apps[index(app)];
+        std::mem::take(&mut st.ended).then_some(Event::EndedCleared { app })
     }
 
     /// The user dismissed this app's prompt. Returns Cleared when a prompt was showing.
@@ -140,7 +170,36 @@ impl Rules {
         for app in ALL {
             self.tick_app(app, t, &mut events);
         }
+        self.tick_ended(t, &mut events);
         events
+    }
+
+    /// End-of-call prompts. Decided after every app's tick so "no other call open" sees this tick's ends.
+    fn tick_ended(&mut self, t: &Tick, events: &mut Vec<Event>) {
+        for app in ALL {
+            let st = &mut self.apps[index(app)];
+            // The recording stopped, or this app's call came back: the prompt has no meaning now.
+            if st.ended && (!t.recording || st.call.is_some()) {
+                st.ended = false;
+                events.push(Event::EndedCleared { app });
+            }
+        }
+        for app in ALL {
+            if !self.apps[index(app)].just_ended || !t.recording {
+                continue;
+            }
+            let other_open = ALL.iter().any(|&o| {
+                o != app && watches(t.recording_app, o) && self.apps[index(o)].call.is_some()
+            });
+            let st = &mut self.apps[index(app)];
+            if !other_open && !st.ended {
+                st.ended = true;
+                events.push(Event::Ended { app });
+            }
+        }
+        for st in &mut self.apps {
+            st.just_ended = false;
+        }
     }
 
     fn tick_app(&mut self, app: App, t: &Tick, events: &mut Vec<Event>) {
@@ -173,10 +232,16 @@ impl Rules {
         } else {
             call.quiet += 1;
         }
+        if t.recording && watches(t.recording_app, app) {
+            call.in_recording = true;
+        } else if !t.recording {
+            call.in_recording = false;
+        }
         if call.quiet >= QUIET_TICKS_TO_END {
             if call.prompted {
                 events.push(Event::Cleared { app });
             }
+            st.just_ended = call.in_recording && t.recording;
             st.call = None;
             return;
         }
@@ -212,7 +277,7 @@ mod tests {
     }
 
     fn tick(now: u64, recording: bool, zoom: AppSignals, teams: AppSignals) -> Tick {
-        Tick { now, recording, zoom, teams }
+        Tick { now, recording, zoom, teams, ..Default::default() }
     }
 
     fn zoom_only(now: u64, mic: bool, win: bool) -> Tick {
@@ -411,7 +476,7 @@ mod tests {
         let mut r = Rules::new();
         r.tick(&zoom_only(2, true, true));
         assert_eq!(r.prompted().len(), 1);
-        assert_eq!(cleared(&r.recording_started()), vec![App::Zoom]);
+        assert_eq!(cleared(&r.recording_started(None)), vec![App::Zoom]);
         assert!(r.prompted().is_empty());
         // Recording stops; the same call must not prompt again.
         let events = r.tick(&zoom_only(4, true, true));
@@ -477,5 +542,178 @@ mod tests {
         let ev = r.tick(&tick(2, false, zoom, AppSignals::default()));
         assert_eq!(ev, vec![Event::Prompted { app: App::Zoom, title: Some("Standup".into()) }]);
         assert_eq!(r.prompted(), vec![(App::Zoom, Some("Standup".into()))]);
+    }
+
+    // ---- meeting-ended prompt ----
+
+    fn ended(events: &[Event]) -> Vec<App> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::Ended { app } => Some(*app),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn ended_cleared(events: &[Event]) -> Vec<App> {
+        events
+            .iter()
+            .filter_map(|e| match e {
+                Event::EndedCleared { app } => Some(*app),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A recording tick tied to `scope`.
+    fn rec(now: u64, scope: Option<App>, zoom: AppSignals, teams: AppSignals) -> Tick {
+        Tick { now, recording: true, recording_app: scope, zoom, teams }
+    }
+
+    fn quiet() -> AppSignals {
+        AppSignals::default()
+    }
+
+    /// Feeds quiet recording ticks from `from`; returns every event raised.
+    fn go_quiet(r: &mut Rules, from: u64, scope: Option<App>) -> Vec<Event> {
+        (0..QUIET_TICKS_TO_END as u64)
+            .flat_map(|i| r.tick(&rec(from + 2 * i, scope, quiet(), quiet())))
+            .collect()
+    }
+
+    #[test]
+    fn call_seen_during_recording_prompts_when_it_ends() {
+        let mut r = Rules::new();
+        for t in [0, 2, 4] {
+            assert!(ended(&r.tick(&rec(t, None, sig(true, true), quiet()))).is_empty());
+        }
+        let ev = go_quiet(&mut r, 6, None);
+        assert_eq!(ended(&ev), vec![App::Zoom]);
+        assert_eq!(r.ended(), vec![App::Zoom]);
+        // Once per end, not once per tick.
+        assert!(ended(&r.tick(&rec(12, None, quiet(), quiet()))).is_empty());
+    }
+
+    #[test]
+    fn call_open_before_the_recording_counts_once_it_is_recording() {
+        let mut r = Rules::new();
+        r.tick(&zoom_only(0, true, true));
+        r.tick(&rec(2, None, sig(true, true), quiet()));
+        assert_eq!(ended(&go_quiet(&mut r, 4, None)), vec![App::Zoom]);
+    }
+
+    #[test]
+    fn recording_with_no_call_never_prompts() {
+        let mut r = Rules::new();
+        let mut all = Vec::new();
+        for t in (0..=20).step_by(2) {
+            all.extend(r.tick(&rec(t, None, quiet(), quiet())));
+        }
+        assert!(ended(&all).is_empty());
+    }
+
+    #[test]
+    fn call_that_ends_before_the_recording_does_not_prompt() {
+        let mut r = Rules::new();
+        r.tick(&zoom_only(0, true, true));
+        for t in [2, 4, 6] {
+            r.tick(&zoom_only(t, false, false));
+        }
+        assert!(ended(&go_quiet(&mut r, 8, None)).is_empty());
+    }
+
+    #[test]
+    fn call_that_ends_after_the_recording_stopped_does_not_prompt() {
+        let mut r = Rules::new();
+        r.tick(&rec(0, None, sig(true, true), quiet()));
+        r.tick(&zoom_only(2, true, true));
+        let ev: Vec<Event> = [4, 6, 8].iter().flat_map(|&t| r.tick(&zoom_only(t, false, false))).collect();
+        assert!(ended(&ev).is_empty());
+    }
+
+    #[test]
+    fn one_app_recording_ignores_the_other_apps_call() {
+        let mut r = Rules::new();
+        let scope = Some(App::Zoom);
+        for t in [0, 2, 4] {
+            r.tick(&rec(t, scope, quiet(), sig(true, true)));
+        }
+        assert!(ended(&go_quiet(&mut r, 6, scope)).is_empty());
+        // And an open call of the other app does not hold back the watched app's prompt.
+        let mut r = Rules::new();
+        for t in [0, 2, 4] {
+            r.tick(&rec(t, scope, sig(true, true), sig(true, true)));
+        }
+        let ev: Vec<Event> = [6, 8, 10].iter().flat_map(|&t| r.tick(&rec(t, scope, quiet(), sig(true, true)))).collect();
+        assert_eq!(ended(&ev), vec![App::Zoom]);
+    }
+
+    #[test]
+    fn no_prompt_while_another_tracked_call_is_open() {
+        let mut r = Rules::new();
+        for t in [0, 2, 4] {
+            r.tick(&rec(t, None, sig(true, true), sig(true, true)));
+        }
+        // Zoom ends, Teams stays on: no prompt yet.
+        let ev: Vec<Event> = [6, 8, 10].iter().flat_map(|&t| r.tick(&rec(t, None, quiet(), sig(true, true)))).collect();
+        assert!(ended(&ev).is_empty());
+        // Teams ends: its prompt shows.
+        assert_eq!(ended(&go_quiet(&mut r, 12, None)), vec![App::Teams]);
+    }
+
+    #[test]
+    fn two_calls_ending_on_the_same_tick_prompt_each_once() {
+        let mut r = Rules::new();
+        for t in [0, 2, 4] {
+            r.tick(&rec(t, None, sig(true, true), sig(true, true)));
+        }
+        let ev = go_quiet(&mut r, 6, None);
+        assert_eq!(ended(&ev), vec![App::Zoom, App::Teams]);
+    }
+
+    #[test]
+    fn keep_recording_clears_and_a_later_call_prompts_again() {
+        let mut r = Rules::new();
+        r.tick(&rec(0, None, sig(true, true), quiet()));
+        go_quiet(&mut r, 2, None);
+        assert_eq!(r.keep(App::Zoom), Some(Event::EndedCleared { app: App::Zoom }));
+        assert!(r.ended().is_empty());
+        assert_eq!(r.keep(App::Zoom), None, "nothing left to keep");
+        // The kept call stays quiet.
+        assert!(ended(&r.tick(&rec(10, None, quiet(), quiet()))).is_empty());
+        // A second call that starts and ends in the same recording prompts again.
+        r.tick(&rec(12, None, sig(true, true), quiet()));
+        assert_eq!(ended(&go_quiet(&mut r, 14, None)), vec![App::Zoom]);
+    }
+
+    #[test]
+    fn rejoin_clears_the_ended_prompt() {
+        let mut r = Rules::new();
+        r.tick(&rec(0, None, sig(true, true), quiet()));
+        go_quiet(&mut r, 2, None);
+        let ev = r.tick(&rec(10, None, sig(true, true), quiet()));
+        assert_eq!(ended_cleared(&ev), vec![App::Zoom]);
+        assert!(r.ended().is_empty());
+    }
+
+    #[test]
+    fn stopping_the_recording_clears_the_ended_prompt() {
+        let mut r = Rules::new();
+        r.tick(&rec(0, None, sig(true, true), quiet()));
+        go_quiet(&mut r, 2, None);
+        let ev = r.tick(&zoom_only(10, false, false));
+        assert_eq!(ended_cleared(&ev), vec![App::Zoom]);
+        assert!(r.ended().is_empty());
+    }
+
+    #[test]
+    fn a_call_after_stop_start_prompts_and_never_ends_prompts() {
+        let mut r = Rules::new();
+        r.tick(&rec(0, None, sig(true, true), quiet()));
+        go_quiet(&mut r, 2, None);
+        r.tick(&zoom_only(10, false, false));
+        assert_eq!(prompts(&r.tick(&zoom_only(12, true, true))), vec![App::Zoom]);
+        assert!(r.ended().is_empty());
     }
 }

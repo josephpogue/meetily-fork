@@ -31,6 +31,7 @@ let suppressedNow = false;
 let modelGate: Promise<void> | null = null;
 const invoke = mock(async (command: string, _args?: Record<string, unknown>): Promise<unknown> => {
   if (command === 'meeting_detect_current') return currentCalls;
+  if (command === 'meeting_detect_ended_current') return [];
   if (command === 'list_call_apps') return [
     { id: 'zoom', label: 'Zoom', running: true },
     { id: 'teams', label: 'Teams', running: teamsRunning },
@@ -213,6 +214,53 @@ describe('meeting prompt cards', () => {
     await act(async () => { setRec(true); });
     expect(cardText()).toEqual([]);
     await fire('meeting-detected', teams(null));
+    expect(cardText()).toEqual([]);
+  });
+});
+
+describe('meeting ended cards', () => {
+  test('a card shows only while recording, with Stop recording and Keep recording', async () => {
+    await mount();
+    await act(async () => { setRec(true); });
+    await fire('meeting-ended', zoom(null));
+    expect(cardText()).toEqual([['Zoom meeting ended']]);
+    expect(button('Stop recording after Zoom meeting')).toBeDefined();
+    expect(button('Keep recording after Zoom meeting')).toBeDefined();
+  });
+
+  test('an ended event while not recording shows nothing', async () => {
+    await mount();
+    await fire('meeting-ended', zoom(null));
+    expect(cardText()).toEqual([]);
+  });
+
+  test('Stop recording calls the stop command and removes the card', async () => {
+    await mount();
+    await act(async () => { setRec(true); });
+    await fire('meeting-ended', teams(null));
+    await act(async () => { button('Stop recording after Teams meeting').props.onClick(); });
+    expect(invoke).toHaveBeenCalledWith('meeting_detect_stop', { app: 'teams' });
+    expect(cardText()).toEqual([]);
+  });
+
+  test('Keep recording calls the keep command and removes the card', async () => {
+    await mount();
+    await act(async () => { setRec(true); });
+    await fire('meeting-ended', zoom(null));
+    await act(async () => { button('Keep recording after Zoom meeting').props.onClick(); });
+    expect(invoke).toHaveBeenCalledWith('meeting_detect_keep', { app: 'zoom' });
+    expect(cardText()).toEqual([]);
+  });
+
+  test('a rejoin clears the card, and a recording that stops another way removes it', async () => {
+    await mount();
+    await act(async () => { setRec(true); });
+    await fire('meeting-ended', zoom(null));
+    await fire('meeting-ended', teams(null));
+    expect(cardText()).toEqual([['Zoom meeting ended'], ['Teams meeting ended']]);
+    await fire('meeting-ended-cleared', { app: 'zoom' });
+    expect(cardText()).toEqual([['Teams meeting ended']]);
+    await act(async () => { setRec(false); });
     expect(cardText()).toEqual([]);
   });
 });
