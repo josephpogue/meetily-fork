@@ -541,6 +541,7 @@ pub fn run() {
         .manage(assistant::AssistantHandle::with_history(assistant_history))
         .setup(|_app| {
             meeting_detect::start(_app.handle());
+            assistant::vision::permission::request_access_if_missing();
             #[cfg(target_os = "windows")]
             match _app.path().resolve(
                 "onnxruntime.dll",
