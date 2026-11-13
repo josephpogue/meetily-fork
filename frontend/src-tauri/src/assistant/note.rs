@@ -11,6 +11,7 @@ use std::{fs, io};
 
 use super::ask_list::{AnswerHow, AnsweredItem};
 use crate::database::repositories::assistant_items::AssistantItem;
+use crate::database::repositories::assistant_meta::FiledMeeting;
 
 /// System prompt for `AnswerLanes::draft_note`. Populates `LaneConfig`'s
 /// `note_prompt` field so `lanes.rs` never depends on this file directly.
@@ -20,12 +21,16 @@ pub const NOTE_PROMPT: &str = include_str!("prompts/note.md");
 pub struct NoteDraft {
     pub slug: String,
     pub markdown: String,
+    /// The vault project the writer picked, as written: None for `none` or a
+    /// missing section. The caller keeps it only if it is on the project list.
+    pub project: Option<String>,
 }
 
 const SLUG_MARKER: &str = "=== SLUG ===";
+const PROJECT_MARKER: &str = "=== PROJECT ===";
 const NOTE_MARKER: &str = "=== NOTE ===";
 
-/// Parses the deep lane's raw reply into a slug and a note body.
+/// Parses the deep lane's raw reply into a slug, a project pick and a note body.
 pub fn parse_note(raw: &str) -> Result<NoteDraft, String> {
     let slug_pos = raw
         .find(SLUG_MARKER)
@@ -37,7 +42,15 @@ pub fn parse_note(raw: &str) -> Result<NoteDraft, String> {
         return Err(format!("{} must come after {}", NOTE_MARKER, SLUG_MARKER));
     }
 
-    let slug = raw[slug_pos + SLUG_MARKER.len()..note_pos].trim();
+    // The project section sits between the slug and the note; elsewhere it is ignored.
+    let project_pos = raw.find(PROJECT_MARKER).filter(|p| *p > slug_pos && *p < note_pos);
+    let slug_end = project_pos.unwrap_or(note_pos);
+    let project = project_pos
+        .map(|p| raw[p + PROJECT_MARKER.len()..note_pos].trim())
+        .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("none"))
+        .map(str::to_string);
+
+    let slug = raw[slug_pos + SLUG_MARKER.len()..slug_end].trim();
     let markdown = raw[note_pos + NOTE_MARKER.len()..].trim();
 
     if slug.is_empty() {
@@ -50,7 +63,13 @@ pub fn parse_note(raw: &str) -> Result<NoteDraft, String> {
     Ok(NoteDraft {
         slug: slug.to_string(),
         markdown: markdown.to_string(),
+        project,
     })
+}
+
+/// A pick counts only when it is on the project list; anything else is no project.
+pub fn keep_listed(pick: Option<String>, projects: &[String]) -> Option<String> {
+    pick.filter(|p| projects.iter().any(|s| s == p))
 }
 
 /// The "Answered questions" section, built in code from the assistant's
@@ -125,78 +144,78 @@ fn is_project_slug(name: &str) -> bool {
         && chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
 }
 
-/// Slugs of `<vault_root>/Wiki/Projects/*.md`, sorted, kebab-case names only.
-/// A missing folder gives an empty list.
+/// Slugs of the main pages in `<vault_root>/Wiki/Projects/*.md`, sorted,
+/// kebab-case names only. A page is a sub-page, and left out, when two or more
+/// other pages' slugs plus "-" are prefixes of its slug: `broadcom` groups the
+/// client pages (`broadcom-pnc-bank`), which own their sub-pages
+/// (`broadcom-pnc-bank-wave-plan`). A missing folder gives an empty list.
 pub fn list_projects(vault_root: &Path) -> Vec<String> {
     let Ok(entries) = fs::read_dir(projects_dir(vault_root)) else {
         return Vec::new();
     };
-    let mut out: Vec<String> = entries
+    let mut all: Vec<String> = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().is_file())
         .filter_map(|e| e.file_name().to_str().and_then(|n| n.strip_suffix(".md")).map(str::to_string))
         .filter(|slug| is_project_slug(slug))
         .collect();
-    out.sort();
-    out
-}
-
-/// Lowercase alphanumeric words of `text`.
-fn words(text: &str) -> std::collections::HashSet<String> {
-    text.split(|c: char| !c.is_alphanumeric())
-        .filter(|w| !w.is_empty())
-        .map(str::to_lowercase)
+    all.sort();
+    all.iter()
+        .filter(|slug| all.iter().filter(|other| slug.starts_with(&format!("{other}-"))).count() < 2)
+        .cloned()
         .collect()
 }
 
-/// The words of the first `# ` line of a project page; empty when unreadable.
-fn page_h1_words(vault_root: &Path, slug: &str) -> std::collections::HashSet<String> {
+const BLURB_CHARS: usize = 240;
+const HINT_BRIEF_CHARS: usize = 160;
+const THIS_BRIEF_CHARS: usize = 400;
+
+/// The first paragraph of a project page after its H1 (front matter skipped),
+/// on one line and cut to `BLURB_CHARS`; empty when unreadable.
+fn page_blurb(vault_root: &Path, slug: &str) -> String {
     let Ok(text) = fs::read_to_string(projects_dir(vault_root).join(format!("{slug}.md"))) else {
-        return Default::default();
+        return String::new();
     };
-    text.lines().find_map(|l| l.strip_prefix("# ")).map(words).unwrap_or_default()
+    let body = match text.strip_prefix("---\n").and_then(|t| t.split_once("\n---")) {
+        Some((_, rest)) => rest,
+        None => text.as_str(),
+    };
+    let mut lines = body.lines().skip_while(|l| !l.starts_with("# ")).skip(1).skip_while(|l| l.trim().is_empty());
+    let paragraph: Vec<&str> = lines.by_ref().take_while(|l| !l.trim().is_empty() && !l.starts_with('#')).collect();
+    super::ask_list::collapse(&paragraph.join(" ")).chars().take(BLURB_CHARS).collect()
 }
 
-/// The project the meeting is about, scored over the `Wiki/Projects` pages.
-/// A slug's tokens are its `-` parts (3+ characters, or a word of the page's
-/// H1) plus the H1's 3+ character words. A token found in 3+ slugs is common
-/// and scores 1, any other 3. Title and Brief weigh 2, the transcript 1; a
-/// token scores once per place it appears. Best total wins, ties go to the slug
-/// with fewer `-` parts then the alphabet, and under 3 gives None.
-pub fn suggest_project(vault_root: &Path, title: &str, brief: &str, transcript: &str) -> Option<String> {
-    let head = words(&format!("{title} {brief}"));
-    let body = words(transcript);
-    let slugs: Vec<(String, usize, std::collections::HashSet<String>)> = list_projects(vault_root)
-        .into_iter()
-        .map(|slug| {
-            let h1 = page_h1_words(vault_root, &slug);
-            let parts: Vec<&str> = slug.split('-').filter(|p| !p.is_empty()).collect();
-            let mut tokens: std::collections::HashSet<String> = parts
-                .iter()
-                .filter(|p| p.len() >= 3 || h1.contains(**p))
-                .map(|p| p.to_string())
-                .collect();
-            tokens.extend(h1.into_iter().filter(|w| w.chars().count() >= 3));
-            let n = parts.len();
-            (slug, n, tokens)
-        })
-        .collect();
-    let owners = |token: &str| slugs.iter().filter(|(_, _, t)| t.contains(token)).count();
-    let mut best: Option<(u32, usize, &String)> = None;
-    for (slug, parts, tokens) in &slugs {
-        let score: u32 = tokens
-            .iter()
-            .map(|t| {
-                let value = if owners(t) >= 3 { 1 } else { 3 };
-                value * (2 * head.contains(t) as u32 + body.contains(t) as u32)
-            })
-            .sum();
-        // Higher score, then fewer parts, then alphabetical (the list is sorted, so first wins).
-        if best.map_or(true, |(s, n, _)| score > s || (score == s && *parts < n)) {
-            best = Some((score, *parts, slug));
+/// The section of the draft input that lets the note writer pick the project:
+/// every main page with its blurb, this meeting's title and Brief, then past
+/// filings (only those under a page still on the list). Empty when the vault
+/// has no projects.
+pub fn picker_input(vault_root: &Path, this: Option<(&str, &str)>, filed: &[FiledMeeting]) -> String {
+    let projects = list_projects(vault_root);
+    if projects.is_empty() {
+        return String::new();
+    }
+    let pages: Vec<String> = projects.iter().map(|slug| format!("- {}: {}", slug, page_blurb(vault_root, slug))).collect();
+    let mut out = format!("VAULT PROJECTS (the PROJECT section names one slug from this list, or none):\n{}", pages.join("\n"));
+    if let Some((title, brief)) = this {
+        let (title, brief) = (super::ask_list::collapse(title), super::ask_list::collapse(brief));
+        let brief: String = brief.chars().take(THIS_BRIEF_CHARS).collect();
+        if !title.is_empty() || !brief.is_empty() {
+            out.push_str(&format!("\n\nTHIS MEETING:\n- title: {title}\n- brief: {brief}"));
         }
     }
-    best.filter(|(score, _, _)| *score >= 3).map(|(_, _, slug)| slug.clone())
+    let past: Vec<String> = filed
+        .iter()
+        .filter(|f| projects.contains(&f.project))
+        .map(|f| {
+            let brief = super::ask_list::collapse(&f.brief);
+            let brief = if brief.is_empty() || brief.chars().count() > HINT_BRIEF_CHARS { String::new() } else { format!(" (brief: {brief})") };
+            format!("- \"{}\"{} -> {}", super::ask_list::collapse(&f.title), brief, f.project)
+        })
+        .collect();
+    if !past.is_empty() {
+        out.push_str(&format!("\n\nMEETINGS JOSEPH FILED BEFORE, with the project he chose:\n{}", past.join("\n")));
+    }
+    out
 }
 
 pub fn check_project(vault_root: &Path, project: Option<&str>) -> Result<(), String> {
@@ -705,6 +724,7 @@ mod tests {
         NoteDraft {
             slug: "pnc-sync".into(),
             markdown: "## Summary\n\nWave order.\n\n## Open questions\n\n- Is pricing in scope?\n- Who signs off?\n".into(),
+            project: None,
         }
     }
 
@@ -735,82 +755,101 @@ mod tests {
         assert!(list_projects(&dir.path().join("nowhere")).is_empty());
     }
 
-    #[test]
-    fn suggestion_comes_from_title_and_brief_then_transcript() {
-        let dir = vault();
-        let root = dir.path();
-        // resolve_project matches the whole slug as words, so the title names it.
-        assert_eq!(suggest_project(root, "Broadcom PNC Bank sync with Jim", "", "").as_deref(), Some("broadcom-pnc-bank"));
-        assert_eq!(suggest_project(root, "Weekly sync", "Confirm wave order", "we talked about broadcom pnc bank").as_deref(), Some("broadcom-pnc-bank"));
-        assert_eq!(suggest_project(root, "Weekly sync", "Confirm wave order", "nothing relevant"), None);
-        // Linked in the index but with no page: never suggested.
-        fs::remove_file(root.join("Wiki/Projects/broadcom-pnc-bank.md")).unwrap();
-        assert_eq!(suggest_project(root, "Broadcom PNC Bank sync", "", ""), None);
-    }
-
-    /// The seven-project vault from the brief, each page with its own H1.
-    fn scored_vault() -> tempfile::TempDir {
+    /// A vault with main pages and sub-pages, each page with front matter, an H1 and a first paragraph.
+    fn picker_vault() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let projects = dir.path().join("Wiki/Projects");
         fs::create_dir_all(&projects).unwrap();
-        for (slug, h1) in [
-            ("broadcom", "Broadcom"),
-            ("broadcom-pnc-bank", "PNC Bank"),
-            ("broadcom-cleveland-clinic", "Cleveland Clinic"),
-            ("broadcom-principal-financial-group", "Principal Financial Group"),
-            ("mission-control", "Mission Control"),
-            ("homelab", "Homelab"),
-            ("homelab-facts", "Homelab facts"),
+        for (slug, h1, para) in [
+            ("broadcom-pnc-bank", "PNC Bank", "VCF migration for PNC.\nSecond line."),
+            ("broadcom-pnc-bank-wave-plan", "PNC wave plan", "Waves."),
+            ("broadcom-csl-behring", "CSL Behring", "Discovery for CSL."),
+            ("broadcom-csl-behring-box-index", "CSL box", "Index."),
+            ("broadcom", "Broadcom", "The employer."),
+            ("homelab", "Homelab", "Two hosts."),
+            ("homelab-facts", "Homelab facts", "Facts."),
+            ("homelabs-extra", "Other", "Not a sub-page: no hyphen after homelab."),
         ] {
-            fs::write(projects.join(format!("{slug}.md")), format!("---\ntags: x\n---\n# {h1}\n\nBody.\n")).unwrap();
+            fs::write(projects.join(format!("{slug}.md")), format!("---\ntags: x\n---\n# {h1}\n\n{para}\n\n## Meetings\n")).unwrap();
         }
         dir
     }
 
     #[test]
-    fn suggestion_scores_realistic_titles_over_the_project_list() {
-        let dir = scored_vault();
-        let root = dir.path();
-        // A distinctive token (pnc) in the title beats the common one (broadcom).
-        assert_eq!(suggest_project(root, "PNC sync with Jim", "", "").as_deref(), Some("broadcom-pnc-bank"));
-        // Only a common token in the title: 1 x 2 = 2, below the bar.
-        assert_eq!(suggest_project(root, "Broadcom sync", "", ""), None);
-        // Common token in title (2) and transcript (1) reaches 3; ties go to the fewest tokens.
-        assert_eq!(suggest_project(root, "Broadcom weekly", "", "the broadcom team").as_deref(), Some("broadcom"));
-        // Transcript only, two distinctive tokens at weight 1 each.
+    fn only_main_pages_are_listed() {
+        let dir = picker_vault();
+        // A page is a sub-page when two other slugs plus "-" are prefixes of it.
         assert_eq!(
-            suggest_project(root, "Weekly", "", "we met Cleveland Clinic. Cleveland Clinic again").as_deref(),
-            Some("broadcom-cleveland-clinic")
+            list_projects(dir.path()),
+            vec!["broadcom", "broadcom-csl-behring", "broadcom-pnc-bank", "homelab", "homelab-facts", "homelabs-extra"]
         );
-        assert_eq!(suggest_project(root, "Mission Control perf", "", "").as_deref(), Some("mission-control"));
-        assert_eq!(suggest_project(root, "Dentist", "", "lunch plans").as_deref(), None);
-        // Whole words only, any case.
-        assert_eq!(suggest_project(root, "pncx syncing", "", ""), None);
-        assert_eq!(suggest_project(root, "MISSION CONTROL", "", "").as_deref(), Some("mission-control"));
     }
 
     #[test]
-    fn a_short_slug_token_counts_only_when_the_page_h1_has_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let projects = dir.path().join("Wiki/Projects");
-        fs::create_dir_all(&projects).unwrap();
-        fs::write(projects.join("q3-planning.md"), "# Q3 planning\n").unwrap();
-        fs::write(projects.join("x1-garden.md"), "# Garden\n").unwrap();
-        // q3 is in the H1 as a word, so it counts (3 x 2); x1 is not, so it does not.
-        assert_eq!(suggest_project(dir.path(), "Q3 review", "", "").as_deref(), Some("q3-planning"));
-        assert_eq!(suggest_project(dir.path(), "x1 review", "", ""), None);
+    fn the_picker_input_lists_each_main_page_with_its_first_paragraph() {
+        let dir = picker_vault();
+        let out = picker_input(dir.path(), None, &[]);
+        assert!(out.contains("- broadcom: The employer."));
+        assert!(out.contains("- homelab: Two hosts."));
+        assert!(out.contains("- broadcom-pnc-bank: VCF migration for PNC. Second line."));
+        assert!(!out.contains("wave-plan") && !out.contains("box-index"));
+        assert!(!out.contains("MEETINGS JOSEPH FILED BEFORE"));
+        let pnc = tempfile::tempdir().unwrap();
+        fs::create_dir_all(pnc.path().join("Wiki/Projects")).unwrap();
+        fs::write(pnc.path().join("Wiki/Projects/p.md"), "---\nk: v\n---\n# P\n\nLine one.\nLine two.\n\nNext paragraph.\n").unwrap();
+        assert!(picker_input(pnc.path(), None, &[]).ends_with("- p: Line one. Line two."));
+        fs::write(pnc.path().join("Wiki/Projects/p.md"), format!("# P\n\n{}\n", "word ".repeat(100))).unwrap();
+        assert_eq!(page_blurb(pnc.path(), "p").chars().count(), BLURB_CHARS);
+        assert_eq!(picker_input(&dir.path().join("nowhere"), None, &[]), "");
     }
 
     #[test]
-    fn page_h1_words_count_as_extra_tokens_of_the_slug() {
-        let dir = tempfile::tempdir().unwrap();
-        let projects = dir.path().join("Wiki/Projects");
-        fs::create_dir_all(&projects).unwrap();
-        fs::write(projects.join("acme-rollout.md"), "# Acme Rollout Bluebird\n").unwrap();
-        fs::write(projects.join("other.md"), "# Other\n").unwrap();
-        assert_eq!(suggest_project(dir.path(), "Bluebird kickoff", "", "").as_deref(), Some("acme-rollout"));
+    fn the_picker_input_carries_past_filings_under_listed_pages_only() {
+        let dir = picker_vault();
+        let filed = |title: &str, brief: &str, project: &str| FiledMeeting { title: title.into(), brief: brief.into(), project: project.into() };
+        let out = picker_input(
+            dir.path(),
+            Some(("PNC call", "Wave order")),
+            &[
+                filed("CSL sprint planning", "Plan the sprint", "broadcom"),
+                filed("Long brief", &"x".repeat(HINT_BRIEF_CHARS + 1), "homelab"),
+                filed("Filed under a sub-page", "", "broadcom-pnc-bank-wave-plan"),
+            ],
+        );
+        assert!(out.contains("THIS MEETING:\n- title: PNC call\n- brief: Wave order"));
+        assert!(out.contains("MEETINGS JOSEPH FILED BEFORE"));
+        assert!(out.contains("- \"CSL sprint planning\" (brief: Plan the sprint) -> broadcom"));
+        assert!(out.contains("- \"Long brief\" -> homelab"));
+        assert!(!out.contains("Filed under a sub-page"));
     }
 
+    #[test]
+    fn parse_note_reads_the_project_section() {
+        let raw = "=== SLUG ===\nteam-standup\n=== PROJECT ===\nbroadcom-pnc-bank\n=== NOTE ===\n## Summary\n\nx\n";
+        let draft = parse_note(raw).unwrap();
+        assert_eq!(draft.slug, "team-standup");
+        assert_eq!(draft.project.as_deref(), Some("broadcom-pnc-bank"));
+        assert!(draft.markdown.starts_with("## Summary"));
+        // none, any case, is no project.
+        let none = raw.replace("broadcom-pnc-bank", "None");
+        assert_eq!(parse_note(&none).unwrap().project, None);
+        // A missing section is no project and the note still parses.
+        let missing = "=== SLUG ===\nteam-standup\n=== NOTE ===\n## Summary\n\nx\n";
+        let draft = parse_note(missing).unwrap();
+        assert_eq!((draft.slug.as_str(), draft.project), ("team-standup", None));
+        // A project section after the note is ignored.
+        let after = "=== SLUG ===\ns\n=== NOTE ===\nbody\n=== PROJECT ===\nbroadcom\n";
+        assert_eq!(parse_note(after).unwrap().project, None);
+    }
+
+    #[test]
+    fn a_pick_off_the_list_is_no_project() {
+        let list = vec!["broadcom".to_string(), "homelab".to_string()];
+        assert_eq!(keep_listed(Some("homelab".into()), &list).as_deref(), Some("homelab"));
+        assert_eq!(keep_listed(Some("homelab-facts".into()), &list), None);
+        assert_eq!(keep_listed(Some("made-up".into()), &list), None);
+        assert_eq!(keep_listed(None, &list), None);
+    }
     #[test]
     fn a_refile_replaces_only_the_two_code_sections() {
         let text = "# T\n\n## Summary\n\nx\n\n## Answered questions\n\n- **What storage?** NetApp. (On the call)\n\n## Q&A log\n\nQ: Where is the DR site?\nA: Charlotte.\n\n## Follow-up\n\n- call Jim\n- send diagram\n";

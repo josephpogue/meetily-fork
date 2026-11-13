@@ -101,13 +101,10 @@ pub async fn assistant_list_vault_projects(handle: State<'_, AssistantHandle>) -
     Ok(core::list_vault_projects(handle.inner()).await)
 }
 
-/// The project the finished meeting most likely belongs to, if any.
+/// The project the note writer picked for the drafted note, if any.
 #[tauri::command]
-pub async fn assistant_suggest_vault_project(
-    handle: State<'_, AssistantHandle>,
-    state: State<'_, AppState>,
-) -> Result<Option<String>, String> {
-    Ok(core::suggest_vault_project(handle.inner(), state.db_manager.pool()).await)
+pub async fn assistant_suggest_vault_project(handle: State<'_, AssistantHandle>) -> Result<Option<String>, String> {
+    Ok(core::suggest_vault_project(handle.inner()).await)
 }
 
 #[tauri::command]
