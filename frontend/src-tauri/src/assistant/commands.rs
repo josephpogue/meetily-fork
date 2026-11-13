@@ -169,7 +169,7 @@ pub async fn assistant_delete_items(
 
 #[tauri::command]
 pub async fn assistant_screen_recording_allowed() -> Result<bool, String> {
-    Ok(super::vision::permission::screen_recording_allowed())
+    Ok(super::vision::permission::screen_recording_allowed().await)
 }
 
 #[tauri::command]
