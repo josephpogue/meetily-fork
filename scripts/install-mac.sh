@@ -42,8 +42,8 @@ done
 requirement() { codesign -d -r- "$1" 2>&1 | sed -n 's/^[# ]*designated => //p'; }
 
 if [ "$BUILD" = 1 ]; then
-  security find-identity -v -p codesigning | grep -q "\"$IDENTITY\"" || {
-    echo "No signing identity \"$IDENTITY\". Run scripts/setup-mac-signing.sh once first." >&2; exit 1; }
+  security find-identity -v -p codesigning | grep -Eq "\"$IDENTITY\"[[:space:]]*$" || {
+    echo "No trusted signing identity \"$IDENTITY\". Run scripts/setup-mac-signing.sh once first." >&2; exit 1; }
   # tauri build exits 1 at the very end ("public key, no private key") because the updater
   # artifacts need a signing key this Mac does not have, after the app is already built and
   # signed. So a failure only counts when the app is not newer than the start of this build.
