@@ -443,7 +443,7 @@ Examples:
   docker run -e WHISPER_MODEL=models/ggml-large-v3.bin whisper-server
   
   # Start with port mapping
-  docker run -p 8178:8178 whisper-server
+  docker run -p 127.0.0.1:8178:8178 whisper-server
   
   # Start with volume for models
   docker run -v /path/to/models:/app/models whisper-server
