@@ -38,7 +38,7 @@ Joseph's own build of Meetily: an assistant that sits beside him during a call, 
 
 Decisions Joseph has made for this version. Every feature follows them.
 - Meetily's own summary providers stay untouched by the assistant's model calls.
-- The assistant sees only the Zoom or Microsoft Teams meeting window (Zoom first when both are open), and only while recording. It keeps a picture only when the window changes, by the /watch rule in `~/.claude/skills/watch/scripts/frames.py` (scene score above 0.20, then a 16x16 thumbnail more than 2.0 from the last kept picture). Kept pictures are saved full-size in the meeting folder.
+- The assistant sees only the Zoom or Microsoft Teams meeting window (Zoom first when both are open), and only while recording. It keeps a picture only when the window changes, by the /watch rule in `~/.claude/skills/watch/scripts/frames.py` (scene score above 0.20, then a 16x16 thumbnail more than 2.0 from the last kept picture), plus a timed candidate every 5 seconds in place of the rule's evenly spaced fallback: when 5 seconds have passed since the last kept picture, the current frame goes to the same thumbnail check, so a slow scroll or a page change in a shared window still gets kept while a still screen keeps nothing. Kept pictures are saved full-size in the meeting folder.
 - Nothing is written anywhere without a Save press.
 - The meeting brief is optional and editable during the call. A new recording starts clean: nothing from the previous call (brief, cards, questions, to-dos) carries over, except a brief typed after Stop and before the new recording. The assistant also works out the point of the call from the conversation.
 - Gaps are the assistant's own judgment from the context it has.

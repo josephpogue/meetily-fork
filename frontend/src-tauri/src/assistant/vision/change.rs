@@ -7,15 +7,26 @@
 //   - dedup: 16x16 grayscale thumbnail, mean absolute difference from the last
 //     KEPT frame's thumbnail, dropped when <= 2.0
 //     (~/.claude/skills/watch/scripts/frames.py: SCENE_THRESHOLD, DEDUP_THUMB,
-//     DEDUP_THRESHOLD, _frame_delta, _dedupe_by_deltas).
+//     DEDUP_THRESHOLD, _frame_delta, _dedupe_by_deltas);
+//   - timed candidate: /watch also treats a video with few scene cuts as a
+//     screen recording and samples it evenly in time, then dedups. Live, that
+//     becomes: when TIMED_KEEP_AFTER has passed since the last kept frame, the
+//     current frame goes to the same dedup. A slow scroll or a page change in a
+//     window that only partly fills the call never passes the scene gate; a
+//     still screen still keeps nothing.
 // Documented difference: ffmpeg scales the dedup thumbnail with bicubic; this
 // box-averages into 16x16 cells.
 //
 // Everything here is pure: tests drive it with plain byte arrays.
 
+use std::time::{Duration, Instant};
+
 pub const SCENE_THRESHOLD: f64 = 0.20;
 pub const DEDUP_THUMB: usize = 16;
 pub const DEDUP_THRESHOLD: f64 = 2.0;
+/// How long after the last kept frame the current frame becomes a candidate
+/// even when its scene score is low.
+pub const TIMED_KEEP_AFTER: Duration = Duration::from_secs(5);
 
 /// Byte order of a 4-byte pixel. Alpha (byte 3) is ignored either way.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,6 +99,10 @@ pub struct ChangeFilter {
     last_kept_thumb: Option<Vec<u8>>,
     /// Thumbnail of a frame `observe` said to keep, until `commit_kept`.
     pending_thumb: Option<Vec<u8>>,
+    /// When the last kept frame was saved (set at `commit_kept`).
+    last_kept_at: Option<Instant>,
+    /// When the frame `observe` said to keep was seen, until `commit_kept`.
+    pending_at: Option<Instant>,
 }
 
 impl ChangeFilter {
@@ -101,6 +116,7 @@ impl ChangeFilter {
     pub fn commit_kept(&mut self) {
         if let Some(t) = self.pending_thumb.take() {
             self.last_kept_thumb = Some(t);
+            self.last_kept_at = self.pending_at.take();
         }
     }
 
@@ -108,9 +124,15 @@ impl ChangeFilter {
     /// captured" frame) and says whether to keep it. A `kept` verdict only
     /// takes effect after `commit_kept`.
     pub fn observe(&mut self, frame: &Frame) -> Verdict {
+        self.observe_at(frame, Instant::now())
+    }
+
+    /// `observe` with the frame's time given, so tests do not wait.
+    pub fn observe_at(&mut self, frame: &Frame, now: Instant) -> Verdict {
         let verdict = match &self.prev {
             None => {
                 self.pending_thumb = Some(thumbnail(frame));
+                self.pending_at = Some(now);
                 Verdict {
                     score: 1.0,
                     thumb_delta: None,
@@ -131,7 +153,10 @@ impl ChangeFilter {
                 // Nothing committed yet means the last keep never reached disk:
                 // judge this frame by dedup alone, whatever its scene score.
                 let unsaved = self.pending_thumb.is_some() || self.last_kept_thumb.is_none();
-                if score > SCENE_THRESHOLD || unsaved {
+                let timed = self
+                    .last_kept_at
+                    .is_some_and(|t| now.saturating_duration_since(t) >= TIMED_KEEP_AFTER);
+                if score > SCENE_THRESHOLD || unsaved || timed {
                     let thumb = thumbnail(frame);
                     let delta = self
                         .last_kept_thumb
@@ -140,6 +165,7 @@ impl ChangeFilter {
                         .unwrap_or(f64::INFINITY);
                     let kept = delta > DEDUP_THRESHOLD;
                     self.pending_thumb = if kept { Some(thumb) } else { None };
+                    self.pending_at = if kept { Some(now) } else { None };
                     Verdict {
                         score,
                         thumb_delta: Some(delta),
@@ -435,5 +461,135 @@ mod tests {
         assert!(t.iter().all(|&v| v == 76));
         let white = solid(4, 2, 255);
         assert_eq!(mafd(&fr, &frame(&white, 4, 2)), (255.0 + 255.0) / 3.0);
+    }
+
+    // ---- timed candidate ----
+
+    const W: usize = 640;
+    const H: usize = 400;
+
+    /// Observe at `base + secs`, committing when kept.
+    fn feed_at(f: &mut ChangeFilter, d: &[u8], base: Instant, secs: u64) -> Verdict {
+        let v = f.observe_at(&frame(d, W, H), base + Duration::from_secs(secs));
+        if v.kept {
+            f.commit_kept();
+        }
+        v
+    }
+
+    fn paint(d: &mut [u8], x0: usize, y0: usize, w: usize, h: usize, v: u8) {
+        for y in y0..(y0 + h).min(H) {
+            for x in x0..(x0 + w).min(W) {
+                let i = (y * W + x) * 4;
+                d[i] = v;
+                d[i + 1] = v;
+                d[i + 2] = v;
+            }
+        }
+    }
+
+    /// A white page with a dark block 60 rows tall every 150 rows, shifted up
+    /// by `scroll` rows.
+    fn scrolled_page(scroll: usize) -> Vec<u8> {
+        let mut d = solid(W, H, 255);
+        for y in 0..H {
+            if (y + scroll) % 150 < 60 {
+                paint(&mut d, 100, y, 300, 1, 30);
+            }
+        }
+        d
+    }
+
+    #[test]
+    fn a_slow_scroll_that_never_passes_the_scene_gate_is_kept_within_five_seconds() {
+        let base = Instant::now();
+        let mut f = ChangeFilter::new();
+        assert!(feed_at(&mut f, &scrolled_page(0), base, 0).kept);
+        // 3 rows a second: every step is far under the scene threshold.
+        let mut kept_at = None;
+        for s in 1..=6u64 {
+            let v = feed_at(&mut f, &scrolled_page(3 * s as usize), base, s);
+            assert!(v.score <= SCENE_THRESHOLD, "step {s} scored {}", v.score);
+            if v.kept && kept_at.is_none() {
+                kept_at = Some(s);
+            }
+        }
+        assert_eq!(kept_at, Some(5));
+    }
+
+    #[test]
+    fn a_page_change_in_part_of_the_window_is_kept_within_five_seconds() {
+        let base = Instant::now();
+        let mut f = ChangeFilter::new();
+        let mut a = solid(W, H, 235);
+        paint(&mut a, 0, 0, 160, H, 60); // call sidebar, never changes
+        paint(&mut a, 200, 60, 380, 100, 195); // page A content
+        let mut b = a.clone();
+        paint(&mut b, 200, 60, 380, 100, 235);
+        paint(&mut b, 200, 200, 380, 120, 195); // page B content
+        assert!(feed_at(&mut f, &a, base, 0).kept);
+        let v = feed_at(&mut f, &b, base, 1);
+        assert!(v.score <= SCENE_THRESHOLD, "scored {}", v.score);
+        assert!(!v.kept, "the scene gate alone must not keep it");
+        for s in 2..=4 {
+            assert!(!feed_at(&mut f, &b, base, s).kept);
+        }
+        assert!(feed_at(&mut f, &b, base, 5).kept);
+    }
+
+    #[test]
+    fn an_unchanged_screen_keeps_nothing_new_however_long_it_stays() {
+        let base = Instant::now();
+        let mut f = ChangeFilter::new();
+        let a = scrolled_page(0);
+        assert!(feed_at(&mut f, &a, base, 0).kept);
+        for s in 1..=120 {
+            assert!(!feed_at(&mut f, &a, base, s).kept, "kept a still screen at {s}s");
+        }
+    }
+
+    #[test]
+    fn the_timed_candidate_waits_for_five_seconds_since_the_last_kept_frame() {
+        let base = Instant::now();
+        let mut f = ChangeFilter::new();
+        assert!(feed_at(&mut f, &scrolled_page(0), base, 0).kept);
+        let moved = scrolled_page(8);
+        // Changed, below the scene gate, but only 4 s after the keep.
+        let v = feed_at(&mut f, &moved, base, 4);
+        assert_eq!(v.thumb_delta, None);
+        assert!(!v.kept);
+        assert!(feed_at(&mut f, &moved, base, 5).kept);
+        // The clock restarts at that keep.
+        assert!(!feed_at(&mut f, &scrolled_page(16), base, 9).kept);
+    }
+
+    #[test]
+    fn a_timed_keep_that_was_never_saved_does_not_restart_the_clock() {
+        let base = Instant::now();
+        let mut f = ChangeFilter::new();
+        assert!(feed_at(&mut f, &scrolled_page(0), base, 0).kept);
+        let moved = scrolled_page(25);
+        // Kept at 5 s but the save failed: no commit.
+        assert!(f.observe_at(&frame(&moved, W, H), base + Duration::from_secs(5)).kept);
+        assert!(f.observe_at(&frame(&moved, W, H), base + Duration::from_secs(6)).kept);
+    }
+
+    #[test]
+    fn measure_a_one_line_text_change_against_the_dedup_threshold() {
+        // A mostly unchanged 640x400 page of text lines; one 300x8 line of a
+        // list changes (a different line of text, same ink density).
+        let mut page = solid(W, H, 250);
+        for row in 0..20 {
+            paint(&mut page, 40, 20 + row * 18, 500 - (row % 5) * 40, 8, 40);
+        }
+        let mut edited = page.clone();
+        paint(&mut edited, 40, 20 + 7 * 18, 460, 8, 250);
+        paint(&mut edited, 40, 20 + 7 * 18, 300, 8, 40);
+        let d = thumb_delta(
+            &thumbnail(&frame(&page, W, H)),
+            &thumbnail(&frame(&edited, W, H)),
+        );
+        eprintln!("one-line text change: thumb delta {d:.3} (keep needs > {DEDUP_THRESHOLD})");
+        assert!(d < DEDUP_THRESHOLD);
     }
 }
