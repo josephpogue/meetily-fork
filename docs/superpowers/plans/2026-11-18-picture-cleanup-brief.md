@@ -80,3 +80,15 @@ Meeting folder with `teams-frames/teams-20261118-110300-478.jpg` (200 bytes), `t
 - `draft_note_gated` in `assistant/core.rs` holds the core lock while the note run is in flight; the cleanup run must not wait on that lock, or the two would not run side by side.
 - New code lives in its own modules; edits to upstream files stay small and are listed in `docs/FORK_CHANGES.md`. `docs/GOAL.md` gets the two Requirements lines named in the design.
 - Supporting text 12.5px or larger. No em dashes in any text.
+
+## Answers to the tester's questions
+
+- **A move that fails part way:** `apply` returns Ok; the record lists only the pictures really in `removed/`, and the failure is logged. Err only when the record itself cannot be written.
+- **Purge and a failed record:** `purge_if_expired` does nothing to a Failed record and returns false; the record stays. Only a Done record whose window has ended is purged.
+- **Restore with no record, or a Purged record:** Err, and nothing changes.
+- **Repeats are checked in reply order.** A `repeat` is accepted only if its `repeat_of` is still kept at that point. A later entry that would remove a picture an accepted repeat points at is skipped, so a kept picture that a repeat names always stays. Two repeats naming each other: the first is accepted, the second skipped.
+- **Every named picture gone:** `apply` returns Ok with a Done record and an empty `removed` list.
+
+## Test file locations
+
+The guard accepts files under a `tests/` folder: `frontend/src-tauri/src/assistant/tests/cleanup.rs` (child module of cleanup.rs) and `frontend/src-tauri/src/tests/meeting_saved_cleanup.rs` (child module of meeting_saved.rs).

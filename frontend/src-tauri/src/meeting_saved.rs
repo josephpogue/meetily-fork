@@ -296,7 +296,7 @@ pub async fn api_get_meeting_saved(
 }
 
 #[cfg(test)]
-#[path = "meeting_saved_cleanup_tests.rs"]
+#[path = "tests/meeting_saved_cleanup.rs"]
 mod cleanup_size_tests;
 
 #[cfg(test)]
