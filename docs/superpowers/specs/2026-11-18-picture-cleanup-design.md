@@ -64,10 +64,10 @@ Joseph picked 1 because each run has the same context and the cleanup stays inde
 
 ## Rules this touches
 
-- **"Nothing is written anywhere without a Save press."** The cleanup moves pictures when Draft note is pressed, before Save. Proposed: a second exception beside the assistant-items save, because the move stays inside the recording folder and never reaches the vault.
-- **"The assistant never acts; it informs and converses."** Claude only returns a list; the app moves the files, and every move can be undone for five days. Proposed: picture cleanup is app housekeeping, not the assistant acting.
+- **"Nothing is written anywhere without a Save press."** The cleanup moves pictures when Draft note is pressed, before Save. Decided: a second exception beside the assistant-items save, because the move stays inside the recording folder and never reaches the vault.
+- **"The assistant never acts; it informs and converses."** Claude only returns a list; the app moves the files, and every move can be undone for five days. Decided: picture cleanup is app housekeeping, not the assistant acting.
 
-Both wait on Joseph's answer; the PR writes the agreed wording into `docs/GOAL.md`.
+Joseph agreed to both on 2026-11-18. The PR adds them to `docs/GOAL.md` Requirements: the picture move on Draft note is the second write that needs no Save press, and picture cleanup is app housekeeping, not the assistant acting.
 
 ## Left to the builder
 
