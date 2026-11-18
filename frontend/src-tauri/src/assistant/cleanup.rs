@@ -11,9 +11,10 @@
 // the restore window ends. Claude never writes; this code moves the files.
 
 use serde::{Deserialize, Serialize};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 
 /// The cleanup run's system prompt.
 pub const CLEANUP_PROMPT: &str = include_str!("prompts/cleanup.md");
@@ -175,8 +176,8 @@ pub struct SavedSession {
 /// The pictures from `pictures` that the saved session was not sent, in the
 /// same order: what a Try again must attach so Claude sees every picture.
 pub fn unsent(pictures: &[Picture], session: &SavedSession) -> Vec<Picture> {
-    let _ = session;
-    pictures.to_vec()
+    let held: HashSet<&str> = session.sent.iter().map(|s| s.as_str()).collect();
+    pictures.iter().filter(|p| !held.contains(p.file.as_str())).cloned().collect()
 }
 
 /// Saves the deep-lane session beside the record (best effort).
@@ -206,6 +207,18 @@ fn stamp_of(name: &str) -> Option<(String, String)> {
         return None;
     }
     Some((rest.to_string(), format!("{}:{}:{}", &hms[0..2], &hms[2..4], &hms[4..6])))
+}
+
+/// When a kept picture was captured, in epoch milliseconds, read from its file
+/// name (local time, "teams-20261118-110300-478.jpg"). None for another name.
+pub fn captured_at_ms(file: &str) -> Option<i64> {
+    use chrono::TimeZone;
+    let name = file.rsplit('/').next()?;
+    let (key, _) = stamp_of(name)?;
+    let (stamp, ms) = key.rsplit_once('-')?;
+    let naive = chrono::NaiveDateTime::parse_from_str(stamp, "%Y%m%d-%H%M%S").ok()?;
+    let local = chrono::Local.from_local_datetime(&naive).earliest()?;
+    Some(local.timestamp_millis() + ms.parse::<i64>().ok()?.min(999))
 }
 
 /// The kept pictures in `meeting_folder` (top level of each frames folder,
@@ -312,12 +325,36 @@ pub fn parse_reply(raw: &str, pictures: &[Picture]) -> Result<Vec<Removal>, Stri
     Ok(out)
 }
 
+/// One lock per meeting folder: every writer of the record (and every move of
+/// a picture in or out of `removed/`) holds it, so two of them never interleave.
+static FOLDER_LOCKS: Mutex<Option<HashMap<PathBuf, Arc<Mutex<()>>>>> = Mutex::new(None);
+
+fn folder_lock(meeting_folder: &Path) -> Arc<Mutex<()>> {
+    FOLDER_LOCKS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .entry(meeting_folder.to_path_buf())
+        .or_default()
+        .clone()
+}
+
+/// Writes the record to a temporary file of its own, then renames it into
+/// place, so a reader never sees a half-written file.
 fn write_record(meeting_folder: &Path, rec: &CleanupRecord) -> Result<(), String> {
+    static NEXT: AtomicU64 = AtomicU64::new(0);
     let text = serde_json::to_string_pretty(rec).map_err(|e| e.to_string())?;
-    let tmp = meeting_folder.join(format!("{}.tmp", RECORD_FILE));
-    std::fs::write(&tmp, text).map_err(|e| format!("could not write the cleanup record: {}", e))?;
-    std::fs::rename(&tmp, meeting_folder.join(RECORD_FILE))
-        .map_err(|e| format!("could not write the cleanup record: {}", e))
+    let tmp = meeting_folder.join(format!(
+        "{}.{}.{}.tmp",
+        RECORD_FILE,
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ));
+    let written = std::fs::write(&tmp, text).and_then(|_| std::fs::rename(&tmp, meeting_folder.join(RECORD_FILE)));
+    written.map_err(|e| {
+        let _ = std::fs::remove_file(&tmp);
+        format!("could not write the cleanup record: {}", e)
+    })
 }
 
 /// `dir/name.jpg` -> `dir/removed/name.jpg`.
@@ -329,6 +366,8 @@ fn removed_path(file: &str) -> Option<String> {
 /// Moves each removal's picture into `removed/` in its own frames folder and
 /// writes the record. Returns the record written.
 pub fn apply(meeting_folder: &Path, pictures: &[Picture], removals: &[Removal], now_ms: i64) -> Result<CleanupRecord, String> {
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let file_of = |id: &str| pictures.iter().find(|p| p.id == id).map(|p| p.file.clone());
     let mut moved: Vec<RemovedPicture> = Vec::new();
     for r in removals {
@@ -375,7 +414,9 @@ pub fn apply(meeting_folder: &Path, pictures: &[Picture], removals: &[Removal], 
 /// Moves the named pictures (their `file` values) back and updates the record.
 /// An empty list restores every removed picture.
 pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
-    let mut rec = load(meeting_folder).ok_or("there is no picture cleanup to restore from")?;
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rec = load_locked(meeting_folder).ok_or("there is no picture cleanup to restore from")?;
     if rec.state != CleanupState::Done {
         return Err("there are no removed pictures to restore".to_string());
     }
@@ -397,7 +438,9 @@ pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord,
 /// Undo for `restore`: moves the named restored pictures (their `file`
 /// values) back into `removed/` and marks them removed again.
 pub fn remove_again(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
-    let mut rec = load(meeting_folder).ok_or("there is no picture cleanup to undo")?;
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rec = load_locked(meeting_folder).ok_or("there is no picture cleanup to undo")?;
     if rec.state != CleanupState::Done {
         return Err("there are no removed pictures to undo".to_string());
     }
@@ -422,6 +465,8 @@ pub fn remove_again(meeting_folder: &Path, files: &[String]) -> Result<CleanupRe
 
 /// Writes a failed record. Moves nothing.
 pub fn record_failure(meeting_folder: &Path, error: &str, now_ms: i64) -> Result<CleanupRecord, String> {
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let rec = CleanupRecord {
         state: CleanupState::Failed { error: error.to_string() },
         ran_at_ms: now_ms,
@@ -432,15 +477,78 @@ pub fn record_failure(meeting_folder: &Path, error: &str, now_ms: i64) -> Result
     Ok(rec)
 }
 
-/// Reads the record. None when there is none or it cannot be read.
+/// Reads the record, first making it agree with the disk (the disk is the
+/// truth): see `load_locked`. None when there is no readable record.
 pub fn load(meeting_folder: &Path) -> Option<CleanupRecord> {
-    serde_json::from_str(&std::fs::read_to_string(meeting_folder.join(RECORD_FILE)).ok()?).ok()
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    load_locked(meeting_folder)
+}
+
+/// `load` for a caller that already holds the folder's lock.
+///
+/// An entry whose picture sits at `removed_file` is not restored; one whose
+/// picture is back at `file` is restored; one found in neither place is
+/// dropped. A picture in a `removed/` folder that no entry lists goes back to
+/// its frames folder, so nothing is stranded. A corrected record is written.
+fn load_locked(meeting_folder: &Path) -> Option<CleanupRecord> {
+    let mut rec: Option<CleanupRecord> =
+        std::fs::read_to_string(meeting_folder.join(RECORD_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok());
+    let mut changed = false;
+    let mut listed: HashSet<String> = HashSet::new();
+    if let Some(r) = rec.as_mut().filter(|r| r.state == CleanupState::Done) {
+        let before = r.removed.clone();
+        r.removed.retain_mut(|m| {
+            let in_removed = absolute(meeting_folder, &m.removed_file).is_file();
+            let in_place = absolute(meeting_folder, &m.file).is_file();
+            match (in_removed, in_place) {
+                (true, false) => m.restored = false,
+                (false, true) => m.restored = true,
+                // Gone from both places: drop it. With the frames folder itself
+                // missing (a folder that moved or is not mounted) nothing can be
+                // judged, so the entry stays.
+                (false, false) => {
+                    return m.file.rsplit_once('/').map(|(dir, _)| !meeting_folder.join(dir).is_dir()).unwrap_or(true)
+                }
+                (true, true) => {}
+            }
+            true
+        });
+        listed = r.removed.iter().map(|m| m.removed_file.clone()).collect();
+        changed = r.removed != before;
+    }
+    for dir in FRAME_DIRS {
+        let Ok(entries) = std::fs::read_dir(meeting_folder.join(dir).join(REMOVED_DIR)) else { continue };
+        for e in entries.flatten() {
+            let name = e.file_name().to_string_lossy().to_string();
+            if !e.file_type().map(|t| t.is_file()).unwrap_or(false) || listed.contains(&format!("{}/{}/{}", dir, REMOVED_DIR, name)) {
+                continue;
+            }
+            let back = meeting_folder.join(dir).join(&name);
+            if back.exists() {
+                continue; // never overwrite a kept picture
+            }
+            if let Err(err) = std::fs::rename(e.path(), &back) {
+                log::warn!("picture cleanup: could not move {} back: {}", name, err);
+            }
+        }
+    }
+    if changed {
+        if let Some(r) = rec.as_ref() {
+            if let Err(e) = write_record(meeting_folder, r) {
+                log::warn!("picture cleanup: {}", e);
+            }
+        }
+    }
+    rec
 }
 
 /// Deletes `removed/` in each frames folder when the window has ended, and
 /// marks the record Purged. True when it deleted something.
 pub fn purge_if_expired(meeting_folder: &Path, now_ms: i64) -> bool {
-    let Some(mut rec) = load(meeting_folder) else { return false };
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let Some(mut rec) = load_locked(meeting_folder) else { return false };
     if rec.state != CleanupState::Done || now_ms < rec.delete_after_ms {
         return false;
     }
