@@ -92,3 +92,15 @@ Meeting folder with `teams-frames/teams-20261118-110300-478.jpg` (200 bytes), `t
 ## Test file locations
 
 The guard accepts files under a `tests/` folder: `frontend/src-tauri/src/assistant/tests/cleanup.rs` (child module of cleanup.rs) and `frontend/src-tauri/src/tests/meeting_saved_cleanup.rs` (child module of meeting_saved.rs).
+
+## Round 2: review findings (2026-11-18)
+
+The high review found four ways the record and the disk can disagree. New rules:
+
+- **The disk is the truth.** `load` reconciles the record with the disk before returning it: an entry whose picture is at `removed_file` is not restored; an entry whose picture is back at `file` is restored; an entry whose picture is in neither place is dropped. A picture in a `removed/` folder that the record does not list is moved back to its frames folder (so nothing is ever stranded unrestorable), and is not listed. When reconciling changed anything, `load` writes the corrected record.
+  - Example: after `apply` on the worked example, move `teams-frames/removed/teams-20261118-110300-478.jpg` back to `teams-frames/` by hand. `load` marks that entry restored, and `summary` shows 1 removed.
+  - Example: a picture `teams-frames/removed/x.jpg` with no record entry. `load` moves it to `teams-frames/x.jpg`; it is not in the record; `list_pictures` lists it.
+  - Example: with no record file at all and a stray `teams-frames/removed/x.jpg`, `load` still moves it back and returns None.
+  - Example: Undo moved a restored picture back into `removed/` but the record still says restored. `load` marks it not restored.
+- **One writer at a time.** `apply`, `restore`, `record_failure` and `purge_if_expired` on the same meeting folder never interleave: two `restore` calls on different pictures of one folder, run at the same time from two threads, both take effect, and the record afterwards marks both restored. A record write never leaves a half-written file (write to a unique temporary file in the same folder, then rename).
+- **Try again sees every picture.** A retry forks the saved session and attaches every picture that session had not been sent, the same set the first run would have attached. The saved session file records which pictures that session already holds.
