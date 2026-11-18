@@ -504,12 +504,8 @@ fn load_locked(meeting_folder: &Path) -> Option<CleanupRecord> {
             match (in_removed, in_place) {
                 (true, false) => m.restored = false,
                 (false, true) => m.restored = true,
-                // Gone from both places: drop it. With the frames folder itself
-                // missing (a folder that moved or is not mounted) nothing can be
-                // judged, so the entry stays.
-                (false, false) => {
-                    return m.file.rsplit_once('/').map(|(dir, _)| !meeting_folder.join(dir).is_dir()).unwrap_or(true)
-                }
+                // Gone from both places (even the whole frames folder): drop it.
+                (false, false) => return false,
                 (true, true) => {}
             }
             true
