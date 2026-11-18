@@ -97,7 +97,7 @@ The guard accepts files under a `tests/` folder: `frontend/src-tauri/src/assista
 
 The high review found four ways the record and the disk can disagree. New rules:
 
-- **The disk is the truth.** `load` reconciles the record with the disk before returning it: an entry whose picture is at `removed_file` is not restored; an entry whose picture is back at `file` is restored; an entry whose picture is in neither place is dropped. A picture in a `removed/` folder that the record does not list is moved back to its frames folder (so nothing is ever stranded unrestorable), and is not listed. When reconciling changed anything, `load` writes the corrected record.
+- **The disk is the truth.** `load` reconciles the record with the disk before returning it: an entry whose picture is at `removed_file` is not restored; an entry whose picture is back at `file` is restored; an entry whose picture is in neither place is dropped, also when its whole frames folder is gone. A picture in a `removed/` folder that the record does not list is moved back to its frames folder (so nothing is ever stranded unrestorable), and is not listed. When reconciling changed anything, `load` writes the corrected record.
   - Example: after `apply` on the worked example, move `teams-frames/removed/teams-20261118-110300-478.jpg` back to `teams-frames/` by hand. `load` marks that entry restored, and `summary` shows 1 removed.
   - Example: a picture `teams-frames/removed/x.jpg` with no record entry. `load` moves it to `teams-frames/x.jpg`; it is not in the record; `list_pictures` lists it.
   - Example: with no record file at all and a stray `teams-frames/removed/x.jpg`, `load` still moves it back and returns None.
@@ -107,3 +107,4 @@ The high review found four ways the record and the disk can disagree. New rules:
   - Entry point: `SavedSession.sent` (meeting-relative paths of the pictures the session already holds; a file without the field loads with an empty list) and `unsent(pictures, session)`, which returns the pictures not in `sent`, in their order.
   - Example: pictures P1 `teams-frames/a.jpg`, P2 `teams-frames/b.jpg`, P3 `zoom-frames/c.jpg`; `sent` = [`teams-frames/a.jpg`]. `unsent` gives P2 and P3.
   - Example: a session file saved without `sent` loads, and `unsent` gives every picture.
+- **Round 3 (review 2):** an entry is dropped even when its frames folder no longer exists. The round 1 test that reads back each kind of record now puts the Done record's pictures on disk where the record says they are, so the rule and that test agree.
