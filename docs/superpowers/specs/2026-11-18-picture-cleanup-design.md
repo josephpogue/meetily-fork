@@ -26,6 +26,8 @@ Mockup (clickable): `~/.claude/artifacts/587ff039-b5ae-419c-a417-6ffd8246b171/me
 - **What Claude returns.** A list of the pictures to remove, each with a reason group, an optional specific caption, and, for a repeat, which kept picture it repeats. When pictures repeat each other, Claude keeps the clearest one. Claude writes nothing; the app does the moving.
 - **Removing.** The app moves each removed picture into a `removed/` folder inside its frames folder (`teams-frames/` or `zoom-frames/`) and records the reasons beside it. `count_jpgs` in `meeting_saved.rs` reads only the top folder, so "What was saved" already counts only kept pictures.
 - **Restoring.** Restore moves a picture back and updates the record.
+- **Sizes during the restore window (my call).** "What was saved" and the meeting-list totals count only kept pictures, so the size leaves out `removed/` (today `dir_bytes` in `meeting_saved.rs` counts subfolders, and its `size_is_recursive_total` test changes with it; list the edit in `docs/FORK_CHANGES.md`). The header line keeps "to free 51 MB"; the panel title reads "93 pictures removed, 51 MB freed on Mon, Nov 23", so it never claims space that is still on disk.
+- **When the cleanup fails (my call).** The meeting page shows one line in place of the header line, "Picture cleanup did not finish. Try again", and Try again starts the cleanup run alone. The failure is stored with the meeting so the page shows it after a restart.
 - **Deleting for good.** Five days after the cleanup, the app deletes the `removed/` folder and its record. After that the header line no longer offers restore.
 
 ## Approaches considered
