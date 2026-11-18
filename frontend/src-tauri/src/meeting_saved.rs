@@ -30,6 +30,8 @@ pub struct MeetingSaved {
     pub duration_seconds: f64,
     pub pictures: u64,
     pub bytes: u64,
+    /// A picture cleanup record exists for this meeting, so the page asks for it.
+    pub cleanup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -231,6 +233,11 @@ where
     let count = rows.len();
     for r in rows {
         let scan = r.folder.as_deref().and_then(|f| scan_folder(Path::new(f)));
+        let has_cleanup = r
+            .folder
+            .as_deref()
+            .map(|f| Path::new(f).join(crate::assistant::cleanup::RECORD_FILE).is_file())
+            .unwrap_or(false);
         let saved = match &scan {
             Some(s) => MeetingSaved {
                 brief: r.brief,
@@ -238,6 +245,7 @@ where
                 duration_seconds: length_seconds(s, r.created).unwrap_or(0.0),
                 pictures: s.pictures,
                 bytes: s.bytes,
+                cleanup: has_cleanup,
             },
             None => MeetingSaved {
                 brief: r.brief,
@@ -245,6 +253,7 @@ where
                 duration_seconds: 0.0,
                 pictures: 0,
                 bytes: 0,
+                cleanup: false,
             },
         };
         hours += saved.duration_seconds / 3600.0;

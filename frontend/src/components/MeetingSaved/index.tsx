@@ -1,7 +1,8 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
+import { PictureCleanup } from './PictureCleanup';
 
 // Shapes of api_get_meetings_saved / api_get_meeting_saved (src-tauri/src/meeting_saved.rs).
 // The backend writes all the wording; these components only place it.
@@ -11,6 +12,8 @@ export interface MeetingSaved {
   durationSeconds: number;
   pictures: number;
   bytes: number;
+  /** A picture cleanup record exists for this meeting. */
+  cleanup?: boolean;
 }
 
 export interface SavedOverview {
@@ -42,6 +45,9 @@ export function SavedTotals({ totals, meetingCount }: { totals?: string; meeting
  */
 export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId: string; title: string; reloadKey?: unknown }) {
   const [loaded, setLoaded] = useState<{ id: string; saved: MeetingSaved | null } | null>(null);
+  // Bumped when picture cleanup finishes or Joseph restores pictures: the saved numbers change.
+  const [version, setVersion] = useState(0);
+  const onCleanupChanged = useCallback(() => setVersion((n) => n + 1), []);
 
   useEffect(() => {
     let cancelled = false;
@@ -49,7 +55,7 @@ export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId:
       .then((s) => { if (!cancelled) setLoaded({ id: meetingId, saved: s ?? null }); })
       .catch((error) => console.error('Failed to load what was saved:', error));
     return () => { cancelled = true; };
-  }, [meetingId, reloadKey]);
+  }, [meetingId, reloadKey, version]);
 
   // Another meeting's numbers are never shown; the same meeting keeps its line while reloading.
   const saved = loaded?.id === meetingId ? loaded.saved : null;
@@ -59,6 +65,7 @@ export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId:
       <h1 className="truncate text-sm font-semibold text-gray-900" title={title}>{title}</h1>
       <BriefLine brief={saved?.brief} />
       {saved && <p className="text-xs text-gray-600">What was saved: {saved.line}</p>}
+      <PictureCleanup meetingId={meetingId} hasCleanup={saved?.cleanup} version={version} onChanged={onCleanupChanged} />
     </div>
   );
 }

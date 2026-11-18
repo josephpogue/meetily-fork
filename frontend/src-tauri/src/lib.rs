@@ -841,6 +841,7 @@ pub fn run() {
             meeting_saved::api_get_meeting_saved,
             assistant::cleanup_run::picture_cleanup_get,
             assistant::cleanup_run::picture_cleanup_restore,
+            assistant::cleanup_run::picture_cleanup_undo_restore,
             assistant::cleanup_run::picture_cleanup_retry,
             assistant::cleanup_run::picture_cleanup_picture,
             api::api_search_transcripts,

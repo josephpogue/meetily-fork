@@ -178,6 +178,20 @@ pub struct CleanupView {
     pub can_retry: bool,
     /// A run is in flight.
     pub running: bool,
+    /// "93 pictures removed, 51 MB freed on Mon, Nov 23"
+    pub title: Option<String>,
+    /// "Claude kept the 44 that show something new. ... deleted for good on Mon, Nov 23."
+    pub note: Option<String>,
+    /// "You can bring them back until Mon, Nov 23."
+    pub bring_back: Option<String>,
+    /// "Mon, Nov 23": when the removed pictures are deleted for good.
+    pub until: Option<String>,
+}
+
+/// "Mon, Nov 23" in local time.
+fn day_text(ms: i64) -> Option<String> {
+    use chrono::TimeZone;
+    chrono::Local.timestamp_millis_opt(ms).single().map(|t| t.format("%a, %b %-d").to_string())
 }
 
 fn view_of(folder: &Path, record: Option<CleanupRecord>) -> CleanupView {
@@ -187,7 +201,23 @@ fn view_of(folder: &Path, record: Option<CleanupRecord>) -> CleanupView {
         Some(CleanupRecord { state: CleanupState::Done, removed, .. }) => removed,
         _ => Vec::new(),
     };
-    CleanupView { summary, removed, can_retry, running: cleanup::run_in_flight(folder) }
+    let until = if summary.removed > 0 { day_text(summary.delete_after_ms) } else { None };
+    let (mut title, mut note, mut bring_back) = (None, None, None);
+    if let Some(day) = until.clone() {
+        let kept = cleanup::list_pictures(folder).len();
+        title = Some(format!(
+            "{} removed, {} freed on {}",
+            crate::meeting_saved::format_pictures(summary.removed),
+            crate::meeting_saved::format_size(summary.bytes),
+            day
+        ));
+        note = Some(format!(
+            "Claude kept the {} that show something new. Click a picture to see it full size. Removed pictures are deleted for good on {}.",
+            kept, day
+        ));
+        bring_back = Some(format!("You can bring them back until {}.", day));
+    }
+    CleanupView { summary, removed, can_retry, running: cleanup::run_in_flight(folder), title, note, bring_back, until }
 }
 
 /// A path the page may ask for: inside a frames folder, no way out of it.
@@ -224,6 +254,22 @@ pub async fn picture_cleanup_restore(
     let folder = folder_of(state.db_manager.pool(), &meeting_id).await?;
     tokio::task::spawn_blocking(move || {
         let record = cleanup::restore(&folder, &files)?;
+        Ok(view_of(&folder, Some(record)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
+/// Undo for a restore: puts the named restored pictures back into `removed/`.
+#[tauri::command]
+pub async fn picture_cleanup_undo_restore(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    files: Vec<String>,
+) -> Result<CleanupView, String> {
+    let folder = folder_of(state.db_manager.pool(), &meeting_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let record = cleanup::remove_again(&folder, &files)?;
         Ok(view_of(&folder, Some(record)))
     })
     .await

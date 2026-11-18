@@ -21,3 +21,4 @@ Reply with one JSON object and nothing else:
 - "caption" is optional: a short, specific description such as "Save changes? box". Use plain words and no dashes.
 - "repeat_of" is required for a repeat and used for no other reason.
 - List each picture at most once. If nothing should be removed, reply {"remove":[]}.
+- A picture you cannot find in this conversation must stay: leave it out of the list.

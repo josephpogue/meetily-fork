@@ -382,6 +382,32 @@ pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord,
     Ok(rec)
 }
 
+/// Undo for `restore`: moves the named restored pictures (their `file`
+/// values) back into `removed/` and marks them removed again.
+pub fn remove_again(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
+    let mut rec = load(meeting_folder).ok_or("there is no picture cleanup to undo")?;
+    if rec.state != CleanupState::Done {
+        return Err("there are no removed pictures to undo".to_string());
+    }
+    for m in rec.removed.iter_mut() {
+        if !m.restored || !files.contains(&m.file) {
+            continue;
+        }
+        let from = absolute(meeting_folder, &m.file);
+        let to = absolute(meeting_folder, &m.removed_file);
+        let moved = match to.parent() {
+            Some(d) => std::fs::create_dir_all(d).and_then(|_| std::fs::rename(&from, &to)),
+            None => Ok(()),
+        };
+        match moved {
+            Ok(()) => m.restored = false,
+            Err(e) => log::warn!("picture cleanup: could not undo the restore of {}: {}", m.file, e),
+        }
+    }
+    write_record(meeting_folder, &rec)?;
+    Ok(rec)
+}
+
 /// Writes a failed record. Moves nothing.
 pub fn record_failure(meeting_folder: &Path, error: &str, now_ms: i64) -> Result<CleanupRecord, String> {
     let rec = CleanupRecord {
