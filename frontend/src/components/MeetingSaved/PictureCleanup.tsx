@@ -86,7 +86,6 @@ function Picture({ meetingId, file, alt, className }: { meetingId: string; file:
     return () => { cancelled = true; };
   }, [meetingId, file]);
   if (!src) return <div className={`${className} bg-gray-200`} role="img" aria-label={alt} />;
-  // eslint-disable-next-line @next/next/no-img-element
   return <img src={src} alt={alt} className={className} />;
 }
 
