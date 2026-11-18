@@ -251,7 +251,7 @@ export function PictureCleanup({
 
       {open && (
         <section aria-label="Removed pictures" className="mt-2 max-h-[60vh] overflow-y-auto border-t border-gray-200 pt-3">
-          <div className="flex items-start justify-between gap-4 pb-3">
+          <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 pb-3">
             <div className="min-w-0">
               <h2 className="text-base font-semibold text-gray-900">{view.title}</h2>
               <p className="text-[13px] text-gray-600">{view.note}</p>
@@ -337,7 +337,7 @@ function GroupRow({
           <figure className="w-[150px]">
             <div className="relative">
               <Picture meetingId={meetingId} file={group.keptFile} alt={`Kept picture at ${keptTime ?? ''}`} className="aspect-video w-full rounded-md border-2 border-green-600 object-cover" />
-              <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-green-600 px-2 py-0.5 text-[12.5px] font-medium text-white">
+              <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-green-700 px-2 py-0.5 text-[12.5px] font-medium text-white">
                 <Check className="h-3 w-3" /> Kept
               </span>
             </div>
@@ -361,7 +361,7 @@ function GroupRow({
                 />
               </button>
               {r.restored ? (
-                <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-green-600 px-2 py-0.5 text-[12.5px] font-medium text-white">
+                <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-green-700 px-2 py-0.5 text-[12.5px] font-medium text-white">
                   <Check className="h-3 w-3" /> Restored
                 </span>
               ) : (
@@ -410,7 +410,7 @@ function Viewer({
 
   const keptTime = timeOfFile(current?.repeatOf ?? null);
   const title = !current
-    ? ''
+    ? 'Removed picture'
     : current.reason === 'repeat'
       ? `Repeat of the ${keptTime ?? ''} picture`
       : current.caption ?? NOT_USEFUL.find((n) => n.reason === current.reason)?.label ?? 'Removed picture';
@@ -448,7 +448,7 @@ function Viewer({
                 </span>
                 {current.time}
               </figcaption>
-              <Picture meetingId={meetingId} file={current.restored ? current.file : current.removedFile} alt={`Picture at ${current.time}`} className="w-full rounded-md border border-gray-200" />
+              <Picture meetingId={meetingId} file={current.restored ? current.file : current.removedFile} alt={`Picture at ${current.time}`} className="max-h-[68vh] w-full rounded-md border border-gray-200 object-contain" />
             </figure>
             {current.repeatOf && (
               <figure>
@@ -458,7 +458,7 @@ function Viewer({
                   </span>
                   {keptTime}
                 </figcaption>
-                <Picture meetingId={meetingId} file={current.repeatOf} alt={`Kept picture at ${keptTime ?? ''}`} className="w-full rounded-md border border-gray-200" />
+                <Picture meetingId={meetingId} file={current.repeatOf} alt={`Kept picture at ${keptTime ?? ''}`} className="max-h-[68vh] w-full rounded-md border border-gray-200 object-contain" />
               </figure>
             )}
           </div>
