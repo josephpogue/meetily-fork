@@ -7,6 +7,7 @@
 
 pub mod card;
 pub mod cleanup;
+pub mod cleanup_run;
 pub mod ask_lane;
 pub mod ask_list;
 pub mod claude_cli;

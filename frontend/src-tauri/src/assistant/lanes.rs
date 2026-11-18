@@ -944,6 +944,26 @@ impl AnswerLanes {
     /// One turn of the note-drafting work, on the deep lineage, at end of
     /// meeting.
     pub async fn draft_note(&mut self, transcript: String, qa_log: String) -> Result<String, String> {
+        self.fork_deep(None, move |has_frames| {
+            let mut prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
+            if has_frames {
+                prompt.push_str(
+                    "\n\nPictures of the Zoom or Teams window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
+                );
+            }
+            prompt
+        })
+        .await
+    }
+
+    /// One read-only fork of the deep session with `system_prompt` (the note
+    /// prompt when None) and the prompt `build_prompt` makes, told whether
+    /// frames newer than the session's ride along.
+    async fn fork_deep(
+        &self,
+        system_prompt: Option<String>,
+        build_prompt: impl FnOnce(bool) -> String,
+    ) -> Result<String, String> {
         let (deep_id, cfg) = {
             let s = self.state.lock().unwrap();
             (s.deep_id.clone(), s.cfg.clone())
@@ -964,17 +984,12 @@ impl AnswerLanes {
                 None => (FrameBatch::none(), false),
             }
         };
-        let mut prompt = format!("TRANSCRIPT:\n{}\n\nQ&A LOG:\n{}", transcript, qa_log);
-        if has_frames {
-            prompt.push_str(
-                "\n\nPictures of the Zoom or Teams window sent earlier in this conversation, and any attached to this message, are the call's slides too.",
-            );
-        }
+        let prompt = build_prompt(has_frames);
         let turn = build_turn(LaneCall {
             lane_id: deep_id,
             model: cfg.deep_model.clone(),
             effort: cfg.deep_effort.clone(),
-            system_prompt: cfg.note_prompt.clone(),
+            system_prompt: system_prompt.unwrap_or_else(|| cfg.note_prompt.clone()),
             tools: LaneTools::ReadOnly,
             fork: true,
             cwd: cfg.cwd.clone(),
@@ -1005,6 +1020,54 @@ impl AnswerLanes {
             Some(err) => Err(err),
             None => Ok(outcome.text),
         }
+    }
+
+    // Picture cleanup. It forks the same deep session as the note, from a
+    // second handle on this lane's state, so it never waits on the core lock
+    // the note run holds.
+
+    /// True once `close` ran: a new recording replaced this session.
+    pub fn is_closed(&self) -> bool {
+        self.state.lock().unwrap().closed
+    }
+
+    /// A second handle on the same runner and session state.
+    pub fn share(&self) -> AnswerLanes {
+        AnswerLanes { runner: self.runner.clone(), state: self.state.clone() }
+    }
+
+    /// The open deep session's id and its config, when there is one.
+    pub fn deep_session(&self) -> Option<(String, LaneConfig)> {
+        let s = self.state.lock().unwrap();
+        Some((s.deep_id.clone()?, s.cfg.clone()?))
+    }
+
+    /// Lanes holding only a deep session saved by an earlier run of the app, so
+    /// a cleanup can fork it. No frames ride along: the session holds what it saw.
+    pub fn from_saved_session(runner: Runner, deep_id: String, cfg: LaneConfig) -> AnswerLanes {
+        let lanes = AnswerLanes::new(runner);
+        {
+            let mut s = lanes.state.lock().unwrap();
+            s.deep_id = Some(deep_id);
+            s.cfg = Some(cfg);
+        }
+        lanes
+    }
+
+    /// The picture cleanup run: a read-only fork of the deep session with the
+    /// cleanup prompt, the transcript and the numbered picture list.
+    pub async fn run_cleanup(&self, transcript: String, picture_list: String) -> Result<String, String> {
+        self.fork_deep(Some(super::cleanup::CLEANUP_PROMPT.to_string()), move |has_frames| {
+            let mut prompt = format!("TRANSCRIPT:\n{}\n\nPICTURES KEPT:\n{}", transcript, picture_list);
+            if has_frames {
+                prompt.push_str(
+                    "\n\nPictures sent earlier in this conversation, and any attached to this message, carry the same time labels.",
+                );
+            }
+            prompt.push_str("\n\nName the pictures to remove, as the JSON in your instructions.");
+            prompt
+        })
+        .await
     }
 }
 

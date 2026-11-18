@@ -169,11 +169,19 @@ fn count_jpgs(dir: &Path) -> u64 {
         .count() as u64
 }
 
+/// Total bytes under `dir`. A `removed/` folder directly inside a frames folder
+/// holds pictures the cleanup took out, so it is left out (it is not "saved").
 fn dir_bytes(dir: &Path) -> u64 {
+    let is_frames = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| crate::assistant::cleanup::FRAME_DIRS.contains(&n))
+        .unwrap_or(false);
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     entries
         .flatten()
         .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() && is_frames && e.file_name() == crate::assistant::cleanup::REMOVED_DIR => 0,
             Ok(t) if t.is_dir() => dir_bytes(&e.path()),
             Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
             _ => 0,
@@ -284,6 +292,8 @@ pub async fn overview(pool: &SqlitePool, only: Option<&str>) -> Result<SavedOver
 pub async fn api_get_meetings_saved(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<SavedOverview, String> {
+    // The list loading is one of the two moments expired removed pictures are deleted.
+    crate::assistant::cleanup_run::purge_expired_all(state.db_manager.pool()).await;
     overview(state.db_manager.pool(), None).await
 }
 
