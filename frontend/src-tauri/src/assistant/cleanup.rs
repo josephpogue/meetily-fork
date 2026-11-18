@@ -529,3 +529,7 @@ pub fn absolute(meeting_folder: &Path, file: &str) -> PathBuf {
 #[cfg(test)]
 #[path = "tests/cleanup.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "tests/cleanup_round2.rs"]
+mod round2_tests;
