@@ -104,3 +104,6 @@ The high review found four ways the record and the disk can disagree. New rules:
   - Example: Undo moved a restored picture back into `removed/` but the record still says restored. `load` marks it not restored.
 - **One writer at a time.** `apply`, `restore`, `record_failure` and `purge_if_expired` on the same meeting folder never interleave: two `restore` calls on different pictures of one folder, run at the same time from two threads, both take effect, and the record afterwards marks both restored. A record write never leaves a half-written file (write to a unique temporary file in the same folder, then rename).
 - **Try again sees every picture.** A retry forks the saved session and attaches every picture that session had not been sent, the same set the first run would have attached. The saved session file records which pictures that session already holds.
+  - Entry point: `SavedSession.sent` (meeting-relative paths of the pictures the session already holds; a file without the field loads with an empty list) and `unsent(pictures, session)`, which returns the pictures not in `sent`, in their order.
+  - Example: pictures P1 `teams-frames/a.jpg`, P2 `teams-frames/b.jpg`, P3 `zoom-frames/c.jpg`; `sent` = [`teams-frames/a.jpg`]. `unsent` gives P2 and P3.
+  - Example: a session file saved without `sent` loads, and `unsent` gives every picture.

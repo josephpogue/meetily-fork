@@ -60,6 +60,7 @@ pub fn start_beside_note(app: Option<AppHandle<Wry>>, folder: PathBuf, lanes: An
             model: cfg.deep_model.clone(),
             effort: cfg.deep_effort.clone(),
             read_dirs: cfg.deep_read_dirs.clone(),
+            sent: Vec::new(),
         },
     );
     tokio::spawn(run(app, folder, lanes, transcript, pictures));

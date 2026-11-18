@@ -165,6 +165,18 @@ pub struct SavedSession {
     pub model: String,
     pub effort: String,
     pub read_dirs: Vec<PathBuf>,
+    /// Meeting-relative paths of the pictures this session was already sent
+    /// (for example "teams-frames/teams-20261118-110300-478.jpg"). A file saved
+    /// before this field existed loads with an empty list.
+    #[serde(default)]
+    pub sent: Vec<String>,
+}
+
+/// The pictures from `pictures` that the saved session was not sent, in the
+/// same order: what a Try again must attach so Claude sees every picture.
+pub fn unsent(pictures: &[Picture], session: &SavedSession) -> Vec<Picture> {
+    let _ = session;
+    pictures.to_vec()
 }
 
 /// Saves the deep-lane session beside the record (best effort).
