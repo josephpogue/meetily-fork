@@ -1,0 +1,82 @@
+# Picture cleanup: job brief
+
+Design: `docs/superpowers/specs/2026-11-18-picture-cleanup-design.md` (read it first).
+Entry points: `frontend/src-tauri/src/assistant/cleanup.rs`. Size change: `frontend/src-tauri/src/meeting_saved.rs`.
+
+## Goal
+
+After a call, when Joseph presses Draft note, a second Claude run beside the note names the pictures that add nothing. The app moves them into `removed/` inside their frames folder, shows what it removed on the meeting page, lets Joseph restore any of them, and deletes `removed/` for good five days later. "What was saved" counts only kept pictures.
+
+## Done when
+
+- Pressing Draft note on a call with pictures starts the note and the cleanup together; the note does not wait for the cleanup.
+- The meeting page shows the cleanup line and the removed panel as in the approved mockup (`~/.claude/artifacts/587ff039-b5ae-419c-a417-6ffd8246b171/meetily-cleanup/removed-pictures.html`), and restore works from every place the mockup shows it.
+- A failed cleanup shows "Picture cleanup did not finish. Try again" and Try again runs the cleanup alone.
+- Five days after a cleanup, its `removed/` folders are gone.
+- Every locked test passes, and the existing suites still pass.
+
+## States and readers
+
+| State of a meeting | Files on disk | Who reads it | What they must show or do |
+|---|---|---|---|
+| Never cleaned (no record) | no `picture-cleanup.json`, no `removed/` | meeting page header, `should_start`, "What was saved" | no cleanup line; Draft note starts a run; size and count as today |
+| Run in flight | as before the run | `should_start`, header | a second Draft note press (redraft) starts no second run; header shows no cleanup line yet |
+| Done, nothing removed | record with `removed: []` | header, summary | no cleanup line (nothing to show) |
+| Done, pictures removed | record `done`; files in `<frames>/removed/` | header, panel, "What was saved", totals line | the line "Claude removed N pictures to free X: R repeats, U not useful."; count and size leave out `removed/` |
+| Done, some restored | record entries `restored: true`, files back | header, panel | counts, bytes and line leave out restored pictures; restored files count again in "What was saved" |
+| Done, all restored | every entry restored | header | no cleanup line |
+| Failed | record `failed` with error, nothing moved | header, `should_start` | "Picture cleanup did not finish."; Draft note or Try again starts a run |
+| Purged | record `purged`; no `removed/` | header, `purge_if_expired`, `should_start` | no cleanup line; no new run; restore is not offered |
+| Recording has no deep-lane session (assistant off, or an older call) | anything | `should_start` caller | no run starts; nothing changes |
+
+Readers of the frames folders today: `meeting_saved.rs` (`count_jpgs` reads only the top of each frames folder; `dir_bytes` counts every subfolder), `assistant/core.rs` and `assistant/vision/capture.rs` (write frames during a recording only).
+
+## Ways a run can end, and what must still happen
+
+| How it ends | What must happen after |
+|---|---|
+| Reply parsed, removals applied | record `done` written, header refreshes |
+| Reply parsed, nothing to remove | record `done` with an empty list; nothing moved |
+| Reply cannot be parsed | record `failed`; nothing moved |
+| The `claude` run fails or times out | record `failed`; nothing moved |
+| The run could not start (no deep session, no meeting folder) | no record written; nothing moved; the note still drafts |
+| App quits or a new recording starts mid-run | nothing moved, no record; the next Draft note may run it |
+| A file move fails part way | pictures already moved stay recorded so they can be restored; the record lists only pictures really in `removed/`; no picture is lost |
+| A picture named in the reply no longer exists | skipped; the rest are applied |
+
+## Rules for parsing a reply
+
+- The reply holds one JSON object with a `remove` array; text before or after it is ignored.
+- Reasons are `loading`, `greyed`, `blank`, `popup`, `before_share`, `repeat`.
+- An id not in the picture list is skipped.
+- An id listed twice is removed once (first entry wins).
+- A `repeat` must name `repeat_of` as a picture that is kept (in the list and not itself removed); otherwise that removal is skipped, so a repeat never points at nothing.
+- An unknown reason skips that entry.
+- `{"remove": []}` is a valid reply meaning "remove nothing".
+- No JSON object, or no `remove` array: Err.
+
+## Worked examples
+
+Meeting folder with `teams-frames/teams-20261118-110300-478.jpg` (200 bytes), `teams-frames/teams-20261118-110332-532.jpg` (300 bytes), `teams-frames/teams-20261118-110433-637.jpg` (400 bytes), `zoom-frames/zoom-20261118-110310-000.jpg` (100 bytes).
+
+- `list_pictures` gives P1 teams 11:03:00, P2 zoom 11:03:10, P3 teams 11:03:32, P4 teams 11:04:33 (capture order across both folders, by the time in the file name).
+- `picture_list` line for P1: `P1 = Teams window at 11:03:00`; for P2: `P2 = Zoom window at 11:03:10`.
+- Reply `Here you go: {"remove":[{"id":"P1","reason":"before_share"},{"id":"P3","reason":"repeat","repeat_of":"P4","caption":"Same page, scrolled up"}]} done` parses to two removals.
+- `apply` at now_ms = 1_000 moves P1 to `teams-frames/removed/teams-20261118-110300-478.jpg` and P3 to `teams-frames/removed/teams-20261118-110332-532.jpg`; the record has state done, ran_at_ms 1000, delete_after_ms 1000 + 5 days in ms (432_000_000), two entries with bytes 200 and 300, P3's `repeat_of` = `teams-frames/teams-20261118-110433-637.jpg`.
+- After that, `list_pictures` lists only the zoom picture and P4 (renumbered P1, P2).
+- `summary` after that: removed 2, repeats 1, not_useful 1, bytes 500, line `Claude removed 2 pictures to free under 1 MB: 1 repeat, 1 not useful.` (sizes use `meeting_saved::format_size`; counts use singular for 1).
+- With 93 removed, 56 repeats, 37 not useful and 53,477,376 bytes: `Claude removed 93 pictures to free 51 MB: 56 repeats, 37 not useful.`
+- Only repeats removed: `Claude removed 3 pictures to free under 1 MB: 3 repeats.` Only not useful: `...: 2 not useful.`
+- `restore(folder, ["teams-frames/teams-20261118-110300-478.jpg"])` moves that file back, marks it restored; summary now removed 1, bytes 300.
+- `restore(folder, [])` restores every removed picture.
+- `purge_if_expired(folder, 1000 + 432_000_000 - 1)` is false and deletes nothing; at `1000 + 432_000_000` it deletes `teams-frames/removed/` and marks the record purged; summary line is None.
+- Failed record: summary line `Picture cleanup did not finish.`, failed true.
+- `should_start(None, false)` true; `(None, true)` false; failed record true; done record false; purged record false.
+- "What was saved" with 200 bytes in `teams-frames/a.jpg` and 300 bytes in `teams-frames/removed/b.jpg` and 50 bytes `audio.mp4`: pictures 1, bytes 250. A folder named `removed` anywhere else in the meeting folder still counts.
+
+## Constraints
+
+- Every model call is the local `claude` CLI; the cleanup run forks the deep-lane session the way `AnswerLanes::draft_note` does (`assistant/lanes.rs`), with read-only tools.
+- `draft_note_gated` in `assistant/core.rs` holds the core lock while the note run is in flight; the cleanup run must not wait on that lock, or the two would not run side by side.
+- New code lives in its own modules; edits to upstream files stay small and are listed in `docs/FORK_CHANGES.md`. `docs/GOAL.md` gets the two Requirements lines named in the design.
+- Supporting text 12.5px or larger. No em dashes in any text.
