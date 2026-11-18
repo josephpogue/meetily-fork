@@ -142,6 +142,22 @@ fn load_drops_an_entry_whose_picture_is_in_neither_place() {
 }
 
 #[test]
+fn load_drops_an_entry_when_its_whole_frames_folder_is_gone() {
+    let d = applied();
+    // Both removed entries (T1, T2) live in teams-frames; delete the folder.
+    fs::remove_dir_all(d.path().join("teams-frames")).unwrap();
+
+    let rec = load(d.path()).unwrap();
+
+    assert!(entry(&rec, T1).is_none());
+    assert!(entry(&rec, T2).is_none());
+    assert!(rec.removed.is_empty());
+    assert_eq!(summary(Some(&rec), 2_000).removed, 0);
+    // The corrected record is in the file too.
+    assert_eq!(raw_record(d.path()), rec);
+}
+
+#[test]
 fn load_moves_an_unlisted_picture_in_removed_back_to_its_frames_folder() {
     let d = applied();
     write(d.path(), "teams-frames/removed/x.jpg", 10);

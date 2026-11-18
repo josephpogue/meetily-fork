@@ -568,7 +568,6 @@ fn load_is_none_without_a_record_or_with_an_unreadable_one() {
 
 #[test]
 fn load_reads_back_each_kind_of_record_from_its_file() {
-    let d = tempfile::tempdir().unwrap();
     let mut full = entry(T2, Reason::Repeat, 300, true);
     full.caption = Some("Same page, scrolled up".to_string());
     let records = vec![
@@ -577,6 +576,16 @@ fn load_reads_back_each_kind_of_record_from_its_file() {
         record(CleanupState::Purged, vec![entry(T1, Reason::Blank, 200, false)]),
     ];
     for rec in records {
+        // A Done record's pictures are on disk where the record says they are
+        // (restored: at `file`; not restored: at `removed_file`), so the disk
+        // agrees with the record. A fresh folder per record keeps one record's
+        // files from leaking into the next.
+        let d = tempfile::tempdir().unwrap();
+        if rec.state == CleanupState::Done {
+            for m in &rec.removed {
+                write(d.path(), if m.restored { &m.file } else { &m.removed_file }, m.bytes as usize);
+            }
+        }
         fs::write(d.path().join(RECORD_FILE), serde_json::to_string(&rec).unwrap()).unwrap();
         assert_eq!(load(d.path()), Some(rec));
     }
