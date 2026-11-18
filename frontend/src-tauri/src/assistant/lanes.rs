@@ -1042,14 +1042,33 @@ impl AnswerLanes {
         Some((s.deep_id.clone()?, s.cfg.clone()?))
     }
 
+    /// The paths of the frames the deep session already holds (seq at or below
+    /// its cursor), oldest first. Empty without a frame feed.
+    pub fn deep_sent_frame_paths(&self) -> Vec<PathBuf> {
+        let s = self.state.lock().unwrap();
+        let cursor = s.deep_frame_cursor;
+        match &s.frames {
+            Some(feed) => feed.store.since(0).into_iter().filter(|f| f.seq <= cursor).map(|f| f.path).collect(),
+            None => Vec::new(),
+        }
+    }
+
     /// Lanes holding only a deep session saved by an earlier run of the app, so
-    /// a cleanup can fork it. No frames ride along: the session holds what it saw.
-    pub fn from_saved_session(runner: Runner, deep_id: String, cfg: LaneConfig) -> AnswerLanes {
+    /// a cleanup can fork it. The session holds the frames it was sent; the
+    /// `unsent` frames (oldest first) ride along with the fork.
+    pub fn from_saved_session(runner: Runner, deep_id: String, cfg: LaneConfig, unsent: Vec<(CallApp, PathBuf, i64)>) -> AnswerLanes {
         let lanes = AnswerLanes::new(runner);
         {
             let mut s = lanes.state.lock().unwrap();
             s.deep_id = Some(deep_id);
             s.cfg = Some(cfg);
+            if !unsent.is_empty() {
+                let store = FrameStore::new();
+                for (app, path, at_ms) in unsent {
+                    store.push_from(app, path, at_ms);
+                }
+                s.frames = Some(FrameFeed::new(store));
+            }
         }
         lanes
     }

@@ -17,6 +17,7 @@ use super::cleanup::{self, CleanupRecord, CleanupState, CleanupSummary, Picture,
 use super::history::{self, HistoryHandle};
 use super::lanes::{claude_runner, AnswerLanes, LaneConfig};
 use super::settings::{self, AssistantSettings};
+use super::vision::CallApp;
 use crate::state::AppState;
 
 /// Sent to the app when a cleanup run ends; the payload is the meeting folder.
@@ -52,6 +53,14 @@ pub fn start_beside_note(app: Option<AppHandle<Wry>>, folder: PathBuf, lanes: An
     if !cleanup::begin_run(&folder) {
         return;
     }
+    // The pictures the deep session already holds, as meeting-relative paths:
+    // a Try again must attach every other picture.
+    let sent: Vec<String> = lanes
+        .deep_sent_frame_paths()
+        .iter()
+        .filter_map(|p| p.strip_prefix(&folder).ok())
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
     cleanup::save_session(
         &folder,
         &SavedSession {
@@ -60,7 +69,7 @@ pub fn start_beside_note(app: Option<AppHandle<Wry>>, folder: PathBuf, lanes: An
             model: cfg.deep_model.clone(),
             effort: cfg.deep_effort.clone(),
             read_dirs: cfg.deep_read_dirs.clone(),
-            sent: Vec::new(),
+            sent,
         },
     );
     tokio::spawn(run(app, folder, lanes, transcript, pictures));
@@ -124,6 +133,15 @@ pub async fn retry(app: AppHandle<Wry>, pool: &SqlitePool, meeting_id: &str) -> 
         .await
         .map_err(|e| e.to_string())?
         .join("\n");
+    // Every picture the saved session was not sent rides along with the fork,
+    // the same set the first run attached.
+    let unsent: Vec<(CallApp, PathBuf, i64)> = cleanup::unsent(&pictures, &session)
+        .into_iter()
+        .filter_map(|p| {
+            let app = if p.file.starts_with("zoom-frames/") { CallApp::Zoom } else { CallApp::Teams };
+            Some((app, cleanup::absolute(&folder, &p.file), cleanup::captured_at_ms(&p.file)?))
+        })
+        .collect();
     let cfg = LaneConfig {
         cwd: session.cwd,
         fast_model: String::new(),
@@ -133,7 +151,7 @@ pub async fn retry(app: AppHandle<Wry>, pool: &SqlitePool, meeting_id: &str) -> 
         deep_read_dirs: session.read_dirs,
         note_prompt: String::new(),
     };
-    let lanes = AnswerLanes::from_saved_session(claude_runner(bin), session.session_id, cfg);
+    let lanes = AnswerLanes::from_saved_session(claude_runner(bin), session.session_id, cfg, unsent);
     if !cleanup::begin_run(&folder) {
         return Err("Picture cleanup is already running.".to_string());
     }
