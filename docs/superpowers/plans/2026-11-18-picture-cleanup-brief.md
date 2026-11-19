@@ -138,3 +138,24 @@ Ways a run ends: done (record written, pictures moved), failed (failed record, n
 
 **Done when** the locked tests pass and the walkthrough shows the "Claude removed" line after Stop then Draft note.
 - **Retry after Stop (developer question).** The cleanup run may retry a passing failure after Stop: its retry check is "not superseded", not "not closed". The note keeps its own retry check unchanged.
+
+## Round 5: the sidebar totals miss a cleanup that ends off the meeting page
+
+Walkthrough 3 found the sidebar totals line still at 7 pictures after Draft note, while the meeting held 5. The cleanup finishes on the screen right after Stop, before the meeting page is open, so the only listener (on the meeting page) is not there to hear it.
+
+Rule: the sidebar listens for the cleanup-finished event itself, for as long as the app runs, and reloads its saved totals each time it fires.
+
+| State | What must happen |
+|---|---|
+| Cleanup finishes while no meeting page is open | Sidebar totals reload once |
+| Cleanup finishes while the meeting page is open | Sidebar totals reload (the page also reloads, as before) |
+| Two cleanups finish | Totals reload twice |
+| Sidebar unmounts before the listener is set up | The listener is removed as soon as it is set up; later events reload nothing |
+| Sidebar unmounts after the listener is set up | The listener is removed at once; later events reload nothing |
+| Setting up the listener fails | Nothing throws; totals still load on the other paths |
+
+Entry point: `frontend/src/components/Sidebar/cleanupEvents.ts`, `onCleanupFinished(listen, onChange)`. It takes the event listener function so tests can pass a fake; it returns a stop function.
+
+Worked example: listen resolves, the event fires twice, onChange has run twice; stop is called, the event fires again, onChange still shows two calls.
+
+Done when the sidebar totals match the meeting's "What was saved" count right after Draft note, with no visit to the meeting page.
