@@ -1007,7 +1007,7 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
     };
     let projects = note::list_projects(&vault_root);
     let picker = note::picker_input(&vault_root, this.as_ref().map(|(t, b)| (t.as_str(), b.as_str())), &filed);
-    let (mut transcript_text, mut qa_log_text, mut generation) = {
+    let (mut transcript_text, mut qa_log_text, mut generation, cleanup_lanes) = {
         let mut core = handle.0.lock().await;
         if only_if_ready && !matches!(core.note_state, NoteState::Ready) {
             return Ok(());
@@ -1015,8 +1015,16 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
         if core.session_open {
             return Err("stop the recording before drafting a note".to_string());
         }
-        start_draft(&mut core, &picker)
+        let (t, q, g) = start_draft(&mut core, &picker);
+        (t, q, g, core.lanes.share())
     };
+
+    // Picture cleanup runs beside the note on a shared handle on the lanes, so
+    // it never waits on the core lock the note holds below. A run that cannot
+    // start writes nothing and the note drafts as before.
+    if let Some(folder) = super::cleanup_run::ended_meeting_folder(app.as_ref(), &history).await {
+        super::cleanup_run::start_beside_note(app.clone(), folder, cleanup_lanes, transcript_text.clone());
+    }
 
     loop {
         let result = {
@@ -1281,6 +1289,7 @@ async fn open_lanes_with(
     runner: Runner,
 ) {
     let mut core = handle.0.lock().await;
+    core.lanes.supersede();
     core.lanes = AnswerLanes::new(runner.clone());
     let feed = core.frames.clone().map(FrameFeed::new);
     core.lanes.set_frames(feed.clone());

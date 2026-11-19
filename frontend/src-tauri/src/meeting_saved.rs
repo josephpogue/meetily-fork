@@ -30,6 +30,8 @@ pub struct MeetingSaved {
     pub duration_seconds: f64,
     pub pictures: u64,
     pub bytes: u64,
+    /// A picture cleanup record exists for this meeting, so the page asks for it.
+    pub cleanup: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -169,11 +171,19 @@ fn count_jpgs(dir: &Path) -> u64 {
         .count() as u64
 }
 
+/// Total bytes under `dir`. A `removed/` folder directly inside a frames folder
+/// holds pictures the cleanup took out, so it is left out (it is not "saved").
 fn dir_bytes(dir: &Path) -> u64 {
+    let is_frames = dir
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|n| crate::assistant::cleanup::FRAME_DIRS.contains(&n))
+        .unwrap_or(false);
     let Ok(entries) = std::fs::read_dir(dir) else { return 0 };
     entries
         .flatten()
         .map(|e| match e.file_type() {
+            Ok(t) if t.is_dir() && is_frames && e.file_name() == crate::assistant::cleanup::REMOVED_DIR => 0,
             Ok(t) if t.is_dir() => dir_bytes(&e.path()),
             Ok(t) if t.is_file() => e.metadata().map(|m| m.len()).unwrap_or(0),
             _ => 0,
@@ -223,6 +233,11 @@ where
     let count = rows.len();
     for r in rows {
         let scan = r.folder.as_deref().and_then(|f| scan_folder(Path::new(f)));
+        let has_cleanup = r
+            .folder
+            .as_deref()
+            .map(|f| Path::new(f).join(crate::assistant::cleanup::RECORD_FILE).is_file())
+            .unwrap_or(false);
         let saved = match &scan {
             Some(s) => MeetingSaved {
                 brief: r.brief,
@@ -230,6 +245,7 @@ where
                 duration_seconds: length_seconds(s, r.created).unwrap_or(0.0),
                 pictures: s.pictures,
                 bytes: s.bytes,
+                cleanup: has_cleanup,
             },
             None => MeetingSaved {
                 brief: r.brief,
@@ -237,6 +253,7 @@ where
                 duration_seconds: 0.0,
                 pictures: 0,
                 bytes: 0,
+                cleanup: false,
             },
         };
         hours += saved.duration_seconds / 3600.0;
@@ -284,6 +301,8 @@ pub async fn overview(pool: &SqlitePool, only: Option<&str>) -> Result<SavedOver
 pub async fn api_get_meetings_saved(
     state: tauri::State<'_, crate::state::AppState>,
 ) -> Result<SavedOverview, String> {
+    // The list loading is one of the two moments expired removed pictures are deleted.
+    crate::assistant::cleanup_run::purge_expired_all(state.db_manager.pool()).await;
     overview(state.db_manager.pool(), None).await
 }
 
@@ -294,6 +313,10 @@ pub async fn api_get_meeting_saved(
 ) -> Result<Option<MeetingSaved>, String> {
     Ok(overview(state.db_manager.pool(), Some(&meeting_id)).await?.meetings.remove(&meeting_id))
 }
+
+#[cfg(test)]
+#[path = "tests/meeting_saved_cleanup.rs"]
+mod cleanup_size_tests;
 
 #[cfg(test)]
 mod tests {

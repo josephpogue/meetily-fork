@@ -652,6 +652,16 @@ pub fn run() {
             })
             .expect("Failed to initialize database");
 
+            // Picture cleanup: delete removed pictures whose restore window ended.
+            {
+                let purge_app = _app.handle().clone();
+                tauri::async_runtime::spawn(async move {
+                    if let Some(state) = purge_app.try_state::<state::AppState>() {
+                        assistant::cleanup_run::purge_expired_all(state.db_manager.pool()).await;
+                    }
+                });
+            }
+
             // Initialize bundled templates directory for dynamic template discovery
             log::info!("Initializing bundled templates directory...");
             if let Ok(resource_path) = _app.handle().path().resource_dir() {
@@ -829,6 +839,11 @@ pub fn run() {
             api::api_get_meetings,
             meeting_saved::api_get_meetings_saved,
             meeting_saved::api_get_meeting_saved,
+            assistant::cleanup_run::picture_cleanup_get,
+            assistant::cleanup_run::picture_cleanup_restore,
+            assistant::cleanup_run::picture_cleanup_undo_restore,
+            assistant::cleanup_run::picture_cleanup_retry,
+            assistant::cleanup_run::picture_cleanup_picture,
             api::api_search_transcripts,
             api::api_get_profile,
             api::api_save_profile,

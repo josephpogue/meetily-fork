@@ -4,6 +4,8 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { onCleanupFinished } from './cleanupEvents';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
 import type { SavedOverview } from '@/components/MeetingSaved';
@@ -65,6 +67,8 @@ interface SidebarContextType {
   refetchMeetings: () => Promise<void>;
   // Per-meeting Brief and "what was saved" numbers; reloaded with the meeting list
   saved: SavedOverview | null;
+  // Reload only the saved overview (sidebar totals), not the meeting list
+  refreshSaved: () => void;
 
 }
 
@@ -98,6 +102,20 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
   const pathname = usePathname();
   const router = useRouter();
 
+  // Extra numbers for the list; the list itself must not depend on them.
+  // Replies can land out of order (a slow scan from Stop vs a newer one after a delete):
+  // only the latest request may set the numbers.
+  const refreshSaved = React.useCallback(() => {
+    const request = ++savedRequestRef.current;
+    invoke<SavedOverview>('api_get_meetings_saved')
+      .then((overview) => { if (request === savedRequestRef.current) setSaved(overview); })
+      .catch((error) => console.error('Error fetching what was saved:', error));
+  }, []);
+
+  // A picture cleanup can finish on any screen (Draft note runs it right after Stop),
+  // so the totals listen for it here, not only on the meeting page.
+  useEffect(() => onCleanupFinished(listen, refreshSaved), [refreshSaved]);
+
   // Extract fetchMeetings as a reusable function
   const fetchMeetings = React.useCallback(async () => {
     if (serverAddress) {
@@ -108,13 +126,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
           title: meeting.title
         }));
         setMeetings(transformedMeetings);
-        // Extra numbers for the list; the list itself must not depend on them.
-        // Replies can land out of order (a slow scan from Stop vs a newer one after a delete):
-        // only the latest request may set the numbers.
-        const request = ++savedRequestRef.current;
-        invoke<SavedOverview>('api_get_meetings_saved')
-          .then((overview) => { if (request === savedRequestRef.current) setSaved(overview); })
-          .catch((error) => console.error('Error fetching what was saved:', error));
+        refreshSaved();
         Analytics.trackBackendConnection(true);
       } catch (error) {
         console.error('Error fetching meetings:', error);
@@ -122,7 +134,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
         Analytics.trackBackendConnection(false, error instanceof Error ? error.message : 'Unknown error');
       }
     }
-  }, [serverAddress]);
+  }, [serverAddress, refreshSaved]);
 
   useEffect(() => {
     fetchMeetings();
@@ -329,6 +341,7 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       stopSummaryPolling,
       refetchMeetings: fetchMeetings,
       saved,
+      refreshSaved,
 
     }}>
       {children}
