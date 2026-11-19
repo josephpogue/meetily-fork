@@ -1,6 +1,6 @@
 'use client';
 
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PictureCleanup } from './PictureCleanup';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
@@ -40,16 +40,22 @@ export function SavedTotals({ totals, meetingCount }: { totals?: string; meeting
 }
 
 /**
- * Title, Brief and the "What was saved" line at the top of a meeting page.
+ * Title, Brief and the "What was saved" line at the top of a meeting page, above the page body.
+ * While the removed-pictures panel is open it takes the body's place, so both groups and their
+ * restore links have the room; the body stays mounted underneath and comes back on Hide.
  * `reloadKey` changes when the meeting list reloads (the provider's `saved`), so a page
  * opened right after Stop picks up the finished numbers.
  */
-export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId: string; title: string; reloadKey?: unknown }) {
+export function MeetingSavedHeader({
+  meetingId, title, reloadKey, children,
+}: { meetingId: string; title: string; reloadKey?: unknown; children?: ReactNode }) {
   const [loaded, setLoaded] = useState<{ id: string; saved: MeetingSaved | null } | null>(null);
   // Bumped when picture cleanup finishes or Joseph restores pictures: the saved numbers change.
   const [version, setVersion] = useState(0);
   const { refreshSaved } = useSidebar();
   const onCleanupChanged = useCallback(() => { setVersion((n) => n + 1); refreshSaved(); }, [refreshSaved]);
+  const [panelHost, setPanelHost] = useState<HTMLDivElement | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
 
   useEffect(() => {
     let cancelled = false;
@@ -63,11 +69,22 @@ export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId:
   const saved = loaded?.id === meetingId ? loaded.saved : null;
 
   return (
-    <div className="flex-shrink-0 min-w-0 border-b border-gray-200 bg-white px-4 py-2">
-      <h1 className="truncate text-sm font-semibold text-gray-900" title={title}>{title}</h1>
-      <BriefLine brief={saved?.brief} />
-      {saved && <p className="text-xs text-gray-600">What was saved: {saved.line}</p>}
-      <PictureCleanup meetingId={meetingId} hasCleanup={saved?.cleanup} version={version} onChanged={onCleanupChanged} />
-    </div>
+    <>
+      <div className="flex-shrink-0 min-w-0 border-b border-gray-200 bg-white px-4 py-2">
+        <h1 className="truncate text-sm font-semibold text-gray-900" title={title}>{title}</h1>
+        <BriefLine brief={saved?.brief} />
+        {saved && <p className="text-xs text-gray-600">What was saved: {saved.line}</p>}
+        <PictureCleanup
+          meetingId={meetingId}
+          hasCleanup={saved?.cleanup}
+          version={version}
+          onChanged={onCleanupChanged}
+          panelHost={panelHost}
+          onOpenChange={setPanelOpen}
+        />
+      </div>
+      <div ref={setPanelHost} className={panelOpen ? 'min-h-0 min-w-0 flex-1 overflow-y-auto bg-white' : 'hidden'} />
+      <div className={panelOpen ? 'hidden' : 'flex min-h-0 min-w-0 flex-1 flex-col'}>{children}</div>
+    </>
   );
 }

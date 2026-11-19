@@ -194,7 +194,7 @@ export default function PageContent({
       transition={{ duration: 0.3, ease: 'easeOut' }}
       className="flex flex-col h-screen min-w-0 bg-gray-50"
     >
-      <MeetingSavedHeader meetingId={meeting.id} title={meetingData.meetingTitle} reloadKey={saved} />
+      <MeetingSavedHeader meetingId={meeting.id} title={meetingData.meetingTitle} reloadKey={saved}>
       <div className="flex flex-1 min-w-0 overflow-hidden">
         <MeetingDetailsSplitView
           activeTab={activeTab}
@@ -257,6 +257,7 @@ export default function PageContent({
           assistant={<AssistantHistoryPanel meetingId={meeting.id} />}
         />
       </div>
+      </MeetingSavedHeader>
     </motion.div>
   );
 }
