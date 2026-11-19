@@ -4,6 +4,8 @@ import React, { createContext, useContext, useState, useEffect } from 'react';
 import { usePathname, useRouter } from 'next/navigation';
 import Analytics from '@/lib/analytics';
 import { invoke } from '@tauri-apps/api/core';
+import { listen } from '@tauri-apps/api/event';
+import { onCleanupFinished } from './cleanupEvents';
 import { useRecordingState } from '@/contexts/RecordingStateContext';
 import type { SummaryProcessResponse } from '@/types';
 import type { SavedOverview } from '@/components/MeetingSaved';
@@ -109,6 +111,10 @@ export function SidebarProvider({ children }: { children: React.ReactNode }) {
       .then((overview) => { if (request === savedRequestRef.current) setSaved(overview); })
       .catch((error) => console.error('Error fetching what was saved:', error));
   }, []);
+
+  // A picture cleanup can finish on any screen (Draft note runs it right after Stop),
+  // so the totals listen for it here, not only on the meeting page.
+  useEffect(() => onCleanupFinished(listen, refreshSaved), [refreshSaved]);
 
   // Extract fetchMeetings as a reusable function
   const fetchMeetings = React.useCallback(async () => {

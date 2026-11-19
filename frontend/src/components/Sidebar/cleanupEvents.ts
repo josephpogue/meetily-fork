@@ -9,5 +9,22 @@ export type Listen = (event: string, handler: () => void) => Promise<() => void>
  * Never throws, also when `listen` fails.
  */
 export function onCleanupFinished(listen: Listen, onChange: () => void): () => void {
-  throw new Error('not implemented');
+  let stopped = false;
+  let remove: (() => void) | undefined;
+  let pending: Promise<() => void>;
+  try {
+    pending = listen(CLEANUP_EVENT, () => { if (!stopped) onChange(); });
+  } catch (error) {
+    console.error('Could not listen for picture cleanup:', error);
+    return () => {};
+  }
+  pending.then(
+    (off) => { if (stopped) off(); else remove = off; },
+    (error) => console.error('Could not listen for picture cleanup:', error),
+  );
+  return () => {
+    stopped = true;
+    remove?.();
+    remove = undefined;
+  };
 }
