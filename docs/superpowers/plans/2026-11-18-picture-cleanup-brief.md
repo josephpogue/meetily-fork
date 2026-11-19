@@ -108,3 +108,32 @@ The high review found four ways the record and the disk can disagree. New rules:
   - Example: pictures P1 `teams-frames/a.jpg`, P2 `teams-frames/b.jpg`, P3 `zoom-frames/c.jpg`; `sent` = [`teams-frames/a.jpg`]. `unsent` gives P2 and P3.
   - Example: a session file saved without `sent` loads, and `unsent` gives every picture.
 - **Round 3 (review 2):** an entry is dropped even when its frames folder no longer exists. The round 1 test that reads back each kind of record now puts the Done record's pictures on disk where the record says they are, so the rule and that test agree.
+
+## Round 4: the cleanup never starts after Stop (walkthrough, 2026-11-19)
+
+**Bug.** Stop closes the call's lanes (`AnswerLanes::close`), and Draft note only works after Stop. `start_beside_note` returns at once on closed lanes, so the cleanup never runs in the real app. The run's result is also thrown away on closed lanes. The tests never closed the lanes first, so they missed it.
+
+**Rule.** Stop is the normal state for a cleanup, not a reason to skip it. Only a new recording cancels it.
+
+- New entry points on `AnswerLanes`: `supersede(&self)` marks these lanes replaced by a new recording, and `is_superseded(&self) -> bool` reads it. A shared handle (`share()`) sees the same mark. `close()` does not set it.
+- `start_beside_note` starts a run on lanes that are closed (after Stop), when they have a deep session and the folder has pictures and `should_start` allows it.
+- It starts nothing on superseded lanes.
+- A run whose lanes are superseded before it finishes moves nothing and writes no record, and the next Draft note may run it again. A run on lanes that are only closed applies its result as usual.
+- Opening a new recording marks the previous call's lanes superseded before it replaces them (wiring in `assistant/core.rs`, not tested here).
+- Every early return in `start_beside_note` logs one info line naming the reason, so a skipped cleanup shows in the app log.
+
+| State of the lanes at Draft note | Run starts | Result applied |
+|---|---|---|
+| Open (no Stop yet; not reachable from Draft note, which needs Stop) | yes | yes |
+| Closed by Stop | yes | yes |
+| Closed by Stop, then superseded by a new recording mid-run | yes | no: nothing moved, no record, no run in flight afterwards |
+| Superseded before Draft note | no | no record |
+| No deep session | no | no record |
+
+Ways a run ends: done (record written, pictures moved), failed (failed record, nothing moved), superseded (no record, nothing moved). In every case the in-flight mark is cleared afterwards, so `run_in_flight` is false.
+
+**Worked example.** Folder with `zoom-frames/zoom-20261118-110300-000.jpg` and `zoom-frames/zoom-20261118-110310-000.jpg`. Lanes from `AnswerLanes::from_saved_session(fake_runner, "deep-1", cfg, vec![])`; `close()` called (Stop). The fake runner answers `{"remove":[{"id":"P1","reason":"before_share"}]}`. `start_beside_note(None, folder, lanes, "transcript")`; once `run_in_flight(folder)` is false: P1 is in `zoom-frames/removed/`, the record is Done with one entry.
+- Same, but `supersede()` is called on a shared handle while the fake runner is still answering (the fake waits on a signal): afterwards both pictures are still in `zoom-frames/`, there is no record, and `run_in_flight` is false.
+- Same, with `supersede()` before `start_beside_note`: nothing moves, no record, no session file.
+
+**Done when** the locked tests pass and the walkthrough shows the "Claude removed" line after Stop then Draft note.

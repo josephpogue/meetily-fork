@@ -1031,6 +1031,16 @@ impl AnswerLanes {
         self.state.lock().unwrap().closed
     }
 
+    /// Marks these lanes replaced by a new recording. Stop's `close` does not.
+    pub fn supersede(&self) {
+        unimplemented!("round 4")
+    }
+
+    /// Whether a new recording has replaced these lanes.
+    pub fn is_superseded(&self) -> bool {
+        unimplemented!("round 4")
+    }
+
     /// A second handle on the same runner and session state.
     pub fn share(&self) -> AnswerLanes {
         AnswerLanes { runner: self.runner.clone(), state: self.state.clone() }
