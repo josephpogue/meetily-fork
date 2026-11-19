@@ -315,3 +315,7 @@ pub async fn picture_cleanup_picture(state: State<'_, AppState>, meeting_id: Str
     .await
     .map_err(|e| e.to_string())?
 }
+
+#[cfg(test)]
+#[path = "tests/cleanup_after_stop.rs"]
+mod after_stop_tests;
