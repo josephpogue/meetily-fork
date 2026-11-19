@@ -1,6 +1,7 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useState } from 'react';
+import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
@@ -136,7 +137,7 @@ function LineText({ line }: { line: string }) {
 // ---- The header line, the inline panel, the viewer ----
 
 export function PictureCleanup({
-  meetingId, hasCleanup, version, onChanged,
+  meetingId, hasCleanup, version, onChanged, panelHost, onOpenChange,
 }: {
   meetingId: string;
   /** The saved numbers say a cleanup record exists, so the page asks for it. */
@@ -145,6 +146,10 @@ export function PictureCleanup({
   version: number;
   /** Tells the header the picture counts changed, so "What was saved" reloads. */
   onChanged: () => void;
+  /** Where the open panel goes: the page body, which the header hides while the panel shows. */
+  panelHost?: HTMLElement | null;
+  /** Tells the header whether the panel is showing, so it can swap the page body for it. */
+  onOpenChange?: (open: boolean) => void;
 }) {
   const [loaded, setLoaded] = useState<{ id: string; view: CleanupView | null } | null>(null);
   const [open, setOpen] = useState(false);
@@ -172,6 +177,9 @@ export function PictureCleanup({
   }, [onChanged]);
 
   const view = loaded?.id === meetingId ? loaded.view : null;
+  const showing = open && !!view && !view.summary.failed && !!view.summary.line && view.summary.removed > 0;
+  useEffect(() => { onOpenChange?.(showing); }, [showing, onOpenChange]);
+  useEffect(() => () => onOpenChange?.(false), [onOpenChange]);
   const groups = useMemo(() => groupRemoved(view?.removed ?? []), [view]);
   const ordered = useMemo(() => [...groups.notUseful.flatMap((g) => g.items), ...groups.repeats.flatMap((g) => g.items)], [groups]);
 
@@ -235,7 +243,7 @@ export function PictureCleanup({
             <Picture key={r.file} meetingId={meetingId} file={r.removedFile} alt="" className="h-5 w-8 rounded-sm border border-gray-200 object-cover" />
           ))}
         </span>
-        <span><LineText line={summary.line} /></span>
+        <span className="min-w-0 break-words"><LineText line={summary.line} /></span>
         <button
           type="button"
           onClick={() => setOpen((o) => !o)}
@@ -248,8 +256,8 @@ export function PictureCleanup({
         {view.bringBack && <span>{view.bringBack}</span>}
       </div>
 
-      {open && (
-        <section aria-label="Removed pictures" className="mt-2 max-h-[60vh] overflow-y-auto border-t border-gray-200 pt-3">
+      {showing && panelHost && createPortal(
+        <section aria-label="Removed pictures" className="px-4 pb-6 pt-3">
           <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 pb-3">
             <div className="min-w-0">
               <h2 className="text-base font-semibold text-gray-900">{view.title}</h2>
@@ -285,7 +293,8 @@ export function PictureCleanup({
               ))}
             </div>
           )}
-        </section>
+        </section>,
+        panelHost,
       )}
 
       <Viewer
