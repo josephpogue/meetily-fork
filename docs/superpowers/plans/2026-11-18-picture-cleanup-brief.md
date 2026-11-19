@@ -137,3 +137,4 @@ Ways a run ends: done (record written, pictures moved), failed (failed record, n
 - Same, with `supersede()` before `start_beside_note`: nothing moves, no record, no session file.
 
 **Done when** the locked tests pass and the walkthrough shows the "Claude removed" line after Stop then Draft note.
+- **Retry after Stop (developer question).** The cleanup run may retry a passing failure after Stop: its retry check is "not superseded", not "not closed". The note keeps its own retry check unchanged.
