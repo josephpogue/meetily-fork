@@ -1289,6 +1289,7 @@ async fn open_lanes_with(
     runner: Runner,
 ) {
     let mut core = handle.0.lock().await;
+    core.lanes.supersede();
     core.lanes = AnswerLanes::new(runner.clone());
     let feed = core.frames.clone().map(FrameFeed::new);
     core.lanes.set_frames(feed.clone());

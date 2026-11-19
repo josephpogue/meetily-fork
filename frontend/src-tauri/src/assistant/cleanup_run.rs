@@ -39,18 +39,26 @@ pub async fn ended_meeting_folder(app: Option<&AppHandle<Wry>>, history: &Histor
 /// writes nothing, when there is no deep session, no pictures, a finished
 /// cleanup, or a run already in flight. Never affects the note.
 pub fn start_beside_note(app: Option<AppHandle<Wry>>, folder: PathBuf, lanes: AnswerLanes, transcript: String) {
-    if lanes.is_closed() {
+    // A call that Stop closed is the normal case; only a new recording cancels.
+    if lanes.is_superseded() {
+        log::info!("picture cleanup: not started, a new recording replaced this call");
         return;
     }
-    let Some((session_id, cfg)) = lanes.deep_session() else { return };
+    let Some((session_id, cfg)) = lanes.deep_session() else {
+        log::info!("picture cleanup: not started, no deep session");
+        return;
+    };
     let pictures = cleanup::list_pictures(&folder);
     if pictures.is_empty() {
+        log::info!("picture cleanup: not started, no pictures in the meeting folder");
         return;
     }
     if !cleanup::should_start(cleanup::load(&folder).as_ref(), cleanup::run_in_flight(&folder)) {
+        log::info!("picture cleanup: not started, already finished or running");
         return;
     }
     if !cleanup::begin_run(&folder) {
+        log::info!("picture cleanup: not started, a run is already in flight");
         return;
     }
     // The pictures the deep session already holds, as meeting-relative paths:
@@ -77,9 +85,9 @@ pub fn start_beside_note(app: Option<AppHandle<Wry>>, folder: PathBuf, lanes: An
 
 async fn run(app: Option<AppHandle<Wry>>, folder: PathBuf, lanes: AnswerLanes, transcript: String, pictures: Vec<Picture>) {
     let result = lanes.run_cleanup(transcript, cleanup::picture_list(&pictures)).await;
-    // A new recording closed these lanes mid-run: nothing moves and no record
+    // A new recording replaced these lanes mid-run: nothing moves and no record
     // is written, so the next Draft note may run it.
-    if !lanes.is_closed() {
+    if !lanes.is_superseded() {
         finish(&folder, &pictures, result);
         if let Some(app) = &app {
             if let Err(e) = app.emit(EVENT, folder.to_string_lossy().to_string()) {

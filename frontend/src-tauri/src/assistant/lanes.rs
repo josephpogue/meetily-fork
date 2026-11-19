@@ -277,6 +277,8 @@ struct LaneState {
     deep_frame_cursor: u64,
     /// Set by `close`: no retry may start after it.
     closed: bool,
+    /// Set by `supersede`: a new recording replaced these lanes.
+    superseded: bool,
 }
 
 pub struct AnswerLanes {
@@ -1013,7 +1015,7 @@ impl AnswerLanes {
                 )
             },
             || {},
-            move || !open_state.lock().unwrap().closed,
+            move || !open_state.lock().unwrap().superseded,
         )
         .await;
         match outcome.error {
@@ -1033,12 +1035,12 @@ impl AnswerLanes {
 
     /// Marks these lanes replaced by a new recording. Stop's `close` does not.
     pub fn supersede(&self) {
-        unimplemented!("round 4")
+        self.state.lock().unwrap().superseded = true;
     }
 
     /// Whether a new recording has replaced these lanes.
     pub fn is_superseded(&self) -> bool {
-        unimplemented!("round 4")
+        self.state.lock().unwrap().superseded
     }
 
     /// A second handle on the same runner and session state.
