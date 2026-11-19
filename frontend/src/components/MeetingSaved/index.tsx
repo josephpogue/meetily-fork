@@ -3,6 +3,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { PictureCleanup } from './PictureCleanup';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 
 // Shapes of api_get_meetings_saved / api_get_meeting_saved (src-tauri/src/meeting_saved.rs).
 // The backend writes all the wording; these components only place it.
@@ -47,7 +48,8 @@ export function MeetingSavedHeader({ meetingId, title, reloadKey }: { meetingId:
   const [loaded, setLoaded] = useState<{ id: string; saved: MeetingSaved | null } | null>(null);
   // Bumped when picture cleanup finishes or Joseph restores pictures: the saved numbers change.
   const [version, setVersion] = useState(0);
-  const onCleanupChanged = useCallback(() => setVersion((n) => n + 1), []);
+  const { refreshSaved } = useSidebar();
+  const onCleanupChanged = useCallback(() => { setVersion((n) => n + 1); refreshSaved(); }, [refreshSaved]);
 
   useEffect(() => {
     let cancelled = false;
