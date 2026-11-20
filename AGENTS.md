@@ -17,20 +17,14 @@ Read docs/GOAL.md before planning any change. Section goals live in docs/goals/;
 - Any PR that adds or changes fork behaviour also updates `docs/FORK_CHANGES.md`: what it does, the PR number, and the upstream files it touches. A new decision Joseph makes about this version goes under Requirements in `docs/GOAL.md`.
 - After an upstream merge, update the upstream base version there and check that each listed change still works.
 
-## Project Overview
+## Read on demand
 
-**Meetily** is a privacy-first AI meeting assistant that captures, transcribes, and summarizes meetings entirely on local infrastructure. The supported application is the Tauri desktop app with a Rust core.
-
-1. **Frontend**: Tauri-based desktop application (Rust + Next.js + TypeScript)
-2. **Rust Backend**: Tauri commands, audio capture, transcription, storage, and summarization orchestration
-3. **Legacy Backend Archive**: the old Python/FastAPI, Docker, and standalone whisper-server backend under `backend/` is archived and unsupported
-
-### Key Technology Stack
-- **Desktop App**: Tauri 2.x (Rust) + Next.js 14 + React 18
-- **Audio Processing**: Rust (cpal, whisper-rs, professional audio mixing)
-- **Transcription**: Whisper.cpp / whisper-rs and Parakeet paths in the Tauri app
-- **App API Surface**: Tauri commands and events, not a separate FastAPI service
-- **LLM Integration**: Ollama (local), Claude, Groq, OpenRouter
+| Before you... | Open |
+|---|---|
+| need what the app is, its technology stack, the Tauri desktop diagram or the audio pipeline (recording path versus transcription path) | `docs/project-overview.md` |
+| edit Rust or frontend code (buffer mixing, thread safety, `perf_debug!` logging, Sidebar state) or tune audio, Whisper or frontend performance | `.claude/rules/development-patterns.md` and `.claude/rules/performance.md` (load when you open a file under `frontend/src-tauri/` or `frontend/src/`) |
+| debug with Rust logs, DevTools or the audio pipeline metrics | `docs/debugging.md` |
+| build in a worktree, sign or install the app, fix a Screen Recording grant that fails, set up the test Mac, run frontend tests or check Homebrew linking (macOS), or work on Windows or Linux | `docs/platform-notes.md` |
 
 ## Essential Development Commands
 
@@ -74,43 +68,6 @@ The archived FastAPI service had unauthenticated, development-oriented CORS beha
 
 ## High-Level Architecture
 
-### Tauri Desktop Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                    Frontend (Tauri Desktop App)                  │
-│  ┌──────────────────┐  ┌─────────────────┐  ┌────────────────┐ │
-│  │   Next.js UI     │  │  Rust Backend   │  │ Whisper Engine │ │
-│  │  (React/TS)      │←→│  (Audio + IPC)  │←→│  (Local STT)   │ │
-│  └──────────────────┘  └─────────────────┘  └────────────────┘ │
-│         ↑ Tauri Events           ↑ Audio Pipeline               │
-└─────────────────────────────────────────────────────────────────┘
-```
-
-The current app does not require a separate FastAPI tier. Meeting persistence, local transcription, and summary orchestration are handled through the Rust/Tauri core.
-
-### Audio Processing Pipeline (Critical Understanding)
-
-The audio system has **two parallel paths** with different purposes:
-
-```
-Raw Audio (Mic + System)
-         ↓
-┌────────────────────────────────────────────────────────────┐
-│              Audio Pipeline Manager                         │
-│  (frontend/src-tauri/src/audio/pipeline.rs)                │
-└─────────────┬──────────────────────────┬───────────────────┘
-              ↓                          ↓
-    ┌─────────────────┐        ┌─────────────────────┐
-    │ Recording Path  │        │ Transcription Path  │
-    │ (Pre-mixed)     │        │ (VAD-filtered)      │
-    └─────────────────┘        └─────────────────────┘
-              ↓                          ↓
-    RecordingSaver.save()      WhisperEngine.transcribe()
-```
-
-**Key Insight**: The pipeline performs **professional audio mixing** (RMS-based ducking, clipping prevention) for recording, while simultaneously applying **Voice Activity Detection (VAD)** to send only speech segments to Whisper for transcription.
-
 ### Audio Device Modularization (Recently Completed)
 
 The `audio/` module tree and the map from symptom to owning file live in `docs/architecture.md`. **Read `docs/architecture.md` before changing anything under `frontend/src-tauri/src/audio/`.**
@@ -118,55 +75,6 @@ The `audio/` module tree and the map from symptom to owning file live in `docs/a
 ### Rust <-> Frontend Communication, and Whisper Model Management
 
 The Tauri command and event patterns, the Whisper model storage paths per platform, and the GPU feature flags live in `docs/architecture.md`. **Read `docs/architecture.md` before adding a Tauri command or event, and before touching model loading.**
-
-## Critical Development Patterns
-
-### 1. Audio Buffer Management
-
-**Ring Buffer Mixing** (pipeline.rs):
-- Mic and system audio arrive asynchronously at different rates
-- Ring buffer accumulates samples until both streams have aligned windows (50ms)
-- Professional mixing applies RMS-based ducking to prevent system audio from drowning out microphone
-- Uses `VecDeque` for efficient windowed processing
-
-### 2. Thread Safety and Async Boundaries
-
-**Recording State** (recording_state.rs):
-```rust
-pub struct RecordingState {
-    is_recording: Arc<AtomicBool>,
-    audio_sender: Arc<RwLock<Option<mpsc::UnboundedSender<AudioChunk>>>>,
-    // ...
-}
-```
-
-**Key Pattern**: Use `Arc<RwLock<T>>` for shared state across async tasks, `Arc<AtomicBool>` for simple flags.
-
-### 3. Error Handling and Logging
-
-**Performance-Aware Logging** (lib.rs):
-```rust
-#[cfg(debug_assertions)]
-macro_rules! perf_debug {
-    ($($arg:tt)*) => { log::debug!($($arg)*) };
-}
-
-#[cfg(not(debug_assertions))]
-macro_rules! perf_debug {
-    ($($arg:tt)*) => {};  // Zero overhead in release builds
-}
-```
-
-**Usage**: Use `perf_debug!()` and `perf_trace!()` for hot-path logging that should be eliminated in production.
-
-### 4. Frontend State Management
-
-**Sidebar Context** (components/Sidebar/SidebarProvider.tsx):
-- Global state for meetings list, current meeting, recording status
-- Communicates with the Rust/Tauri core through Tauri commands and events
-- Keeps React state synchronized with native recording, meeting, transcript, and summary state
-
-**Pattern**: Tauri commands update Rust state → Emit events → Frontend listeners update React state → Context propagates to components
 
 ## Common Development Tasks
 
@@ -181,77 +89,6 @@ Do not add new endpoints to `backend/app/main.py`; that FastAPI code is legacy a
 ## Testing and Debugging
 
 Before a PR, user-mock walks the app in a throwaway test Mac: `testenv/README.md`.
-
-### Frontend Debugging
-
-**Enable Rust Logging**:
-```bash
-# macOS
-RUST_LOG=debug ./clean_run.sh
-
-# Windows (PowerShell)
-$env:RUST_LOG="debug"; ./clean_run_windows.bat
-```
-
-**Developer Tools**:
-- Open DevTools: `Cmd+Shift+I` (macOS) or `Ctrl+Shift+I` (Windows)
-- Console Toggle: Built into app UI (console icon)
-- View Rust logs: Check terminal output
-
-### Audio Pipeline Debugging
-
-**Key Metrics** (emitted by pipeline):
-- Buffer sizes (mic/system)
-- Mixing window count
-- VAD detection rate
-- Dropped chunk warnings
-
-**Monitor via Developer Console**: The app includes real-time metrics display when recording.
-
-## Platform-Specific Notes
-
-### macOS
-- **Audio Capture**: Uses ScreenCaptureKit for system audio (macOS 13+)
-- **GPU**: Metal + CoreML automatically enabled
-- **Permissions**: Requires microphone + screen recording permissions
-- **System Audio**: Requires virtual audio device (BlackHole) for system capture
-- **Worktree builds**: Full Xcode 26.3 is installed and selected (since 2026-10-14), so the `cidre` build script's `xcodebuild` call works and a fresh worktree builds normally with `PATH=$HOME/.cargo/bin:$PATH`. Copy `<main>/frontend/src-tauri/binaries/*` into the worktree first (gitignored sidecars the tauri build requires). `scripts/xcodebuild-shim/xcodebuild` is a fallback for a Mac with only Command Line Tools: put it first on PATH and it compiles cidre's pomace targets with clang.
-- **Signing and installing (this Mac)**: ad hoc signing (`signingIdentity: "-"`, still the default in `tauri.conf.json` so CI and other Macs build) gives each build a new code hash, and macOS pins the Screen Recording grant to it, so after a rebuild the toggle looks on but capture silently fails. Run `scripts/setup-mac-signing.sh` once (creates the self-signed "meetily-fork local" identity in the login keychain, idempotent), then build and install with `scripts/install-mac.sh --build`, which signs with that identity through `APPLE_SIGNING_IDENTITY`, copies the app to /Applications, and when the designated requirement changed runs `tccutil reset ScreenCapture com.meetily.ai`, opens the app and tells you to click Allow. Check a build with `codesign -d -r- <app>`: it must show `certificate leaf = H"..."`, never `cdhash`. Quit the app before installing; the script refuses while it runs. A grant that still fails: `scripts/install-mac.sh --reset-tcc`.
-- **Test Mac screen capture**: an app that captures the screen needs its bundle id pre-approved in replayd's `ScreenCaptureApprovals.plist` by `testenv/provision/tcc.sh`, or Sequoia covers the screen with "<app> is requesting to bypass the system private window picker". Meetily's entry is `com.meetily.ai`.
-- **Test Mac notifications**: macOS 15 keeps an app's notification grant in `~/Library/Preferences/com.apple.ncprefs.plist`; `testenv/provision/tcc.sh` pre-sets Meetily's. usernoted drops an entry at boot whose `path` does not exist, so that entry's path must name an app present at boot.
-- **Frontend tests** are `bun test` in `frontend/`. bun is not installed globally on this Mac: `npm i bun --prefix /tmp/<dir>` and run its `node_modules/.bin/bun`.
-- **No Homebrew libraries in the app**: `frontend/src-tauri/.cargo/config.toml` sets `LIBONNXRUNTIME_NO_PKG_CONFIG`, so onnxruntime links statically even on a Mac with Homebrew's onnxruntime. It applies only to cargo run from `frontend/src-tauri` (tauri does that), not to `cargo test` from the repo root. Check a built app with `otool -L <app>/Contents/MacOS/meetily | grep /opt/homebrew`, which must print nothing.
-
-### Windows
-- **Audio Capture**: Uses WASAPI (Windows Audio Session API)
-- **GPU**: CUDA (NVIDIA) or Vulkan (AMD/Intel) via Cargo features
-- **Build Tools**: Requires Visual Studio Build Tools with C++ workload
-- **System Audio**: Uses WASAPI loopback for system capture
-
-### Linux
-- **Audio Capture**: ALSA/PulseAudio
-- **GPU**: CUDA (NVIDIA) or Vulkan via Cargo features
-- **Dependencies**: Requires cmake, llvm, libomp
-
-## Performance Optimization Guidelines
-
-### Audio Processing
-- Use `perf_debug!()` / `perf_trace!()` for hot-path logging (zero cost in release)
-- Batch audio metrics using `AudioMetricsBatcher` (pipeline.rs)
-- Pre-allocate buffers with `AudioBufferPool` (buffer_pool.rs)
-- VAD filtering reduces Whisper load by ~70% (only processes speech)
-
-### Whisper Transcription
-- **Model Selection**: Balance accuracy vs speed
-  - Development: `base` or `small` (fast iteration)
-  - Production: `medium` or `large-v3` (best quality)
-- **GPU Acceleration**: 5-10x faster than CPU
-- **Parallel Processing**: Available in `whisper_engine/parallel_processor.rs` for batch workloads
-
-### Frontend Performance
-- React state updates batched via Sidebar context
-- Transcript rendering virtualized for large meetings
-- Audio level monitoring throttled to 60fps
 
 ## Important Constraints and Gotchas
 
