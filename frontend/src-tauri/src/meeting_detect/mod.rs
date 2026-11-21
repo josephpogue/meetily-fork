@@ -5,6 +5,7 @@
 // (notify.rs).
 
 pub mod notify;
+pub mod panel;
 pub mod probe;
 pub mod rules;
 
