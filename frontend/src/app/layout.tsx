@@ -10,6 +10,7 @@ import { Toaster, toast } from 'sonner'
 import "sonner/dist/styles.css"
 import { useState, useEffect, useCallback } from 'react'
 import { listen, UnlistenFn } from '@tauri-apps/api/event'
+import { usePathname } from 'next/navigation'
 import { invoke } from '@tauri-apps/api/core'
 import { TooltipProvider } from '@/components/ui/tooltip'
 import { RecordingStateProvider } from '@/contexts/RecordingStateContext'
@@ -70,6 +71,7 @@ export default function RootLayout({
 }: {
   children: React.ReactNode
 }) {
+  const pathname = usePathname()
   const [showOnboarding, setShowOnboarding] = useState(false)
   const [onboardingCompleted, setOnboardingCompleted] = useState(false)
 
@@ -230,6 +232,17 @@ export default function RootLayout({
     setOnboardingCompleted(true)
     // Optionally reload the window to ensure all state is fresh
     window.location.reload()
+  }
+
+  // The floating meeting prompt window draws only its card: no providers, sidebar or onboarding.
+  if (pathname?.startsWith('/meeting-prompt')) {
+    return (
+      <html lang="en" style={{ background: 'transparent' }}>
+        <body className={`${sourceSans3.variable} font-sans antialiased`} style={{ background: 'transparent' }}>
+          {children}
+        </body>
+      </html>
+    )
   }
 
   return (

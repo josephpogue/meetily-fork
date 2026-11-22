@@ -12,17 +12,17 @@ import type { CallApp, CallAppStatus, MeetingDetectedPayload, PanelCard } from '
 class MeetingDetectService {
   /** Cards the floating prompt shows right now (`meeting_prompt_cards`). */
   cards(): Promise<PanelCard[]> {
-    throw new Error('not implemented');
+    return invoke<PanelCard[]>('meeting_prompt_cards');
   }
 
   /** Each `meeting-prompt-cards` payload: the full current card list. */
-  onCards(_cb: (cards: PanelCard[]) => void): Promise<UnlistenFn> {
-    throw new Error('not implemented');
+  onCards(cb: (cards: PanelCard[]) => void): Promise<UnlistenFn> {
+    return listen<PanelCard[]>('meeting-prompt-cards', (e) => cb(e.payload));
   }
 
   /** Record from a floating card (`meeting_detect_record`): the notification's Record path. */
-  record(_app: CallApp): Promise<void> {
-    throw new Error('not implemented');
+  record(app: CallApp): Promise<void> {
+    return invoke('meeting_detect_record', { app });
   }
 
   listCallApps(): Promise<CallAppStatus[]> {

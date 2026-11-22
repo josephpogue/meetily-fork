@@ -74,6 +74,16 @@
                             ]
                         }
                     ]
+                },
+                {
+                    "identifier": "meeting-prompt",
+                    "description": "Floating meeting prompt window: listens for card updates",
+                    "windows": [
+                        "meeting-prompt"
+                    ],
+                    "permissions": [
+                        "core:event:default"
+                    ]
                 }
             ]
         }

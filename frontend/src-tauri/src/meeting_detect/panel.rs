@@ -35,14 +35,17 @@ pub struct Rect {
 }
 
 /// The cards the floating window shows now, Zoom before Teams. Empty means the window is hidden.
-pub fn cards(_rules: &Rules) -> Vec<Card> {
-    unimplemented!("not implemented")
+pub fn cards(rules: &Rules) -> Vec<Card> {
+    let started = rules.prompted().into_iter().map(|(app, title)| Card { app, kind: CardKind::Started, title });
+    let ended = rules.ended().into_iter().map(|app| Card { app, kind: CardKind::Ended, title: None });
+    started.chain(ended).collect()
 }
 
 /// Top-left point for a `width` x `height` window: centered horizontally in `visible`, its top
 /// `GAP_TOP` below `visible.y`; x is `visible.x` when the window is wider than `visible`.
-pub fn place(_visible: Rect, _width: f64, _height: f64) -> (f64, f64) {
-    unimplemented!("not implemented")
+pub fn place(visible: Rect, width: f64, _height: f64) -> (f64, f64) {
+    let x = if width >= visible.w { visible.x } else { visible.x + (visible.w - width) / 2.0 };
+    (x, visible.y + GAP_TOP)
 }
 
 #[cfg(test)]
