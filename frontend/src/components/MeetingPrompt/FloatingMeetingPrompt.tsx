@@ -37,11 +37,12 @@ export function FloatingMeetingPrompt(): JSX.Element | null {
     };
   }, []);
 
-  // The card goes when the command resolves; a failed command leaves it until the next payload.
+  // A press removes nothing: the list is always Rust's latest. Dismiss, Keep and Stop change Rust's state
+  // and it sends the new list at once; Record only asks the main window to start, so the card stays
+  // (and Record stays pressable) until Rust's state says otherwise. A failed command is only logged.
   const press = useCallback(async (card: PanelCard, action: Action) => {
     try {
       await meetingDetectService[action](card.app);
-      setCards((prev) => prev.filter((c) => !(c.app === card.app && c.kind === card.kind)));
     } catch (e) {
       console.error(`[FloatingMeetingPrompt] ${action} failed`, e);
     }
