@@ -53,12 +53,12 @@ Readers of the meeting-detect state today: `meeting_detect/mod.rs` (`apply`, `on
 
 | Press | What must happen |
 |---|---|
-| Record while that app is prompted and nothing records | main window comes forward, the recording of that app starts (same path as the notification's Record), card goes |
+| Record while that app is prompted and nothing records | main window comes forward, the recording of that app starts (same path as the notification's Record); the card goes when Rust's next payload drops it |
 | Record on a stale card (call gone, or recording already on) | main window comes forward, nothing starts, no error shown |
-| Dismiss | `meeting_detect_dismiss`; card goes |
-| Keep recording | `meeting_detect_keep`; card goes |
-| Stop recording | `meeting_detect_stop`; card goes |
-| A command fails | the card stays until the next `meeting-prompt-cards` payload; the error is logged, nothing else breaks |
+| Dismiss | `meeting_detect_dismiss`; card goes with Rust's next payload |
+| Keep recording | `meeting_detect_keep`; card goes with Rust's next payload |
+| Stop recording | `meeting_detect_stop`; card goes with Rust's next payload |
+| A command fails, or Record's start fails or is ignored (onboarding) | the card stays, so it can be pressed again; the error is logged, nothing else breaks |
 
 ## Worked examples
 
@@ -92,7 +92,7 @@ Readers of the meeting-detect state today: `meeting_detect/mod.rs` (`apply`, `on
   - Ended: tick `now: 0, recording: true, recording_app: None` with Zoom `mic: true, meeting_window: true`, then recording ticks with all-default signals every 2 s until `ended()` is not empty (same bounded loop).
   - EndedCleared by a stopped recording: after Ended, one non-recording tick with default signals.
 - **Labels:** the visible button text is exactly "Record", "Dismiss", "Stop recording", "Keep recording". Each card is a `section` with `aria-label` "<Label> meeting started" or "<Label> meeting ended", as the old in-app card had.
-- **When a card goes:** on a successful press, the card goes when the command resolves, without waiting for the next payload. On a failed press it stays until the next payload.
+- **When a card goes (changed after review, 2026-11-21):** a press never removes a card on its own, success or failure. The window shows exactly the latest list Rust sent (`cards()` on mount, then each `meeting-prompt-cards` payload). Rust owns the state: Dismiss, Keep and Stop change it at once and send a new payload; Record does not change it, so the Started card stays until the recording really starts and the next tick clears it. Why: Record only asks the main window to start; if the start fails, or onboarding ignores it, Rust still has the call prompted, so a card removed by the page would leave Rust showing an empty window and the retry gone.
 - **Record on a stale card, and the onboarding row:** both are checked by hand on the running app, not by unit tests.
 
 ## Answers to the developer's plan questions
