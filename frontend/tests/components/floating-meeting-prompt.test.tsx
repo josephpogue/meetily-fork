@@ -103,19 +103,35 @@ describe('FloatingMeetingPrompt', () => {
     expect(buttons('Dismiss')).toHaveLength(1);
   });
 
-  test('pressing Record invokes meeting_detect_record for zoom and the card goes', async () => {
+  test('pressing Record invokes meeting_detect_record for zoom; the card goes only with the next payload', async () => {
     currentCards = [card('zoom', 'started', 'Weekly sync')];
     await mount();
     await press('Record');
     expect(invoke).toHaveBeenCalledWith('meeting_detect_record', { app: 'zoom' });
+    expect(all()).toContain('Zoom meeting started');
+    await fire('meeting-prompt-cards', []);
     expect(renderer!.toJSON()).toBeNull();
   });
 
-  test('pressing Dismiss invokes meeting_detect_dismiss and the card goes', async () => {
+  test('a Record that succeeds with no payload after it leaves the card shown and Record pressable again', async () => {
+    currentCards = [card('zoom', 'started', 'Weekly sync')];
+    await mount();
+    await press('Record');
+    await settle();
+    expect(all()).toContain('Zoom meeting started');
+    expect(buttons('Record')).toHaveLength(1);
+    await press('Record');
+    expect(commandCalls('meeting_detect_record')).toHaveLength(2);
+    expect(all()).toContain('Zoom meeting started');
+  });
+
+  test('pressing Dismiss invokes meeting_detect_dismiss; the card goes only with the next payload', async () => {
     currentCards = [card('teams', 'started')];
     await mount();
     await press('Dismiss');
     expect(invoke).toHaveBeenCalledWith('meeting_detect_dismiss', { app: 'teams' });
+    expect(all()).toContain('Teams meeting started');
+    await fire('meeting-prompt-cards', []);
     expect(renderer!.toJSON()).toBeNull();
   });
 
@@ -138,6 +154,10 @@ describe('FloatingMeetingPrompt', () => {
     expect(buttons('Record')).toHaveLength(2);
     await press('Dismiss', 1);
     expect(invoke).toHaveBeenCalledWith('meeting_detect_dismiss', { app: 'teams' });
+    // The press removes nothing; both cards stay until the next payload.
+    expect(all()).toContain('Zoom meeting started');
+    expect(all()).toContain('Teams meeting started');
+    await fire('meeting-prompt-cards', [card('zoom', 'started', 'Weekly sync')]);
     expect(all()).toContain('Zoom meeting started');
     expect(all()).not.toContain('Teams meeting started');
   });
@@ -150,14 +170,18 @@ describe('FloatingMeetingPrompt', () => {
     expect(buttons('Keep recording')).toHaveLength(1);
     await press('Stop recording');
     expect(invoke).toHaveBeenCalledWith('meeting_detect_stop', { app: 'teams' });
+    expect(all()).toContain('Teams meeting ended');
+    await fire('meeting-prompt-cards', []);
     expect(renderer!.toJSON()).toBeNull();
   });
 
-  test('Keep recording calls meeting_detect_keep and the card goes', async () => {
+  test('Keep recording calls meeting_detect_keep; the card stays until a payload without it arrives', async () => {
     currentCards = [card('teams', 'ended')];
     await mount();
     await press('Keep recording');
     expect(invoke).toHaveBeenCalledWith('meeting_detect_keep', { app: 'teams' });
+    expect(all()).toContain('Teams meeting ended');
+    await fire('meeting-prompt-cards', []);
     expect(renderer!.toJSON()).toBeNull();
   });
 
