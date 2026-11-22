@@ -94,3 +94,12 @@ Readers of the meeting-detect state today: `meeting_detect/mod.rs` (`apply`, `on
 - **Labels:** the visible button text is exactly "Record", "Dismiss", "Stop recording", "Keep recording". Each card is a `section` with `aria-label` "<Label> meeting started" or "<Label> meeting ended", as the old in-app card had.
 - **When a card goes:** on a successful press, the card goes when the command resolves, without waiting for the next payload. On a failed press it stays until the next payload.
 - **Record on a stale card, and the onboarding row:** both are checked by hand on the running app, not by unit tests.
+
+## Answers to the developer's plan questions
+
+- Adding `objc2-app-kit` (macOS target) and the Cargo.lock change it brings: yes.
+- Window label `meeting-prompt`, route `/meeting-prompt`: yes.
+- Size: 360 points wide; the height fits the cards shown (about 120 for one, about 230 for two).
+- The floating window's page is created once at startup, hidden, and kept alive; hiding only orders it out: yes.
+- Closing the main window hides it to the tray and the app keeps running (`lib.rs`, `CloseRequested` handler), so the floating window must keep working then.
+- The window code is macOS only and a no-op elsewhere; `cards()` works everywhere: yes.
