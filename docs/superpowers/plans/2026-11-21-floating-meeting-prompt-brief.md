@@ -80,3 +80,17 @@ Readers of the meeting-detect state today: `meeting_detect/mod.rs` (`apply`, `on
 ## Out of scope
 
 - Detection rules in `rules.rs`, the notification in `notify.rs`, auto start or stop, start at login, new call apps.
+
+## Answers to the tester's questions
+
+- **Rust test file:** `frontend/src-tauri/src/meeting_detect/tests/panel.rs`. `panel.rs` already declares it (`#[cfg(test)] #[path = "tests/panel.rs"] mod tests;`), so it is a child module of `panel`: use `super::*` for `cards`, `place`, `Rect`, `Card`, `CardKind`, `GAP_TOP`, and `crate::meeting_detect::rules::{Rules, Tick, AppSignals}` plus `crate::audio::call_apps::CallAppId`.
+- **Rules, as a black box:** `Rules::new()`; `tick(&Tick) -> Vec<Event>`; `recording_started(Option<CallAppId>) -> Vec<Event>`; `keep(CallAppId) -> Option<Event>`; `dismiss(CallAppId, now: u64) -> Option<Event>`; `prompted()`; `ended()`.
+  - `Tick { now: u64, recording: bool, recording_app: Option<CallAppId>, zoom: AppSignals, teams: AppSignals }`, all fields public, `Default`.
+  - `AppSignals { mic: bool, meeting_window: bool, plain_window: bool, frontmost: bool, title: Option<String> }`, all public, `Default`.
+  - Started prompt: one tick `now: 2, recording: false`, with that app's `mic: true, meeting_window: true` (and `title: Some(..)` for a title) prompts that app at once.
+  - Cleared: after a prompt, feed non-recording ticks with all-default signals every 2 s until `prompted()` is empty (loop with a bound of 30; do not depend on the exact count).
+  - Ended: tick `now: 0, recording: true, recording_app: None` with Zoom `mic: true, meeting_window: true`, then recording ticks with all-default signals every 2 s until `ended()` is not empty (same bounded loop).
+  - EndedCleared by a stopped recording: after Ended, one non-recording tick with default signals.
+- **Labels:** the visible button text is exactly "Record", "Dismiss", "Stop recording", "Keep recording". Each card is a `section` with `aria-label` "<Label> meeting started" or "<Label> meeting ended", as the old in-app card had.
+- **When a card goes:** on a successful press, the card goes when the command resolves, without waiting for the next payload. On a failed press it stays until the next payload.
+- **Record on a stale card, and the onboarding row:** both are checked by hand on the running app, not by unit tests.

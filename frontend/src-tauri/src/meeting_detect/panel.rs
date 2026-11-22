@@ -44,3 +44,7 @@ pub fn cards(_rules: &Rules) -> Vec<Card> {
 pub fn place(_visible: Rect, _width: f64, _height: f64) -> (f64, f64) {
     unimplemented!("not implemented")
 }
+
+#[cfg(test)]
+#[path = "tests/panel.rs"]
+mod tests;
