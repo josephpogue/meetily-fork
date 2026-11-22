@@ -162,9 +162,13 @@ fn a_dismissed_app_shows_no_card_for_30_minutes() {
 }
 
 #[test]
-fn a_dismissed_app_prompts_again_after_30_minutes() {
+fn a_new_call_after_30_minutes_prompts_again() {
     let mut rules = prompted(Some("Weekly sync"), None);
     let _ = rules.dismiss(CallAppId::Zoom, 4);
+    // The dismissed call ends (a dismissed call never prompts again), then a new call starts.
+    for i in 1..=30 {
+        let _ = rules.tick(&Tick { now: 4 + 2 * i, recording: false, ..Default::default() });
+    }
     let _ = rules.tick(&Tick { now: 4 + 31 * 60, recording: false, zoom: in_call(Some("Weekly sync")), ..Default::default() });
     assert_eq!(cards(&rules), vec![started(CallAppId::Zoom, Some("Weekly sync"))]);
 }

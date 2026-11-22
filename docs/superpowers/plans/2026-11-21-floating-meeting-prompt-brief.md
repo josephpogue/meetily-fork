@@ -39,7 +39,7 @@ Frontend:
 | Zoom and Teams both prompted | two Started cards, Zoom first | no card | two, as today |
 | Prompted call ends before any click (Cleared) | that card goes; window hides if none left | no card | withdrawn as today |
 | Recording started any way (Record, main button, tray) | every Started card goes | no card | as today |
-| Dismissed | that card goes; no card for 30 min for that app | no card | withdrawn as today |
+| Dismissed | that card goes; that call never shows a card again, and no new call of that app shows one for 30 min (today's rule in `rules.rs`) | no card | withdrawn as today |
 | Recording, watched call ended (Ended) | one Ended card "Zoom meeting ended", Stop recording and Keep recording | no card | as today |
 | Ended, Keep pressed | that card goes | no card | withdrawn |
 | Ended, Stop pressed | card goes, recording stops by the tray's Stop path | no card | withdrawn |
