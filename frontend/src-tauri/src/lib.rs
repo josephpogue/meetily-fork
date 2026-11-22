@@ -733,6 +733,8 @@ pub fn run() {
             meeting_detect::meeting_detect_keep,
             meeting_detect::meeting_detect_stop,
             meeting_detect::meeting_detect_ended_current,
+            meeting_detect::meeting_detect_record,
+            meeting_detect::meeting_prompt_cards,
             start_recording,
             stop_recording,
             is_recording,

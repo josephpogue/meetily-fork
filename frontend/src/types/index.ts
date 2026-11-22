@@ -328,6 +328,14 @@ export interface MeetingAssistantMeta {
 
 // Call apps Meetily can detect and record on their own (meeting-detect feature).
 export type CallApp = 'zoom' | 'teams';
+
+/** One card in the floating meeting prompt. */
+export interface PanelCard {
+  app: CallApp;
+  label: string;
+  kind: 'started' | 'ended';
+  title: string | null;
+}
 export type CallAppLabel = 'Zoom' | 'Teams';
 
 /** Payload of `meeting-detected`, `meeting-detect-record` and the rows of `meeting_detect_current`. */

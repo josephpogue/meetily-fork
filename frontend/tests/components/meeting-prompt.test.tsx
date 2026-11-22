@@ -117,11 +117,9 @@ const text = (node: ReactTestInstance | string): string =>
   typeof node === 'string' ? node : node.children.map(text).join('');
 let renderer: ReactTestRenderer;
 const sections = () => renderer.root.findAll((n) => n.type === 'section');
-const cardText = () => sections().map((s) => s.findAll((n) => n.type === 'p').map(text));
-const button = (name: string) =>
-  renderer.root.findAll((n) => n.type === 'button' && (n.props['aria-label'] ?? text(n)) === name)[0];
+// MeetingPrompt may no longer listen to every event it used to, so a missing handler is a no-op.
 const fire = async (name: string, payload: unknown) => {
-  await act(async () => { handlers.get(name)!({ payload }); });
+  await act(async () => { handlers.get(name)?.({ payload }); });
 };
 const startCalls = () => invoke.mock.calls.filter((c) => c[0] === 'start_recording_with_devices_and_meeting');
 
@@ -148,120 +146,62 @@ beforeEach(async () => {
 const zoom = (title: string | null) => ({ app: 'zoom', label: 'Zoom', title });
 const teams = (title: string | null) => ({ app: 'teams', label: 'Teams', title });
 
-describe('meeting prompt cards', () => {
-  test('walks the card list through detect, update, clear and dismiss', async () => {
-    await mount();
-    await fire('meeting-detected', zoom('Q3 storage review'));
-    expect(cardText()).toEqual([['Zoom meeting started', 'Q3 storage review']]);
+const noCardDrawn = () => {
+  expect(sections()).toEqual([]);
+  const all = renderer.root.findAll((n) => n.type === 'button').map(text).join('|');
+  for (const word of ['Record', 'Dismiss', 'Stop recording', 'Keep recording']) expect(all).not.toContain(word);
+  expect(renderer.root.findAll((n) => n.type === 'p').map(text).join('|')).not.toContain('meeting started');
+  expect(renderer.root.findAll((n) => n.type === 'p').map(text).join('|')).not.toContain('meeting ended');
+};
 
-    await fire('meeting-detected', teams(null));
-    expect(cardText()).toEqual([['Zoom meeting started', 'Q3 storage review'], ['Teams meeting started']]);
-
-    await fire('meeting-detected', zoom('Q4 plan'));
-    expect(cardText()).toEqual([['Zoom meeting started', 'Q4 plan'], ['Teams meeting started']]);
-
-    await fire('meeting-detected-cleared', { app: 'zoom' });
-    expect(cardText()).toEqual([['Teams meeting started']]);
-
-    await act(async () => { button('Dismiss Teams meeting').props.onClick(); });
-    expect(invoke).toHaveBeenCalledWith('meeting_detect_dismiss', { app: 'teams' });
-    expect(cardText()).toEqual([]);
-  });
-
-  test('a window that loads late shows the calls the backend already holds', async () => {
+describe('the main window draws no meeting cards', () => {
+  test('detect, update, clear and ended events draw nothing', async () => {
     currentCalls = [zoom('Standup'), teams(null)];
     await mount();
-    expect(cardText()).toEqual([['Zoom meeting started', 'Standup'], ['Teams meeting started']]);
-  });
-
-  test('Record on Zoom starts a Zoom-only recording and clears the cards', async () => {
-    await mount();
+    noCardDrawn();
     await fire('meeting-detected', zoom('Q3 storage review'));
     await fire('meeting-detected', teams(null));
-    await act(async () => { button('Record Zoom meeting').props.onClick(); });
-    await act(async () => { await new Promise((r) => setTimeout(r, 10)); });
+    noCardDrawn();
+    await fire('meeting-detected-cleared', { app: 'zoom' });
+    noCardDrawn();
+    await act(async () => { setRec(true); });
+    await fire('meeting-ended', zoom(null));
+    await fire('meeting-ended', teams(null));
+    noCardDrawn();
+  });
+});
+
+describe('meeting-detect-record start flow', () => {
+  const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 10)); });
+
+  test('a native Record on Zoom starts a Zoom-only recording', async () => {
+    await mount();
+    await fire('meeting-detect-record', zoom('Q3 storage review'));
+    await settle();
     expect(startCalls()).toHaveLength(1);
     expect(startCalls()[0][1]).toMatchObject({ micDeviceName: 'Mic', systemDeviceName: 'Speakers', callApp: 'zoom' });
-    expect(cardText()).toEqual([]);
     expect(callAudioStore.get()).toBe('zoom');
+    noCardDrawn();
   });
 
-  test('a Record that fails leaves the card in place', async () => {
+  test('a Record that fails leaves the picker as it was', async () => {
     startError = new Error('no audio');
     g.alert = () => {};
     await mount();
-    await fire('meeting-detected', zoom('Q3 storage review'));
-    await act(async () => { button('Record Zoom meeting').props.onClick(); });
-    await act(async () => { await new Promise((r) => setTimeout(r, 10)); });
+    await fire('meeting-detect-record', zoom('Q3 storage review'));
+    await settle();
     expect(startCalls()).toHaveLength(1);
-    expect(cardText()).toEqual([['Zoom meeting started', 'Q3 storage review']]);
     expect(callAudioStore.get()).toBeNull();
   });
 
   test('Record from another page goes home with the app named for the auto-start', async () => {
     pathname = '/meeting-details';
     await mount();
-    await fire('meeting-detected', teams('Retro'));
-    await act(async () => { button('Record Teams meeting').props.onClick(); });
+    await fire('meeting-detect-record', teams('Retro'));
+    await settle();
     expect(push).toHaveBeenCalledWith('/');
     expect(store.get('autoStartCallApp')).toBe('teams');
     expect(startCalls()).toHaveLength(0);
-  });
-
-  test('a start from anywhere removes the cards, and none appear while recording', async () => {
-    await mount();
-    await fire('meeting-detected', zoom('A'));
-    await act(async () => { setRec(true); });
-    expect(cardText()).toEqual([]);
-    await fire('meeting-detected', teams(null));
-    expect(cardText()).toEqual([]);
-  });
-});
-
-describe('meeting ended cards', () => {
-  test('a card shows only while recording, with Stop recording and Keep recording', async () => {
-    await mount();
-    await act(async () => { setRec(true); });
-    await fire('meeting-ended', zoom(null));
-    expect(cardText()).toEqual([['Zoom meeting ended']]);
-    expect(button('Stop recording after Zoom meeting')).toBeDefined();
-    expect(button('Keep recording after Zoom meeting')).toBeDefined();
-  });
-
-  test('an ended event while not recording shows nothing', async () => {
-    await mount();
-    await fire('meeting-ended', zoom(null));
-    expect(cardText()).toEqual([]);
-  });
-
-  test('Stop recording calls the stop command and removes the card', async () => {
-    await mount();
-    await act(async () => { setRec(true); });
-    await fire('meeting-ended', teams(null));
-    await act(async () => { button('Stop recording after Teams meeting').props.onClick(); });
-    expect(invoke).toHaveBeenCalledWith('meeting_detect_stop', { app: 'teams' });
-    expect(cardText()).toEqual([]);
-  });
-
-  test('Keep recording calls the keep command and removes the card', async () => {
-    await mount();
-    await act(async () => { setRec(true); });
-    await fire('meeting-ended', zoom(null));
-    await act(async () => { button('Keep recording after Zoom meeting').props.onClick(); });
-    expect(invoke).toHaveBeenCalledWith('meeting_detect_keep', { app: 'zoom' });
-    expect(cardText()).toEqual([]);
-  });
-
-  test('a rejoin clears the card, and a recording that stops another way removes it', async () => {
-    await mount();
-    await act(async () => { setRec(true); });
-    await fire('meeting-ended', zoom(null));
-    await fire('meeting-ended', teams(null));
-    expect(cardText()).toEqual([['Zoom meeting ended'], ['Teams meeting ended']]);
-    await fire('meeting-ended-cleared', { app: 'zoom' });
-    expect(cardText()).toEqual([['Teams meeting ended']]);
-    await act(async () => { setRec(false); });
-    expect(cardText()).toEqual([]);
   });
 });
 
@@ -308,21 +248,18 @@ describe('one start at a time', () => {
     (g.window as { dispatchEvent: (e: unknown) => void }).dispatchEvent(new (g.CustomEvent as typeof CustomEvent)('start-recording-from-sidebar', detail ? { detail } : undefined));
   const settle = () => act(async () => { await new Promise((r) => setTimeout(r, 10)); });
 
-  test('a card Record pressed while the button start is in flight is ignored', async () => {
+  test('a native Record arriving while the button start is in flight is ignored', async () => {
     let release!: () => void;
     modelGate = new Promise<void>((r) => { release = r; });
     await mount();
-    await fire('meeting-detected', zoom('Q3 storage review'));
     let first!: Promise<void>;
     await act(async () => { first = startManual(); });
-    await act(async () => { button('Record Zoom meeting').props.onClick(); });
+    await fire('meeting-detect-record', zoom('Q3 storage review'));
     await settle();
-    expect(cardText()).toEqual([['Zoom meeting started', 'Q3 storage review']]);
     await act(async () => { release(); await first; });
     await settle();
     expect(startCalls()).toHaveLength(1);
     expect(startCalls()[0][1]).toMatchObject({ callApp: null });
-    expect(cardText()).toEqual([]);
   });
 
   test('the button start is ignored while a sidebar start is in flight', async () => {
@@ -355,7 +292,7 @@ describe('onboarding', () => {
     suppressedNow = true;
     await mount();
     await fire('meeting-detected', zoom('Q3 storage review'));
-    expect(cardText()).toEqual([]);
+    noCardDrawn();
     await fire('meeting-detect-record', zoom('Q3 storage review'));
     await act(async () => { await new Promise((r) => setTimeout(r, 10)); });
     expect(startCalls()).toHaveLength(0);

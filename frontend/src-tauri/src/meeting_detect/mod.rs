@@ -5,6 +5,9 @@
 // (notify.rs).
 
 pub mod notify;
+pub mod panel;
+#[cfg(target_os = "macos")]
+pub mod panel_window;
 pub mod probe;
 pub mod rules;
 
@@ -55,6 +58,7 @@ pub fn start<R: Runtime>(app: &AppHandle<R>) {
     app.manage(state.clone());
     #[cfg(target_os = "macos")]
     {
+        panel_window::init(app);
         let handle = app.clone();
         notify::init(Box::new({
             let handle = handle.clone();
@@ -82,23 +86,25 @@ fn on_banner<R: Runtime>(app: &AppHandle<R>, state: &Arc<DetectState>, key: &str
         }
         notify::Response::Stop => stop_app(app, state, id),
         notify::Response::Open => crate::tray::focus_main_window(app),
-        notify::Response::Record => {
-            // A stale banner must not start a recording: Record only counts while that app is
-            // prompted right now and nothing is recording. Otherwise it just opens the window.
-            let (app, state) = (app.clone(), state.clone());
-            tauri::async_runtime::spawn(async move {
-                let recording = crate::is_recording().await;
-                let prompted = state.inner.lock().ok().map(|r| r.prompted()).unwrap_or_default();
-                let title = prompted.into_iter().find(|(a, _)| *a == id).map(|(_, t)| t);
-                crate::tray::focus_main_window(&app);
-                if let (Some(title), false) = (title, recording) {
-                    if let Err(e) = app.emit("meeting-detect-record", payload(id, title)) {
-                        log::error!("meeting_detect: cannot emit meeting-detect-record: {}", e);
-                    }
-                }
-            });
-        }
+        notify::Response::Record => record_app(app, state, id),
     }
+}
+
+/// Record on a banner or a floating card. A stale one must not start a recording: Record only counts while
+/// that app is prompted right now and nothing is recording. Otherwise it just brings the main window forward.
+fn record_app<R: Runtime>(app: &AppHandle<R>, state: &Arc<DetectState>, id: CallAppId) {
+    let (app, state) = (app.clone(), state.clone());
+    tauri::async_runtime::spawn(async move {
+        let recording = crate::is_recording().await;
+        let prompted = state.inner.lock().ok().map(|r| r.prompted()).unwrap_or_default();
+        let title = prompted.into_iter().find(|(a, _)| *a == id).map(|(_, t)| t);
+        crate::tray::focus_main_window(&app);
+        if let (Some(title), false) = (title, recording) {
+            if let Err(e) = app.emit("meeting-detect-record", payload(id, title)) {
+                log::error!("meeting_detect: cannot emit meeting-detect-record: {}", e);
+            }
+        }
+    });
 }
 
 /// Keep recording after a "meeting ended" prompt: removes the card and the banner.
@@ -132,6 +138,48 @@ fn dismiss_app<R: Runtime>(app: &AppHandle<R>, state: &DetectState, id: CallAppI
 }
 
 fn apply<R: Runtime>(app: &AppHandle<R>, event: Event) {
+    apply_event(app, event);
+    if let Some(state) = app.try_state::<Arc<DetectState>>() {
+        sync_panel(app, &state);
+    }
+}
+
+/// One card of the floating prompt, as the page reads it.
+#[derive(Serialize, Clone)]
+pub struct PanelCard {
+    app: &'static str,
+    label: &'static str,
+    kind: &'static str,
+    title: Option<String>,
+}
+
+fn panel_cards(state: &DetectState) -> Vec<PanelCard> {
+    let cards = state.inner.lock().map(|r| panel::cards(&r)).unwrap_or_default();
+    cards
+        .into_iter()
+        .map(|c| PanelCard {
+            app: c.app.as_str(),
+            label: c.app.label(),
+            kind: match c.kind {
+                panel::CardKind::Started => "started",
+                panel::CardKind::Ended => "ended",
+            },
+            title: c.title,
+        })
+        .collect()
+}
+
+/// Sends the floating prompt its full card list and shows or hides its window to match.
+fn sync_panel<R: Runtime>(app: &AppHandle<R>, state: &DetectState) {
+    let cards = panel_cards(state);
+    if let Err(e) = app.emit("meeting-prompt-cards", &cards) {
+        log::error!("meeting_detect: cannot emit meeting-prompt-cards: {}", e);
+    }
+    #[cfg(target_os = "macos")]
+    panel_window::update(app, cards.len());
+}
+
+fn apply_event<R: Runtime>(app: &AppHandle<R>, event: Event) {
     match event {
         Event::Prompted { app: id, title } => {
             log::info!("meeting_detect: {} meeting started", id.label());
@@ -295,6 +343,24 @@ pub fn meeting_detect_stop(
     let id = CallAppId::parse(&app).ok_or_else(|| format!("unknown call app: {}", app))?;
     stop_app(&handle, &state, id);
     Ok(())
+}
+
+/// The floating prompt's Record: the notification's Record path.
+#[tauri::command]
+pub fn meeting_detect_record(
+    app: String,
+    handle: AppHandle,
+    state: State<'_, Arc<DetectState>>,
+) -> Result<(), String> {
+    let id = CallAppId::parse(&app).ok_or_else(|| format!("unknown call app: {}", app))?;
+    record_app(&handle, &state, id);
+    Ok(())
+}
+
+/// Cards the floating prompt shows right now, so its page shows them when it loads late.
+#[tauri::command]
+pub fn meeting_prompt_cards(state: State<'_, Arc<DetectState>>) -> Vec<PanelCard> {
+    panel_cards(&state)
 }
 
 /// Ended prompts showing right now, so a window that loads late still shows them.

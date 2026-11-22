@@ -7,9 +7,24 @@
 
 import { invoke } from '@tauri-apps/api/core';
 import { listen, type UnlistenFn } from '@tauri-apps/api/event';
-import type { CallApp, CallAppStatus, MeetingDetectedPayload } from '@/types';
+import type { CallApp, CallAppStatus, MeetingDetectedPayload, PanelCard } from '@/types';
 
 class MeetingDetectService {
+  /** Cards the floating prompt shows right now (`meeting_prompt_cards`). */
+  cards(): Promise<PanelCard[]> {
+    return invoke<PanelCard[]>('meeting_prompt_cards');
+  }
+
+  /** Each `meeting-prompt-cards` payload: the full current card list. */
+  onCards(cb: (cards: PanelCard[]) => void): Promise<UnlistenFn> {
+    return listen<PanelCard[]>('meeting-prompt-cards', (e) => cb(e.payload));
+  }
+
+  /** Record from a floating card (`meeting_detect_record`): the notification's Record path. */
+  record(app: CallApp): Promise<void> {
+    return invoke('meeting_detect_record', { app });
+  }
+
   listCallApps(): Promise<CallAppStatus[]> {
     return invoke<CallAppStatus[]>('list_call_apps');
   }
