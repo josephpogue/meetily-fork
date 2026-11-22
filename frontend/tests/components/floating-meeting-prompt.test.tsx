@@ -161,6 +161,13 @@ describe('FloatingMeetingPrompt', () => {
     expect(renderer!.toJSON()).toBeNull();
   });
 
+  test('each card is a section labelled with its heading', async () => {
+    currentCards = [card('zoom', 'started', 'Weekly sync'), card('teams', 'ended')];
+    await mount();
+    const labels = renderer!.root.findAll((n) => n.type === 'section').map((s) => s.props['aria-label']);
+    expect(labels).toEqual(['Zoom meeting started', 'Teams meeting ended']);
+  });
+
   test('an ended Zoom card reads "Zoom meeting ended" and has no Record button', async () => {
     currentCards = [card('zoom', 'ended')];
     await mount();
