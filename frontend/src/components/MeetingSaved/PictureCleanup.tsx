@@ -1,31 +1,36 @@
 'use client';
 
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
 import { createPortal } from 'react-dom';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
 import { toast } from 'sonner';
-import { Check, ChevronDown, ChevronLeft, ChevronRight, ChevronUp, RotateCcw, Trash2 } from 'lucide-react';
+import { Check, ChevronDown, ChevronUp, RotateCcw, Trash2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
-import { Dialog, DialogContent, DialogDescription, DialogTitle } from '@/components/ui/dialog';
+import type { MeetingPicture, PictureReason } from './allPictures';
+import { AllPicturesPanel } from './AllPicturesPanel';
+import { Picture, REASON_LABEL, Viewer, hhmm, plural, timeOfFile } from './pictureParts';
 
 // Shapes of the picture_cleanup_* commands (src-tauri/src/assistant/cleanup_run.rs).
 // The backend writes the wording of the line, the panel title and the dates; this file places it.
-type Reason = 'loading' | 'greyed' | 'blank' | 'popup' | 'before_share' | 'repeat';
-
 export interface RemovedPicture {
   file: string;
   removedFile: string;
   time: string;
-  reason: Reason;
+  reason: PictureReason;
   caption: string | null;
   repeatOf: string | null;
   bytes: number;
   restored: boolean;
+  /** When this picture is deleted for good (epoch ms). */
+  deleteAfterMs: number;
 }
 
 export interface CleanupView {
-  summary: { line: string | null; failed: boolean; removed: number; repeats: number; notUseful: number; bytes: number; deleteAfterMs: number };
+  summary: {
+    line: string | null; failed: boolean; removed: number; repeats: number; notUseful: number;
+    byYou: number; bytes: number; deleteAfterMs: number;
+  };
   removed: RemovedPicture[];
   canRetry: boolean;
   running: boolean;
@@ -35,59 +40,16 @@ export interface CleanupView {
   until: string | null;
 }
 
+/** Which panel takes the page body: Claude's and Joseph's removed pictures, or every picture. */
+export type PanelKind = 'removed' | 'all' | null;
+
 const CLEANUP_EVENT = 'assistant-cleanup';
 
-const NOT_USEFUL: { reason: Reason; label: string }[] = [
-  { reason: 'loading', label: 'Still loading' },
-  { reason: 'greyed', label: 'Greyed out while saving or testing' },
-  { reason: 'blank', label: 'Blank or no data' },
-  { reason: 'popup', label: 'Popup over the page' },
-  { reason: 'before_share', label: 'Before anyone shared' },
-];
+const NOT_USEFUL: PictureReason[] = ['loading', 'greyed', 'blank', 'popup', 'before_share'];
 
 export function isCleanupView(v: unknown): v is CleanupView {
   const o = v as CleanupView | null;
   return !!o && typeof o === 'object' && !!o.summary && typeof o.summary === 'object' && Array.isArray(o.removed);
-}
-
-// ---- Pictures: one command per picture, a few at a time, each fetched once ----
-
-const pictureCache = new Map<string, Promise<string>>();
-const waiting: (() => void)[] = [];
-let active = 0;
-
-function loadPicture(meetingId: string, file: string): Promise<string> {
-  const key = `${meetingId}/${file}`;
-  const hit = pictureCache.get(key);
-  if (hit) return hit;
-  const p = new Promise<string>((resolve, reject) => {
-    const run = () => {
-      active += 1;
-      invoke<string>('picture_cleanup_picture', { meetingId, file })
-        .then(resolve, reject)
-        .finally(() => {
-          active -= 1;
-          waiting.shift()?.();
-        });
-    };
-    if (active < 4) run();
-    else waiting.push(run);
-  });
-  p.catch(() => pictureCache.delete(key));
-  pictureCache.set(key, p);
-  return p;
-}
-
-function Picture({ meetingId, file, alt, className }: { meetingId: string; file: string; alt: string; className: string }) {
-  const [src, setSrc] = useState<string | null>(null);
-  useEffect(() => {
-    let cancelled = false;
-    setSrc(null);
-    loadPicture(meetingId, file).then((s) => { if (!cancelled) setSrc(s); }).catch(() => {});
-    return () => { cancelled = true; };
-  }, [meetingId, file]);
-  if (!src) return <div className={`${className} bg-gray-200`} role="img" aria-label={alt} />;
-  return <img src={src} alt={alt} className={className} />;
 }
 
 // ---- Grouping ----
@@ -100,10 +62,13 @@ interface Group {
   keptFile?: string;
 }
 
-/** "Not useful" groups first, in the mockup's order; then repeats, each led by its kept picture. */
-export function groupRemoved(removed: RemovedPicture[]): { notUseful: Group[]; repeats: Group[] } {
+/** "Removed by you" first, then "Not useful" groups in the mockup's order, then repeats, each led by its kept picture. */
+export function groupRemoved(removed: RemovedPicture[]): { byYou: Group[]; notUseful: Group[]; repeats: Group[] } {
+  const byYou = removed.some((r) => r.reason === 'by_you')
+    ? [{ key: 'by_you', label: REASON_LABEL.by_you, items: removed.filter((r) => r.reason === 'by_you') }]
+    : [];
   const notUseful = NOT_USEFUL
-    .map(({ reason, label }) => ({ key: reason, label, items: removed.filter((r) => r.reason === reason) }))
+    .map((reason) => ({ key: reason, label: REASON_LABEL[reason], items: removed.filter((r) => r.reason === reason) }))
     .filter((g) => g.items.length > 0);
   const byKept = new Map<string, RemovedPicture[]>();
   for (const r of removed) {
@@ -114,18 +79,23 @@ export function groupRemoved(removed: RemovedPicture[]): { notUseful: Group[]; r
   const repeats = [...byKept.entries()]
     .map(([kept, items]) => ({ key: `repeat-${kept}`, label: 'Repeats', items, keptFile: kept || undefined }))
     .sort((a, b) => a.items[0].time.localeCompare(b.items[0].time));
-  return { notUseful, repeats };
+  return { byYou, notUseful, repeats };
 }
 
-const hhmm = (t: string) => t.slice(0, 5);
-
-/** "11:47:32" from "teams-frames/teams-20261118-114732-000.jpg". */
-function timeOfFile(file: string | null): string | null {
-  const m = file?.match(/-(\d{2})(\d{2})(\d{2})-\d+\.jpg$/i);
-  return m ? `${m[1]}:${m[2]}:${m[3]}` : null;
+/** A record entry as the shared viewer takes it. */
+function asPicture(r: RemovedPicture): MeetingPicture {
+  return {
+    file: r.file,
+    shownFile: r.restored ? r.file : r.removedFile,
+    time: r.time,
+    bytes: r.bytes,
+    removed: !r.restored,
+    reason: r.reason,
+    caption: r.caption,
+    repeatOf: r.repeatOf,
+    deleteAfterMs: r.deleteAfterMs,
+  };
 }
-
-const plural = (n: number) => `${n} ${n === 1 ? 'picture' : 'pictures'}`;
 
 /** The summary line with its picture count in bold. */
 function LineText({ line }: { line: string }) {
@@ -134,10 +104,10 @@ function LineText({ line }: { line: string }) {
   return <>{m[1]}<strong className="font-semibold text-gray-900">{m[2]}</strong>{m[3]}</>;
 }
 
-// ---- The header line, the inline panel, the viewer ----
+// ---- The header line, the inline panels, the viewer ----
 
 export function PictureCleanup({
-  meetingId, hasCleanup, version, onChanged, panelHost, onOpenChange,
+  meetingId, hasCleanup, version, onChanged, panelHost, panel, onPanelChange, onPendingChange,
 }: {
   meetingId: string;
   /** The saved numbers say a cleanup record exists, so the page asks for it. */
@@ -146,15 +116,19 @@ export function PictureCleanup({
   version: number;
   /** Tells the header the picture counts changed, so "What was saved" reloads. */
   onChanged: () => void;
-  /** Where the open panel goes: the page body, which the header hides while the panel shows. */
+  /** Where the open panel goes: the page body, which the header hides while a panel shows. */
   panelHost?: HTMLElement | null;
-  /** Tells the header whether the panel is showing, so it can swap the page body for it. */
-  onOpenChange?: (open: boolean) => void;
+  /** The panel that is open; the header owns it so only one is open at a time. */
+  panel: PanelKind;
+  onPanelChange: (panel: PanelKind) => void;
+  /** Reports how many pictures are removed and not restored (Claude's and Joseph's). */
+  onPendingChange?: (pending: number) => void;
 }) {
   const [loaded, setLoaded] = useState<{ id: string; view: CleanupView | null } | null>(null);
-  const [open, setOpen] = useState(false);
   const [viewing, setViewing] = useState<number | null>(null);
   const [retrying, setRetrying] = useState(false);
+  // Bumped after every Remove, Restore and Undo: the All pictures panel reads its list again.
+  const [tick, setTick] = useState(0);
 
   const load = useCallback(() => {
     invoke<CleanupView | null>('picture_cleanup_get', { meetingId })
@@ -163,38 +137,54 @@ export function PictureCleanup({
   }, [meetingId]);
 
   useEffect(() => { if (hasCleanup || version > 0) load(); }, [load, hasCleanup, version]);
-  useEffect(() => { setOpen(false); setViewing(null); setRetrying(false); }, [meetingId]);
+  useEffect(() => { setViewing(null); setRetrying(false); }, [meetingId]);
 
   // A cleanup that finishes beside the note refreshes the page.
   useEffect(() => {
     let off: (() => void) | undefined;
     let dead = false;
     Promise.resolve()
-      .then(() => listen(CLEANUP_EVENT, () => { setRetrying(false); onChanged(); }))
+      .then(() => listen(CLEANUP_EVENT, () => { setRetrying(false); setTick((n) => n + 1); onChanged(); }))
       .then((f) => { if (dead) f(); else off = f; })
       .catch(() => {});
     return () => { dead = true; off?.(); };
   }, [onChanged]);
 
   const view = loaded?.id === meetingId ? loaded.view : null;
-  const showing = open && !!view && !view.summary.failed && !!view.summary.line && view.summary.removed > 0;
-  useEffect(() => { onOpenChange?.(showing); }, [showing, onOpenChange]);
-  useEffect(() => () => onOpenChange?.(false), [onOpenChange]);
   const groups = useMemo(() => groupRemoved(view?.removed ?? []), [view]);
-  const ordered = useMemo(() => [...groups.notUseful.flatMap((g) => g.items), ...groups.repeats.flatMap((g) => g.items)], [groups]);
+  const ordered = useMemo(
+    () => [...groups.byYou, ...groups.notUseful, ...groups.repeats].flatMap((g) => g.items),
+    [groups],
+  );
+  const items = useMemo(() => ordered.map(asPicture), [ordered]);
+  const pending = ordered.filter((r) => !r.restored);
+  const byYouPaths = useMemo(
+    () => new Map(pending.filter((r) => r.reason === 'by_you').map((r) => [r.file, r.removedFile] as const)),
+    [pending],
+  );
+
+  const showing = panel === 'removed' && !!view && pending.length > 0;
+  // Everything restored while the removed panel is open: hand the page body back.
+  useEffect(() => { if (panel === 'removed' && view && pending.length === 0) onPanelChange(null); }, [panel, view, pending.length, onPanelChange]);
+  useEffect(() => { onPendingChange?.(pending.length); }, [pending.length, onPendingChange]);
+
+  /** Redraw from the command's returned view, never from an edited copy. */
+  const apply = useCallback((next: unknown) => {
+    if (isCleanupView(next)) setLoaded({ id: meetingId, view: next });
+    setTick((n) => n + 1);
+    onChanged();
+  }, [meetingId, onChanged]);
 
   const restore = useCallback(async (files: string[], message: string) => {
     if (files.length === 0) return;
     try {
-      const next = await invoke<CleanupView>('picture_cleanup_restore', { meetingId, files });
-      if (isCleanupView(next)) setLoaded({ id: meetingId, view: next });
-      onChanged();
+      apply(await invoke<CleanupView>('picture_cleanup_restore', { meetingId, files }));
       toast.success(message, {
         action: {
           label: 'Undo',
           onClick: () => {
             invoke<CleanupView>('picture_cleanup_undo_restore', { meetingId, files })
-              .then((v) => { if (isCleanupView(v)) setLoaded({ id: meetingId, view: v }); onChanged(); })
+              .then(apply)
               .catch((e) => toast.error(`Could not undo: ${e}`));
           },
         },
@@ -202,7 +192,26 @@ export function PictureCleanup({
     } catch (e) {
       toast.error(`Could not restore: ${e}`);
     }
-  }, [meetingId, onChanged]);
+  }, [meetingId, apply]);
+
+  const removeByYou = useCallback(async (files: string[], message: string) => {
+    if (files.length === 0) return;
+    try {
+      apply(await invoke<CleanupView>('picture_cleanup_remove', { meetingId, files }));
+      toast.success(message, {
+        action: {
+          label: 'Undo',
+          onClick: () => {
+            invoke<CleanupView>('picture_cleanup_restore', { meetingId, files })
+              .then(apply)
+              .catch((e) => toast.error(`Could not undo: ${e}`));
+          },
+        },
+      });
+    } catch (e) {
+      toast.error(`Could not remove: ${e}`);
+    }
+  }, [meetingId, apply]);
 
   const tryAgain = useCallback(() => {
     setRetrying(true);
@@ -212,51 +221,51 @@ export function PictureCleanup({
     });
   }, [meetingId]);
 
-  if (!view) return null;
-  const { summary } = view;
-
-  if (summary.failed) {
-    return (
-      <p className="text-[13px] text-gray-700">
-        {view.running || retrying ? 'Trying picture cleanup again.' : (
-          <>
-            Picture cleanup did not finish.{' '}
-            {view.canRetry && (
-              <button type="button" onClick={tryAgain} className="font-medium text-blue-600 hover:underline">Try again</button>
-            )}
-          </>
-        )}
-      </p>
-    );
-  }
-  if (!summary.line || summary.removed === 0) return null;
-
-  const pending = ordered.filter((r) => !r.restored);
-  const restoreMessage = (r: RemovedPicture) => `Restored the ${hhmm(r.time)} picture.`;
+  const summary = view?.summary;
   const thumbs = pending.slice(0, 3);
+
+  let text: ReactNode = null;
+  if (summary?.failed) {
+    text = view?.running || retrying ? 'Trying picture cleanup again.' : (
+      <>
+        Picture cleanup did not finish.{' '}
+        {view?.canRetry && (
+          <button type="button" onClick={tryAgain} className="font-medium text-blue-600 hover:underline">Try again</button>
+        )}
+      </>
+    );
+  } else if (summary?.line) {
+    text = <LineText line={summary.line} />;
+  }
 
   return (
     <>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-[13px] text-gray-600">
-        <span className="flex items-center gap-1" aria-hidden="true">
-          {thumbs.map((r) => (
-            <Picture key={r.file} meetingId={meetingId} file={r.removedFile} alt="" className="h-5 w-8 rounded-sm border border-gray-200 object-cover" />
-          ))}
-        </span>
-        <span className="min-w-0 break-words"><LineText line={summary.line} /></span>
-        <button
-          type="button"
-          onClick={() => setOpen((o) => !o)}
-          aria-expanded={open}
-          className="inline-flex items-center gap-1 font-medium text-blue-600 hover:underline"
-        >
-          {open ? 'Hide' : 'See what was removed'}
-          {open ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-        </button>
-        {view.bringBack && <span>{view.bringBack}</span>}
-      </div>
+      {view && summary && text && (
+        <div className="flex flex-wrap items-center gap-x-3 gap-y-1 pt-1 text-[13px] text-gray-600">
+          {pending.length > 0 && (
+            <span className="flex items-center gap-1" aria-hidden="true">
+              {thumbs.map((r) => (
+                <Picture key={r.file} meetingId={meetingId} file={r.removedFile} alt="" className="h-5 w-8 rounded-sm border border-gray-200 object-cover" />
+              ))}
+            </span>
+          )}
+          <span className="min-w-0 break-words">{text}</span>
+          {pending.length > 0 && (
+            <button
+              type="button"
+              onClick={() => onPanelChange(panel === 'removed' ? null : 'removed')}
+              aria-expanded={panel === 'removed'}
+              className="inline-flex items-center gap-1 font-medium text-blue-600 hover:underline"
+            >
+              {panel === 'removed' ? 'Hide' : 'See what was removed'}
+              {panel === 'removed' ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
+            </button>
+          )}
+          {pending.length > 0 && view.bringBack && <span>{view.bringBack}</span>}
+        </div>
+      )}
 
-      {showing && panelHost && createPortal(
+      {showing && view && summary && panelHost && createPortal(
         <section aria-label="Removed pictures" className="px-4 pb-6 pt-3">
           <div className="flex flex-wrap items-start justify-between gap-x-4 gap-y-2 pb-3">
             <div className="min-w-0">
@@ -269,17 +278,27 @@ export function PictureCleanup({
               className="flex-shrink-0 text-[13px]"
               onClick={() => restore(pending.map((r) => r.file), `Restored all ${plural(pending.length)}.`)}
             >
-              <RotateCcw /> Restore all {summary.removed}
+              <RotateCcw /> Restore all {pending.length}
             </Button>
           </div>
 
-          {groups.notUseful.length > 0 && (
+          {groups.byYou.length > 0 && (
             <div>
+              <h3 className="border-b border-gray-200 pb-1 text-[13px] font-semibold text-gray-900">
+                Removed by you <span className="font-normal text-gray-500">{plural(summary.byYou)}</span>
+              </h3>
+              {groups.byYou.map((g) => (
+                <GroupRow key={g.key} group={g} meetingId={meetingId} ordered={ordered} byYouPaths={byYouPaths} onView={setViewing} onRestore={restore} />
+              ))}
+            </div>
+          )}
+          {groups.notUseful.length > 0 && (
+            <div className={groups.byYou.length > 0 ? 'pt-3' : ''}>
               <h3 className="border-b border-gray-200 pb-1 text-[13px] font-semibold text-gray-900">
                 Not useful <span className="font-normal text-gray-500">{plural(summary.notUseful)}</span>
               </h3>
               {groups.notUseful.map((g) => (
-                <GroupRow key={g.key} group={g} meetingId={meetingId} ordered={ordered} onView={setViewing} onRestore={restore} />
+                <GroupRow key={g.key} group={g} meetingId={meetingId} ordered={ordered} byYouPaths={byYouPaths} onView={setViewing} onRestore={restore} />
               ))}
             </div>
           )}
@@ -289,7 +308,7 @@ export function PictureCleanup({
                 Repeats <span className="font-normal text-gray-500">{plural(summary.repeats)}</span>
               </h3>
               {groups.repeats.map((g) => (
-                <GroupRow key={g.key} group={g} meetingId={meetingId} ordered={ordered} onView={setViewing} onRestore={restore} />
+                <GroupRow key={g.key} group={g} meetingId={meetingId} ordered={ordered} byYouPaths={byYouPaths} onView={setViewing} onRestore={restore} />
               ))}
             </div>
           )}
@@ -297,30 +316,37 @@ export function PictureCleanup({
         panelHost,
       )}
 
+      {panel === 'all' && panelHost && createPortal(
+        <AllPicturesPanel meetingId={meetingId} tick={tick} onRemove={removeByYou} onRestore={restore} />,
+        panelHost,
+      )}
+
       <Viewer
         meetingId={meetingId}
-        items={ordered}
-        index={viewing}
-        until={view.until}
+        items={showing ? items : []}
+        index={showing ? viewing : null}
         onIndex={setViewing}
-        onRestore={(r) => restore([r.file], restoreMessage(r))}
+        byYou={byYouPaths}
+        onRestore={(p) => restore([p.file], `Restored the ${hhmm(p.time)} picture.`)}
       />
     </>
   );
 }
 
 function GroupRow({
-  group, meetingId, ordered, onView, onRestore,
+  group, meetingId, ordered, byYouPaths, onView, onRestore,
 }: {
   group: Group;
   meetingId: string;
   ordered: RemovedPicture[];
+  byYouPaths: Map<string, string>;
   onView: (index: number) => void;
   onRestore: (files: string[], message: string) => void;
 }) {
   const left = group.items.filter((r) => !r.restored);
   const restored = group.items.length - left.length;
   const keptTime = timeOfFile(group.keptFile ?? null);
+  const keptRemovedByYou = group.keptFile ? byYouPaths.get(group.keptFile) : undefined;
   return (
     <div className="grid grid-cols-1 gap-3 border-b border-gray-100 py-3 sm:grid-cols-[180px_1fr]">
       <div>
@@ -344,10 +370,21 @@ function GroupRow({
         {group.keptFile && (
           <figure className="w-[150px]">
             <div className="relative">
-              <Picture meetingId={meetingId} file={group.keptFile} alt={`Kept picture at ${keptTime ?? ''}`} className="aspect-video w-full rounded-md border-2 border-green-600 object-cover" />
-              <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-green-700 px-2 py-0.5 text-[12.5px] font-medium text-white">
-                <Check className="h-3 w-3" /> Kept
-              </span>
+              <Picture
+                meetingId={meetingId}
+                file={keptRemovedByYou ?? group.keptFile}
+                alt={`${keptRemovedByYou ? 'Removed' : 'Kept'} picture at ${keptTime ?? ''}`}
+                className={`aspect-video w-full rounded-md object-cover ${keptRemovedByYou ? 'border border-gray-300' : 'border-2 border-green-600'}`}
+              />
+              {keptRemovedByYou ? (
+                <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-gray-800 px-2 py-0.5 text-[12.5px] font-medium text-white">
+                  <Trash2 className="h-3 w-3" /> Removed by you
+                </span>
+              ) : (
+                <span className="absolute left-1 top-1 inline-flex items-center gap-1 rounded-full bg-green-700 px-2 py-0.5 text-[12.5px] font-medium text-white">
+                  <Check className="h-3 w-3" /> Kept
+                </span>
+              )}
             </div>
             <figcaption className="text-[13px] text-gray-600">{keptTime ? hhmm(keptTime) : ''}</figcaption>
           </figure>
@@ -390,88 +427,5 @@ function GroupRow({
         ))}
       </div>
     </div>
-  );
-}
-
-function Viewer({
-  meetingId, items, index, until, onIndex, onRestore,
-}: {
-  meetingId: string;
-  items: RemovedPicture[];
-  index: number | null;
-  until: string | null;
-  onIndex: (i: number | null) => void;
-  onRestore: (r: RemovedPicture) => void;
-}) {
-  const current = index !== null ? items[index] : undefined;
-
-  // Arrow keys step through the pictures in the order the panel shows them.
-  useEffect(() => {
-    if (index === null || items.length === 0) return;
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === 'ArrowRight') onIndex((index + 1) % items.length);
-      else if (e.key === 'ArrowLeft') onIndex((index - 1 + items.length) % items.length);
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [index, items.length, onIndex]);
-
-  const keptTime = timeOfFile(current?.repeatOf ?? null);
-  const title = !current
-    ? 'Removed picture'
-    : current.reason === 'repeat'
-      ? `Repeat of the ${keptTime ?? ''} picture`
-      : current.caption ?? NOT_USEFUL.find((n) => n.reason === current.reason)?.label ?? 'Removed picture';
-
-  return (
-    <Dialog open={current !== undefined} onOpenChange={(o) => { if (!o) onIndex(null); }}>
-      <DialogContent className="max-h-[92vh] w-[min(1400px,95vw)] max-w-none overflow-y-auto">
-        <div className="flex items-start justify-between gap-3 pr-8">
-          <div className="min-w-0">
-            <DialogTitle className="text-base font-semibold text-gray-900">{title}</DialogTitle>
-            <DialogDescription className="text-[13px] text-gray-600">
-              {current && (current.restored
-                ? `Restored. It is back in the recording folder.`
-                : `Removed at ${current.time}.${until ? ` Deleted for good on ${until} unless you restore it.` : ''}`)}
-            </DialogDescription>
-          </div>
-          <div className="flex flex-shrink-0 items-center gap-2">
-            <Button variant="outline" size="icon" aria-label="Previous picture" onClick={() => index !== null && onIndex((index - 1 + items.length) % items.length)}>
-              <ChevronLeft />
-            </Button>
-            <Button variant="outline" size="icon" aria-label="Next picture" onClick={() => index !== null && onIndex((index + 1) % items.length)}>
-              <ChevronRight />
-            </Button>
-            <Button variant="blue" disabled={!current || current.restored} onClick={() => current && onRestore(current)}>
-              <RotateCcw /> {current?.restored ? 'Restored' : 'Restore'}
-            </Button>
-          </div>
-        </div>
-        {current && (
-          <div className={`grid gap-4 ${current.repeatOf ? 'grid-cols-1 md:grid-cols-2' : 'grid-cols-1'}`}>
-            <figure>
-              <figcaption className="mb-1 flex items-center gap-2 text-[13px] text-gray-700">
-                <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-0.5 font-medium">
-                  <Trash2 className="h-3 w-3" /> {current.restored ? 'Restored' : 'Removed'}
-                </span>
-                {current.time}
-              </figcaption>
-              <Picture meetingId={meetingId} file={current.restored ? current.file : current.removedFile} alt={`Picture at ${current.time}`} className="max-h-[68vh] w-full rounded-md border border-gray-200 object-contain" />
-            </figure>
-            {current.repeatOf && (
-              <figure>
-                <figcaption className="mb-1 flex items-center gap-2 text-[13px] text-gray-700">
-                  <span className="inline-flex items-center gap-1 rounded-full bg-green-50 px-2 py-0.5 font-medium text-green-700">
-                    <Check className="h-3 w-3" /> Kept
-                  </span>
-                  {keptTime}
-                </figcaption>
-                <Picture meetingId={meetingId} file={current.repeatOf} alt={`Kept picture at ${keptTime ?? ''}`} className="max-h-[68vh] w-full rounded-md border border-gray-200 object-contain" />
-              </figure>
-            )}
-          </div>
-        )}
-      </DialogContent>
-    </Dialog>
   );
 }

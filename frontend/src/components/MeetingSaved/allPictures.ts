@@ -35,14 +35,12 @@ export interface AllPictures {
  * steps through this same list.
  */
 export function shownPictures(all: AllPictures, showRemoved: boolean): MeetingPicture[] {
-  void all;
-  void showRemoved;
-  throw new Error('not implemented');
+  return showRemoved ? all.pictures : all.pictures.filter((p) => !p.removed);
 }
 
 /** "See all 44 pictures", "See 1 picture", or "See all pictures" when none is kept but some are removed; null when the meeting has no picture at all. */
 export function seeAllLabel(kept: number, removed: number): string | null {
-  void kept;
-  void removed;
-  throw new Error('not implemented');
+  if (kept === 1) return 'See 1 picture';
+  if (kept > 1) return `See all ${kept.toLocaleString('en-US')} pictures`;
+  return removed > 0 ? 'See all pictures' : null;
 }
