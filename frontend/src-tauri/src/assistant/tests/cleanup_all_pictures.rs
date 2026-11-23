@@ -1236,6 +1236,79 @@ fn summary_failed_with_josephs_pending_still_says_did_not_finish_and_fills_the_c
     assert_eq!((sum.by_you, sum.bytes), (1, 400));
 }
 
+// Answers to the tester's questions (end of the brief).
+
+#[test]
+fn summary_failed_delete_after_ms_is_the_soonest_pending_date() {
+    let removed = vec![
+        rp(T1, Reason::ByYou, 10, false, 900),
+        rp(Z, Reason::ByYou, 10, false, 700),
+        rp(T3, Reason::ByYou, 10, true, 100),
+    ];
+    let sum = summary(Some(&rec_of(CleanupState::Failed { error: s("boom") }, 2000, removed)), 3000);
+    assert!(sum.failed);
+    assert_eq!(sum.delete_after_ms, 700);
+    assert_eq!(sum.by_you, 2);
+}
+
+#[test]
+fn record_failure_on_an_existing_record_sets_ran_at_to_now_and_keeps_every_entry() {
+    // After a Done run.
+    let d = example();
+    let pics = list_pictures(d.path());
+    let done = apply(d.path(), &pics, &[removal("P1", Reason::Blank, None, None)], 5000).unwrap();
+    let rec = record_failure(d.path(), "again", 6000).unwrap();
+    assert_eq!(rec.ran_at_ms, 6000);
+    assert_eq!(rec.removed, done.removed);
+    assert_eq!(raw_record(d.path()).ran_at_ms, 6000);
+
+    // After Joseph's removals only (NotRun, ran_at 0).
+    let d = example();
+    let first = remove_by_you(d.path(), &[s(T4)], 1000).unwrap();
+    let rec = record_failure(d.path(), "boom", 2000).unwrap();
+    assert_eq!(rec.ran_at_ms, 2000);
+    assert_eq!(rec.removed, first.removed);
+}
+
+#[test]
+fn remove_again_after_the_date_has_passed_keeps_the_same_date_and_the_next_purge_deletes_it() {
+    let d = example();
+    remove_by_you(d.path(), &[s(T4)], 1000).unwrap(); // clock 432_001_000
+    restore(d.path(), &[s(T4)]).unwrap();
+    // Time has moved past the date, but no sweep ran in between.
+    let rec = remove_again(d.path(), &[s(T4)]).unwrap();
+    let e = entry_of(&rec, T4).unwrap();
+    assert!(!e.restored);
+    assert_eq!(e.delete_after_ms, 432_001_000);
+    assert!(d.path().join(removed_of(T4)).exists());
+
+    assert!(purge_if_expired(d.path(), 500_000_000));
+    assert!(!d.path().join(removed_of(T4)).exists());
+    assert!(load(d.path()).unwrap().removed.is_empty());
+}
+
+#[test]
+fn restore_skips_a_name_no_entry_lists_restores_the_rest_and_is_ok() {
+    let d = example();
+    remove_by_you(d.path(), &[s(T1), s(T4)], 1000).unwrap();
+    let rec = restore(d.path(), &[s("teams-frames/nope.jpg"), s(T4)]).unwrap();
+    assert!(entry_of(&rec, T4).unwrap().restored);
+    assert!(!entry_of(&rec, T1).unwrap().restored);
+    assert!(d.path().join(T4).exists());
+    assert!(d.path().join(removed_of(T1)).exists());
+    assert_eq!(rec.removed.len(), 2);
+    assert_eq!(load(d.path()), Some(rec));
+}
+
+#[test]
+fn restore_with_only_unknown_names_is_ok_and_changes_nothing() {
+    let d = example();
+    let before = remove_by_you(d.path(), &[s(T4)], 1000).unwrap();
+    let rec = restore(d.path(), &[s("teams-frames/nope.jpg")]).unwrap();
+    assert_eq!(rec, before);
+    assert!(d.path().join(removed_of(T4)).exists());
+}
+
 #[test]
 fn summary_delete_after_ms_is_the_soonest_pending_and_ignores_restored() {
     let removed = vec![
