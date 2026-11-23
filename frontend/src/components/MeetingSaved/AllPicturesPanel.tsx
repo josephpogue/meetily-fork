@@ -34,6 +34,11 @@ export function AllPicturesPanel({
   const data = all?.id === meetingId ? all.data : null;
   const show = showRemoved && !!data && data.removed > 0;
   const shown = useMemo(() => (data ? shownPictures(data, show) : []), [data, show]);
+  // Pictures Joseph removed (their `file` to where they are now): a repeat's reference picture may be one.
+  const byYou = useMemo(
+    () => new Map((data?.pictures ?? []).filter((p) => p.removed && p.reason === 'by_you').map((p) => [p.file, p.shownFile] as const)),
+    [data],
+  );
 
   const remove = (p: MeetingPicture) => onRemove([p.file], `Removed the ${p.time} picture.`);
   const restore = (p: MeetingPicture) => onRestore([p.file], `Restored the ${p.time} picture.`);
@@ -115,6 +120,7 @@ export function AllPicturesPanel({
         onIndex={setViewing}
         onRestore={restore}
         onRemove={remove}
+        byYou={byYou}
       />
     </section>
   );
