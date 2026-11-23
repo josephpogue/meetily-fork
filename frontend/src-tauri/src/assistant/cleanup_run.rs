@@ -13,7 +13,7 @@ use serde::Serialize;
 use sqlx::SqlitePool;
 use tauri::{AppHandle, Emitter, Manager, State, Wry};
 
-use super::cleanup::{self, CleanupRecord, CleanupState, CleanupSummary, Picture, RemovedPicture, SavedSession};
+use super::cleanup::{self, AllPictures, CleanupRecord, CleanupState, CleanupSummary, Picture, RemovedPicture, SavedSession};
 use super::history::{self, HistoryHandle};
 use super::lanes::{claude_runner, AnswerLanes, LaneConfig};
 use super::settings::{self, AssistantSettings};
@@ -125,7 +125,9 @@ fn finish(folder: &Path, pictures: &[Picture], result: Result<String, String>) {
 /// forking the deep session saved with the meeting (so it works after a restart).
 pub async fn retry(app: AppHandle<Wry>, pool: &SqlitePool, meeting_id: &str) -> Result<(), String> {
     let folder = folder_of(pool, meeting_id).await?;
-    if !cleanup::should_start(cleanup::load(&folder).as_ref(), cleanup::run_in_flight(&folder)) {
+    let record = cleanup::load(&folder);
+    let failed = matches!(record.as_ref().map(|r| &r.state), Some(CleanupState::Failed { .. }));
+    if !failed || !cleanup::should_start(record.as_ref(), cleanup::run_in_flight(&folder)) {
         return Err("Picture cleanup is not waiting for a retry.".to_string());
     }
     let session = cleanup::load_session(&folder).ok_or("This call's Claude session was not saved, so it cannot be tried again.")?;
@@ -174,7 +176,7 @@ async fn folder_of(pool: &SqlitePool, meeting_id: &str) -> Result<PathBuf, Strin
         .ok_or_else(|| "This meeting has no recording folder.".to_string())
 }
 
-/// Deletes every expired `removed/` folder. Called on app start and when the
+/// Deletes every removed picture past its own date. Called on app start and when the
 /// meeting list loads.
 pub async fn purge_expired_all(pool: &SqlitePool) {
     let folders: Vec<String> = sqlx::query_scalar::<_, String>(
@@ -224,23 +226,25 @@ fn day_text(ms: i64) -> Option<String> {
 fn view_of(folder: &Path, record: Option<CleanupRecord>) -> CleanupView {
     let summary = cleanup::summary(record.as_ref(), now_ms());
     let can_retry = summary.failed && cleanup::load_session(folder).is_some();
-    let removed = match record {
-        Some(CleanupRecord { state: CleanupState::Done, removed, .. }) => removed,
-        _ => Vec::new(),
-    };
-    let until = if summary.removed > 0 { day_text(summary.delete_after_ms) } else { None };
+    let removed = record.map(|r| r.removed).unwrap_or_default();
+    let pending = summary.removed + summary.by_you;
+    let until = if pending > 0 { day_text(summary.delete_after_ms) } else { None };
     let (mut title, mut note, mut bring_back) = (None, None, None);
     if let Some(day) = until.clone() {
-        let kept = cleanup::list_pictures(folder).len();
         title = Some(format!(
             "{} removed, {} freed on {}",
-            crate::meeting_saved::format_pictures(summary.removed),
+            crate::meeting_saved::format_pictures(pending),
             crate::meeting_saved::format_size(summary.bytes),
             day
         ));
+        let lead = if summary.removed > 0 {
+            format!("Claude kept the {} that show something new.", cleanup::list_pictures(folder).len())
+        } else {
+            "These are the pictures you removed.".to_string()
+        };
         note = Some(format!(
-            "Claude kept the {} that show something new. Click a picture to see it full size. Removed pictures are deleted for good on {}.",
-            kept, day
+            "{} Click a picture to see it full size. Removed pictures are deleted for good on {}.",
+            lead, day
         ));
         bring_back = Some(format!("You can bring them back until {}.", day));
     }
@@ -269,6 +273,34 @@ pub async fn picture_cleanup_get(state: State<'_, AppState>, meeting_id: String)
     })
     .await
     .map_err(|e| e.to_string())
+}
+
+/// Every picture of the meeting, kept and removed, for the All pictures panel.
+#[tauri::command]
+pub async fn picture_cleanup_all(state: State<'_, AppState>, meeting_id: String) -> Result<AllPictures, String> {
+    let folder = folder_of(state.db_manager.pool(), &meeting_id).await?;
+    tokio::task::spawn_blocking(move || {
+        cleanup::purge_if_expired(&folder, now_ms());
+        cleanup::all_pictures(&folder)
+    })
+    .await
+    .map_err(|e| e.to_string())
+}
+
+/// Joseph removes kept pictures (their `file` values); returns the new view.
+#[tauri::command]
+pub async fn picture_cleanup_remove(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    files: Vec<String>,
+) -> Result<CleanupView, String> {
+    let folder = folder_of(state.db_manager.pool(), &meeting_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let record = cleanup::remove_by_you(&folder, &files, now_ms())?;
+        Ok(view_of(&folder, Some(record)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
 }
 
 /// Restores the named pictures (their `file` values); an empty list restores all.
