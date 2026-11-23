@@ -49,6 +49,9 @@ pub enum Reason {
     BeforeShare,
     /// The same screen as a kept picture.
     Repeat,
+    /// "Removed by you": Joseph removed a kept picture himself (All pictures
+    /// panel). Never accepted from Claude's reply.
+    ByYou,
 }
 
 /// One kept picture as the cleanup run sees it.
@@ -89,11 +92,19 @@ pub struct RemovedPicture {
     pub bytes: u64,
     /// True once Joseph restored it; the file is back at `file`.
     pub restored: bool,
+    /// When this picture is deleted for good: five days after it was removed.
+    /// A record written before this field existed takes the record's old
+    /// `deleteAfterMs`.
+    #[serde(default)]
+    pub delete_after_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum CleanupState {
+    /// Claude's cleanup has not run yet; the record holds only pictures Joseph
+    /// removed himself. Draft note still starts Claude's run.
+    NotRun,
     /// The run finished and its removals were applied.
     Done,
     /// The run could not finish; nothing was moved. Try again is offered.
@@ -126,6 +137,8 @@ pub struct CleanupSummary {
     pub removed: u64,
     pub repeats: u64,
     pub not_useful: u64,
+    /// Removed by Joseph (reason ByYou) and not restored. Not in `removed`.
+    pub by_you: u64,
     pub bytes: u64,
     /// When removed pictures are deleted for good; 0 when not applicable.
     pub delete_after_ms: i64,
@@ -393,6 +406,7 @@ pub fn apply(meeting_folder: &Path, pictures: &[Picture], removals: &[Removal], 
             repeat_of: r.repeat_of.as_deref().and_then(file_of),
             bytes: meta.len(),
             restored: false,
+            delete_after_ms: now_ms + RESTORE_DAYS * DAY_MS,
         });
     }
     let rec = CleanupRecord {
@@ -584,6 +598,7 @@ pub fn summary(record: Option<&CleanupRecord>, now_ms: i64) -> CleanupSummary {
         removed: 0,
         repeats: 0,
         not_useful: 0,
+        by_you: 0,
         bytes: 0,
         delete_after_ms: 0,
     };
@@ -593,7 +608,7 @@ pub fn summary(record: Option<&CleanupRecord>, now_ms: i64) -> CleanupSummary {
             out.failed = true;
             out.line = Some("Picture cleanup did not finish.".to_string());
         }
-        CleanupState::Purged => {}
+        CleanupState::Purged | CleanupState::NotRun => {}
         CleanupState::Done => {
             for m in rec.removed.iter().filter(|m| !m.restored) {
                 out.removed += 1;
@@ -625,6 +640,59 @@ pub fn summary(record: Option<&CleanupRecord>, now_ms: i64) -> CleanupSummary {
     out
 }
 
+/// One picture of the meeting, kept or removed, for the All pictures panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingPicture {
+    /// Its place in the frames folder, relative to the meeting folder. The name
+    /// Remove, Restore and Undo take, also while it is removed.
+    pub file: String,
+    /// Where the picture is now: `file` when kept, its `removed/` path when removed.
+    pub shown_file: String,
+    /// Local capture time "HH:MM:SS", from the file name.
+    pub time: String,
+    pub bytes: u64,
+    /// True when it sits in `removed/` (removed and not restored).
+    pub removed: bool,
+    /// Why it was removed; None when kept.
+    pub reason: Option<Reason>,
+    pub caption: Option<String>,
+    /// For a repeat: the kept picture's file.
+    pub repeat_of: Option<String>,
+    /// When a removed picture is deleted for good; 0 when kept.
+    pub delete_after_ms: i64,
+}
+
+/// Every picture of a meeting in capture order, for the All pictures panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllPictures {
+    /// "44 pictures kept, 25 MB" (`meeting_saved::format_pictures` and `format_size`).
+    pub title: String,
+    pub kept: u64,
+    pub kept_bytes: u64,
+    /// Removed and not restored, by Claude or by Joseph.
+    pub removed: u64,
+    /// Kept and removed together, oldest first, by the time in the file name.
+    pub pictures: Vec<MeetingPicture>,
+}
+
+/// Joseph removes kept pictures himself (their `file` values). Each moves into
+/// `removed/` in its own frames folder with reason ByYou and its own five-day
+/// clock from `now_ms`. Works with or without an earlier record, and never
+/// changes whether Claude's cleanup has run.
+pub fn remove_by_you(meeting_folder: &Path, files: &[String], now_ms: i64) -> Result<CleanupRecord, String> {
+    let _ = (meeting_folder, files, now_ms);
+    todo!("all-pictures: remove_by_you")
+}
+
+/// Every picture of the meeting, kept and removed, after the same reconcile
+/// with the disk as `load`.
+pub fn all_pictures(meeting_folder: &Path) -> AllPictures {
+    let _ = meeting_folder;
+    todo!("all-pictures: all_pictures")
+}
+
 /// The absolute path of a record-relative file.
 pub fn absolute(meeting_folder: &Path, file: &str) -> PathBuf {
     meeting_folder.join(file)
@@ -637,3 +705,7 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/cleanup_round2.rs"]
 mod round2_tests;
+
+#[cfg(test)]
+#[path = "tests/cleanup_all_pictures.rs"]
+mod all_pictures_tests;
