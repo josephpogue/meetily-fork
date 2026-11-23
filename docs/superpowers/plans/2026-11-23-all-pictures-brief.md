@@ -127,3 +127,11 @@ Update these with the new tests: `frontend/src-tauri/src/assistant/tests/cleanup
 - New: `frontend/src-tauri/src/assistant/tests/cleanup_all_pictures.rs` (already declared as a child module of `cleanup.rs`, so `use super::*;` works).
 - Updated: `frontend/src-tauri/src/assistant/tests/cleanup.rs`, `tests/cleanup_round2.rs`.
 - New: `frontend/src/components/MeetingSaved/allPictures.test.ts`, `bun:test`, like `Sidebar/cleanupEvents.test.ts`.
+
+## Answers to the tester's questions
+
+- **Entry order in the record:** does not matter; readers look entries up by file, and `all_pictures` sorts by capture time.
+- **Failed `summary.delete_after_ms`:** the soonest pending date, the same as every other state.
+- **`record_failure` on an existing record:** sets `ran_at_ms` to now_ms and keeps every entry.
+- **`remove_again` on an entry whose date has passed (not yet swept):** puts it back exactly as it was, same date; the next `purge_if_expired` deletes it.
+- **`restore` with a name no entry lists:** that name is skipped; the rest are restored; Ok.

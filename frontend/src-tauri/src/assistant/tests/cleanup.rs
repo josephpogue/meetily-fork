@@ -69,11 +69,13 @@ fn entry(file: &str, reason: Reason, bytes: u64, restored: bool) -> RemovedPictu
         repeat_of: if reason == Reason::Repeat { Some(T3.to_string()) } else { None },
         bytes,
         restored,
+        delete_after_ms: 1000 + 5 * DAY_MS,
     }
 }
 
+/// The record after the all-pictures change: no record-level delete_after_ms.
 fn record(state: CleanupState, removed: Vec<RemovedPicture>) -> CleanupRecord {
-    CleanupRecord { state, ran_at_ms: 1000, delete_after_ms: 1000 + 5 * DAY_MS, removed }
+    CleanupRecord { state, ran_at_ms: 1000, removed }
 }
 
 fn applied() -> tempfile::TempDir {
@@ -265,8 +267,9 @@ fn apply_moves_pictures_into_removed_and_writes_the_record() {
 
     assert_eq!(rec.state, CleanupState::Done);
     assert_eq!(rec.ran_at_ms, 1000);
-    assert_eq!(rec.delete_after_ms, 1000 + 432_000_000);
     assert_eq!(rec.removed.len(), 2);
+    // Each entry carries its own clock: now_ms plus five days.
+    assert!(rec.removed.iter().all(|r| r.delete_after_ms == 1000 + 432_000_000));
 
     let r1 = rec.removed.iter().find(|r| r.file == T1).unwrap();
     assert_eq!(r1.removed_file, "teams-frames/removed/teams-20261118-110300-478.jpg");
@@ -472,11 +475,12 @@ fn summary_failed_says_so() {
 }
 
 #[test]
-fn summary_purged_shows_no_line() {
-    let rec = record(CleanupState::Purged, vec![entry("teams-frames/a.jpg", Reason::Popup, 300, false)]);
-    let s = summary(Some(&rec), 2_000);
+fn summary_done_with_an_emptied_list_shows_no_line_and_no_date() {
+    // What a purge leaves behind: Done, no entries (Purged no longer exists).
+    let s = summary(Some(&record(CleanupState::Done, vec![])), 2_000);
     assert_eq!(s.line, None);
     assert!(!s.failed);
+    assert_eq!((s.removed, s.by_you, s.bytes, s.delete_after_ms), (0, 0, 0, 0));
 }
 
 // ---------- restore ----------
@@ -530,14 +534,16 @@ fn restore_with_no_record_is_err_and_changes_nothing() {
 }
 
 #[test]
-fn restore_on_a_purged_record_is_err_and_changes_nothing() {
+fn restore_on_a_record_with_no_entries_is_err_and_changes_nothing() {
+    // After a purge the record is still Done but holds no entries.
     let d = applied();
     assert!(purge_if_expired(d.path(), 1000 + 432_000_000));
     let before = load(d.path());
     assert!(restore(d.path(), &[]).is_err());
+    assert!(restore(d.path(), &[T1.to_string()]).is_err());
     assert_eq!(load(d.path()), before);
     assert!(!d.path().join(T1).exists());
-    assert!(!d.path().join("teams-frames/removed").exists());
+    assert!(!d.path().join("teams-frames/removed/teams-20261118-110300-478.jpg").exists());
 }
 
 // ---------- record_failure, load ----------
@@ -548,7 +554,6 @@ fn record_failure_writes_a_failed_record_and_moves_nothing() {
     let rec = record_failure(d.path(), "claude timed out", 5_000).unwrap();
     assert_eq!(rec.state, CleanupState::Failed { error: "claude timed out".to_string() });
     assert_eq!(rec.ran_at_ms, 5_000);
-    assert_eq!(rec.delete_after_ms, 0);
     assert!(rec.removed.is_empty());
     assert_eq!(load(d.path()), Some(rec.clone()));
     assert_eq!(list_pictures(d.path()), example_pictures());
@@ -572,8 +577,13 @@ fn load_reads_back_each_kind_of_record_from_its_file() {
     full.caption = Some("Same page, scrolled up".to_string());
     let records = vec![
         record(CleanupState::Done, vec![full, entry(T1, Reason::Loading, 200, false)]),
-        CleanupRecord { state: CleanupState::Failed { error: "boom".to_string() }, ran_at_ms: 7, delete_after_ms: 0, removed: vec![] },
-        record(CleanupState::Purged, vec![entry(T1, Reason::Blank, 200, false)]),
+        CleanupRecord { state: CleanupState::Failed { error: "boom".to_string() }, ran_at_ms: 7, removed: vec![] },
+        // Joseph's removals only: NotRun, ran_at_ms 0.
+        CleanupRecord {
+            state: CleanupState::NotRun,
+            ran_at_ms: 0,
+            removed: vec![entry(T1, Reason::ByYou, 200, false)],
+        },
     ];
     for rec in records {
         // A Done record's pictures are on disk where the record says they are
@@ -581,7 +591,7 @@ fn load_reads_back_each_kind_of_record_from_its_file() {
         // agrees with the record. A fresh folder per record keeps one record's
         // files from leaking into the next.
         let d = tempfile::tempdir().unwrap();
-        if rec.state == CleanupState::Done {
+        {
             for m in &rec.removed {
                 write(d.path(), if m.restored { &m.file } else { &m.removed_file }, m.bytes as usize);
             }
@@ -603,14 +613,17 @@ fn purge_before_the_window_ends_deletes_nothing() {
 }
 
 #[test]
-fn purge_at_the_end_of_the_window_deletes_removed_and_marks_the_record() {
+fn purge_at_the_end_of_the_window_deletes_the_files_and_drops_the_entries() {
     let d = applied();
     assert!(purge_if_expired(d.path(), 1000 + 432_000_000));
-    assert!(!d.path().join("teams-frames/removed").exists());
+    assert!(!d.path().join("teams-frames/removed/teams-20261118-110300-478.jpg").exists());
+    assert!(!d.path().join("teams-frames/removed/teams-20261118-110332-532.jpg").exists());
     assert!(d.path().join(T3).exists());
     assert!(d.path().join(Z1).exists());
     let rec = load(d.path()).unwrap();
-    assert_eq!(rec.state, CleanupState::Purged);
+    // The state is never changed by a purge (Purged is gone); the list is empty.
+    assert_eq!(rec.state, CleanupState::Done);
+    assert!(rec.removed.is_empty());
     assert_eq!(summary(Some(&rec), 1000 + 432_000_000).line, None);
     assert!(!purge_if_expired(d.path(), 1000 + 432_000_000 + 1));
 }
@@ -627,8 +640,8 @@ fn purge_deletes_removed_in_every_frames_folder() {
     assert!(d.path().join("zoom-frames/removed").exists());
     assert!(d.path().join("teams-frames/removed").exists());
     assert!(purge_if_expired(d.path(), 1_000 + 432_000_000));
-    assert!(!d.path().join("zoom-frames/removed").exists());
-    assert!(!d.path().join("teams-frames/removed").exists());
+    assert!(!d.path().join("zoom-frames/removed/zoom-20261118-110310-000.jpg").exists());
+    assert!(!d.path().join("teams-frames/removed/teams-20261118-110300-478.jpg").exists());
 }
 
 #[test]
@@ -639,7 +652,8 @@ fn purge_with_no_record_does_nothing() {
 }
 
 #[test]
-fn purge_leaves_a_failed_record_alone() {
+fn purge_leaves_a_failed_record_with_no_entries_alone() {
+    // A failed run with nothing pending: nothing to delete, the state stays Failed.
     let d = example();
     let rec = record_failure(d.path(), "boom", 5_000).unwrap();
     assert!(!purge_if_expired(d.path(), i64::MAX));
@@ -662,8 +676,12 @@ fn should_start_rules() {
     let done_empty = record(CleanupState::Done, vec![]);
     assert!(!should_start(Some(&done_empty), false));
 
-    let purged = record(CleanupState::Purged, vec![]);
-    assert!(!should_start(Some(&purged), false));
+    // Joseph's removals only: Claude has not run, so Draft note starts it.
+    let not_run = record(CleanupState::NotRun, vec![entry(T1, Reason::ByYou, 1, false)]);
+    assert!(should_start(Some(&not_run), false));
+    let not_run_empty = record(CleanupState::NotRun, vec![]);
+    assert!(should_start(Some(&not_run_empty), false));
+    assert!(!should_start(Some(&not_run), true));
 }
 
 #[test]

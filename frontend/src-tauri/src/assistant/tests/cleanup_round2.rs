@@ -209,6 +209,56 @@ fn load_moves_a_stray_back_into_its_own_frames_folder_for_zoom_too() {
     assert!(!d.path().join("zoom-frames/removed/y.jpg").exists());
 }
 
+// The all-pictures brief: load reconciles every record that has entries,
+// whatever its state (NotRun and Failed too, not only Done).
+
+#[test]
+fn load_reconciles_a_not_run_record_with_the_disk() {
+    let d = example();
+    remove_by_you(d.path(), &[T1.to_string(), T2.to_string()], 1_000).unwrap();
+    // T1 moved back by hand; T2's picture deleted by hand.
+    fs::rename(d.path().join(removed_of(T1)), d.path().join(T1)).unwrap();
+    fs::remove_file(d.path().join(removed_of(T2))).unwrap();
+    write(d.path(), "teams-frames/removed/x.jpg", 10);
+
+    let rec = load(d.path()).unwrap();
+
+    assert_eq!(rec.state, CleanupState::NotRun);
+    assert!(entry(&rec, T1).unwrap().restored);
+    assert!(entry(&rec, T2).is_none());
+    assert!(d.path().join("teams-frames/x.jpg").exists());
+    assert!(!d.path().join("teams-frames/removed/x.jpg").exists());
+    assert_eq!(raw_record(d.path()), rec);
+}
+
+#[test]
+fn load_reconciles_a_failed_record_that_has_entries() {
+    let d = example();
+    remove_by_you(d.path(), &[T1.to_string(), T2.to_string()], 1_000).unwrap();
+    record_failure(d.path(), "boom", 2_000).unwrap();
+    fs::rename(d.path().join(removed_of(T1)), d.path().join(T1)).unwrap();
+    fs::remove_file(d.path().join(removed_of(T2))).unwrap();
+
+    let rec = load(d.path()).unwrap();
+
+    assert_eq!(rec.state, CleanupState::Failed { error: "boom".to_string() });
+    assert!(entry(&rec, T1).unwrap().restored);
+    assert!(entry(&rec, T2).is_none());
+}
+
+#[test]
+fn load_marks_a_restored_by_you_entry_not_restored_when_its_picture_is_back_in_removed() {
+    let d = example();
+    remove_by_you(d.path(), &[T1.to_string()], 1_000).unwrap();
+    restore(d.path(), &[T1.to_string()]).unwrap();
+    fs::rename(d.path().join(T1), d.path().join(removed_of(T1))).unwrap();
+
+    let rec = load(d.path()).unwrap();
+
+    assert!(!entry(&rec, T1).unwrap().restored);
+    assert_eq!(summary(Some(&rec), 2_000).by_you, 1);
+}
+
 // ---------------------------------------------------------------------------
 // 2. One writer at a time
 // ---------------------------------------------------------------------------
