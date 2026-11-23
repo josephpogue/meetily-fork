@@ -20,11 +20,15 @@ So the page must let him do two checks in one place:
   - Each kept thumbnail has a Remove button. Remove moves the picture into the removed set, the counts update, and a toast offers Undo.
 - **Full size.** Clicking a picture opens the same full-size viewer the removed panel uses. Arrow keys step through what the panel shows (kept only, or kept and removed when the switch is on). The viewer has Remove for a kept picture and Restore for a removed one.
 - **The removed panel.** Unchanged, plus a "Removed by you" group first, with the same per-picture, per-group and Restore all buttons. A repeat group whose lead picture Joseph removed shows that picture tagged "Removed by you" instead of Kept.
-- **The header line.** Claude's line stays as it is. When Joseph removed pictures, it adds "You removed 4." The line shows whenever anything is removed and not restored, by Claude or by Joseph, so "See what was removed" is always reachable.
+- **The header line (my call).** One line, built by the backend from both sets, shows whenever anything is removed and not restored, so "See what was removed" is always reachable. The restore date is the soonest one still pending.
+  - Both: "Claude removed 93 pictures to free 51 MB: 56 repeats, 37 not useful. You removed 4."
+  - Only Joseph's (a meeting Claude never cleaned, a run that removed nothing, or Claude's pictures restored or already deleted for good): "You removed 4 pictures to free 2 MB."
+  - The three thumbnails in front of it come from whatever is pending.
 
 ## How it works
 
 - **One record (approach 1).** Joseph's removals go in the same removed-pictures record as Claude's (`picture-cleanup.json`), with a new reason, "removed by you". They use the same move into `removed/`, the same Restore, Undo and reconcile-with-disk rules.
+- **Removing a picture again (my call).** A picture Claude removed and Joseph restored, then removed with Remove, becomes "Removed by you" with five new days. It leaves Claude's count and groups. Toast Undo is different: it puts a just-restored picture back exactly as it was, as today.
 - **A five-day clock per picture.** Each removed picture is deleted for good five days after it was removed. Claude's removals keep the date of Claude's run; a picture Joseph removes on day 4 gets five full days. The delete step changes from "delete the whole `removed/` folder on one date" to "delete each picture past its date". The header and panel show the soonest date; the viewer shows that picture's own date.
 - **Claude's run and Joseph's removals are independent.** The record has to hold both "has Claude's cleanup run, and did it fail" and the list of removed pictures, which today share one state.
   - Joseph can remove a picture before Draft note. Claude's cleanup still runs later, and it sees only the kept pictures (it already reads only the top frames folder).
@@ -32,6 +36,7 @@ So the page must let him do two checks in one place:
   - A failed Claude run still shows "Picture cleanup did not finish. Try again" beside any removals Joseph made.
   - A meeting whose removed pictures were already deleted for good can still take new removals.
 - **Sizes.** "What was saved" and the sidebar totals already count only kept pictures; Remove and Restore reload them the way Restore does today.
+- **Nothing else points at a picture file.** The note draft, the vault note, `assistant.json` and the prompts never name a picture file (checked 2026-11-23), so Remove and the delete step leave no broken link.
 - **New command.** One backend command lists every picture of the meeting, kept and removed, in capture order, with its state, reason and delete date. One command removes pictures by file. Both live in the fork's own modules.
 
 ## Approaches considered
