@@ -63,7 +63,7 @@ Readers of the record today: `cleanup_run.rs` (`view_of`, `picture_cleanup_get`,
 
 **`should_start(record, in_flight)`**: in flight false; None true; NotRun true; Failed true; Done false (also a PR #30 purged record, which loads as Done).
 
-**`restore(folder, files)`** works on any record that has entries, whatever its state; an empty list restores every pending picture; no record, or a record with no entries, is Err. **`remove_again`** (Undo of a restore) puts the picture back exactly as it was: same reason, caption, `repeat_of` and `delete_after_ms`. Undo of Joseph's Remove is `restore` of that file.
+**`restore(folder, files)`** works on any record that has entries, whatever its state; an empty list restores every pending picture; no record, or a record with no entries, is Err. **`remove_again`** (Undo of a restore) puts the picture back exactly as it was: same reason, caption, `repeat_of` and `delete_after_ms`. Undo of Joseph's Remove is `undo_remove` of that file (round 2 below).
 
 **`load`** reconciles every record that has entries, whatever its state, with the same disk-is-truth rules as before; a stray picture in `removed/` that no entry lists is moved back.
 
@@ -91,7 +91,7 @@ Readers of the record today: `cleanup_run.rs` (`view_of`, `picture_cleanup_get`,
 - New commands in `cleanup_run.rs`, registered in `lib.rs`: `picture_cleanup_all(meetingId) -> AllPictures` (purges first, as `picture_cleanup_get` does) and `picture_cleanup_remove(meetingId, files) -> CleanupView`.
 - `view_of`: title counts every pending picture ("97 pictures removed, 53 MB freed on Mon, Nov 30"), dates use the soonest pending date, and the note fits a record with only Joseph's removals.
 - `PictureCleanup.tsx`: "Removed by you" group first, with Restore per picture, Restore these N and Restore all. A repeat group whose kept picture Joseph removed tags that picture "Removed by you" instead of Kept. "See what was removed" shows whenever anything is pending, also on a Failed record.
-- New All pictures panel beside it, opened from the What was saved line, in the same place as the removed panel; one of the two open at a time. Remove and Restore buttons on thumbnails and in the viewer; the toast's Undo after Remove calls restore.
+- New All pictures panel beside it, opened from the What was saved line, in the same place as the removed panel; one of the two open at a time. Remove and Restore buttons on thumbnails and in the viewer; the toast's Undo after Remove calls `undo_remove` through `picture_cleanup_undo_remove`.
 - After every Remove, Restore or Undo the panels redraw from the command's returned view, never from their own edited copy, and the sidebar totals reload as Restore does today.
 
 ## Worked examples
@@ -111,6 +111,37 @@ Meeting folder: `teams-frames/teams-20261118-110300-478.jpg` (T1, 200 bytes), `z
 - A record with only restored entries: `restore` of nothing pending is Ok and changes nothing; with no record at all, `restore` is Err.
 - PR #30 record as in "The record after this change", with T1 in `removed/`: `load` gives Done with T1's clock 432_001_000; `all_pictures` lists T1 as removed with that date.
 - Frontend: `shownPictures` on [T1 kept, T3 removed, T4 kept] with false gives [T1, T4]; with true gives all three in order.
+
+## Round 2: Undo of a Remove leaves no trace
+
+Found in the test Mac walkthrough: pressing Undo on the Remove toast called `restore`, so the picture came back but its ByYou entry stayed as restored. The removed panel then showed it with a Restored tag, and the "Removed by you" row read "3 pictures, 2 restored" for one pending picture. Undo means the Remove never happened.
+
+**`undo_remove(folder, files)`**, same folder lock, record written temporary file then rename:
+- For each named file whose entry is ByYou and not restored: move the picture from `removed_file` back to `file` and drop the entry.
+- A kept picture already at `file` is never overwritten: that entry is dropped and the copy in `removed/` stays for `load` to sort out (load moves a stray back only when its place is free).
+- A name with no pending ByYou entry is skipped: a Claude entry, a restored entry, or a name no entry lists. Ok.
+- An earlier Claude entry that `remove_by_you` replaced is not brought back; the picture is simply kept.
+- The record's state and `ran_at_ms` do not change. A record left with no entries is still written (NotRun stays NotRun, so `should_start` stays true).
+- No record is Err.
+
+| State before | `undo_remove([X])` | After |
+|---|---|---|
+| NotRun, X ByYou pending | X back in place | NotRun, no entry for X; `summary` has no line if nothing else is pending |
+| Done, Claude's T1 pending, X ByYou pending | X back | Done, only T1; line "Claude removed 1 picture ...", no "You removed" |
+| Failed, X ByYou pending | X back | Failed, no entry for X |
+| X ByYou already restored | skipped | unchanged |
+| X is Claude's pending entry | skipped | unchanged, X stays removed |
+| No record | Err | nothing written |
+
+Worked examples (same files as above):
+- `remove_by_you([T4], 1000)` then `undo_remove([T4])`: T4 is back at `teams-frames/teams-20261118-110433-637.jpg`, `removed/` holds no T4, record NotRun with no entries; `summary` by_you 0, no line; `all_pictures` lists T1, Z, T3, T4 all kept, title "4 pictures kept, under 1 MB".
+- Claude removed T1 (Done, clock 432_005_000), then `remove_by_you([T3], 6000)`, then `undo_remove([T3, T1])`: T3 back and its entry gone; T1 skipped and still removed; record Done with only T1; `summary` line "Claude removed 1 picture to free under 1 MB: 1 not useful."
+- `remove_by_you([T4, T3], 1000)`, then `undo_remove([T4])`: only T4 comes back; T3 stays ByYou pending; `summary` by_you 1.
+- `restore` then Undo still use `restore` and `remove_again` as before: a ByYou picture restored with Restore keeps its Restored tag, like Claude's.
+
+**Wiring:** new command `picture_cleanup_undo_remove(meetingId, files) -> CleanupView` in `cleanup_run.rs`, registered in `lib.rs`; the Undo on the Remove toast (thumbnail and viewer) calls it and the panels redraw from its returned view.
+
+**Button labels the test Mac presses:** the walkthrough could not press the "Show removed (2)" switch because its label renders as three pieces of text ("Show removed (", "2", ")") and the test Mac's click matches one whole piece of text. Every button or link label in the All pictures panel and the removed panel that mixes words and a number is built as one string (a template string), so it renders as one piece of text. Examples: "Show removed (2)", "Restore these 3", "Restore all 4", "See all 17 pictures".
 
 ## Existing tests that encode the old rule
 

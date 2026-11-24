@@ -596,6 +596,15 @@ pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord,
     Ok(rec)
 }
 
+/// Undo for Joseph's own Remove: moves each named picture (its `file` value)
+/// whose entry is ByYou and not restored back to its place and drops that
+/// entry, as if the Remove never happened. Names with no such entry are skipped.
+/// No record is Err.
+pub fn undo_remove(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
+    let _ = (meeting_folder, files);
+    Err("not implemented".to_string())
+}
+
 /// Undo for `restore`: moves the named restored pictures (their `file`
 /// values) back into `removed/` and marks them removed again, exactly as they
 /// were (reason, caption, `repeat_of` and date).
