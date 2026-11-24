@@ -202,7 +202,7 @@ export function PictureCleanup({
         action: {
           label: 'Undo',
           onClick: () => {
-            invoke<CleanupView>('picture_cleanup_restore', { meetingId, files })
+            invoke<CleanupView>('picture_cleanup_undo_remove', { meetingId, files })
               .then(apply)
               .catch((e) => toast.error(`Could not undo: ${e}`));
           },
@@ -278,7 +278,7 @@ export function PictureCleanup({
               className="flex-shrink-0 text-[13px]"
               onClick={() => restore(pending.map((r) => r.file), `Restored all ${plural(pending.length)}.`)}
             >
-              <RotateCcw /> Restore all {pending.length}
+              <RotateCcw />{`Restore all ${pending.length}`}
             </Button>
           </div>
 
@@ -362,7 +362,7 @@ function GroupRow({
             onClick={() => onRestore(left.map((r) => r.file), `Restored ${plural(left.length)}.`)}
             className="mt-1 inline-flex items-center gap-1 text-[13px] font-medium text-blue-600 hover:underline"
           >
-            <RotateCcw className="h-4 w-4" /> Restore these {left.length}
+            <RotateCcw className="h-4 w-4" />{`Restore these ${left.length}`}
           </button>
         )}
       </div>

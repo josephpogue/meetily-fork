@@ -65,7 +65,7 @@ export function AllPicturesPanel({
             <span aria-hidden="true" className={`relative inline-block h-5 w-9 rounded-full ${show ? 'bg-blue-600' : 'bg-gray-400'}`}>
               <span className={`absolute top-0.5 h-4 w-4 rounded-full bg-white transition-all ${show ? 'left-[18px]' : 'left-0.5'}`} />
             </span>
-            Show removed ({data.removed})
+            {`Show removed (${data.removed})`}
           </button>
         )}
       </div>

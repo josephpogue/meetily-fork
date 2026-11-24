@@ -163,7 +163,7 @@ export function Viewer({
               </Button>
             ) : (
               <Button variant="blue" disabled={!current || !current.removed} onClick={() => current && onRestore(current)}>
-                <RotateCcw /> {current && !current.removed ? 'Restored' : 'Restore'}
+                <RotateCcw />{current && !current.removed ? 'Restored' : 'Restore'}
               </Button>
             )}
           </div>
