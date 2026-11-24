@@ -601,8 +601,32 @@ pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord,
 /// entry, as if the Remove never happened. Names with no such entry are skipped.
 /// No record is Err.
 pub fn undo_remove(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
-    let _ = (meeting_folder, files);
-    Err("not implemented".to_string())
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rec = load_locked(meeting_folder).ok_or("there is no picture cleanup to undo")?;
+    let before = rec.removed.len();
+    rec.removed.retain(|m| {
+        if m.restored || m.reason != Reason::ByYou || !files.contains(&m.file) {
+            return true;
+        }
+        let place = absolute(meeting_folder, &m.file);
+        // A kept picture already at its place is never overwritten: the entry goes and
+        // the copy in `removed/` stays for `load` to sort out.
+        if place.exists() {
+            return false;
+        }
+        match std::fs::rename(absolute(meeting_folder, &m.removed_file), &place) {
+            Ok(()) => false,
+            Err(e) => {
+                log::warn!("picture cleanup: could not undo the removal of {}: {}", m.file, e);
+                true
+            }
+        }
+    });
+    if rec.removed.len() != before {
+        write_record(meeting_folder, &rec)?;
+    }
+    Ok(rec)
 }
 
 /// Undo for `restore`: moves the named restored pictures (their `file`

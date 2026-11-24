@@ -303,6 +303,22 @@ pub async fn picture_cleanup_remove(
     .map_err(|e| e.to_string())?
 }
 
+/// Undo for Joseph's Remove: the named pictures go back and their entries are dropped.
+#[tauri::command]
+pub async fn picture_cleanup_undo_remove(
+    state: State<'_, AppState>,
+    meeting_id: String,
+    files: Vec<String>,
+) -> Result<CleanupView, String> {
+    let folder = folder_of(state.db_manager.pool(), &meeting_id).await?;
+    tokio::task::spawn_blocking(move || {
+        let record = cleanup::undo_remove(&folder, &files)?;
+        Ok(view_of(&folder, Some(record)))
+    })
+    .await
+    .map_err(|e| e.to_string())?
+}
+
 /// Restores the named pictures (their `file` values); an empty list restores all.
 #[tauri::command]
 pub async fn picture_cleanup_restore(

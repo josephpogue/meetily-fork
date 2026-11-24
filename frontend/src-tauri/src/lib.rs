@@ -844,6 +844,7 @@ pub fn run() {
             assistant::cleanup_run::picture_cleanup_get,
             assistant::cleanup_run::picture_cleanup_all,
             assistant::cleanup_run::picture_cleanup_remove,
+            assistant::cleanup_run::picture_cleanup_undo_remove,
             assistant::cleanup_run::picture_cleanup_restore,
             assistant::cleanup_run::picture_cleanup_undo_restore,
             assistant::cleanup_run::picture_cleanup_retry,
