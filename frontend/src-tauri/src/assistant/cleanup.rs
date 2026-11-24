@@ -49,6 +49,9 @@ pub enum Reason {
     BeforeShare,
     /// The same screen as a kept picture.
     Repeat,
+    /// "Removed by you": Joseph removed a kept picture himself (All pictures
+    /// panel). Never accepted from Claude's reply.
+    ByYou,
 }
 
 /// One kept picture as the cleanup run sees it.
@@ -89,29 +92,75 @@ pub struct RemovedPicture {
     pub bytes: u64,
     /// True once Joseph restored it; the file is back at `file`.
     pub restored: bool,
+    /// When this picture is deleted for good: five days after it was removed.
+    /// A record written before this field existed takes the record's old
+    /// `deleteAfterMs`.
+    #[serde(default)]
+    pub delete_after_ms: i64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "state")]
 pub enum CleanupState {
+    /// Claude's cleanup has not run yet; the record holds only pictures Joseph
+    /// removed himself. Draft note still starts Claude's run.
+    NotRun,
     /// The run finished and its removals were applied.
     Done,
-    /// The run could not finish; nothing was moved. Try again is offered.
+    /// The run could not finish. Try again is offered.
     Failed { error: String },
-    /// The restore window ended and `removed/` was deleted.
-    Purged,
 }
 
 /// `picture-cleanup.json`: what the cleanup did to one meeting's pictures.
+/// `state` is Claude's run only; every removed picture, Claude's or Joseph's,
+/// carries its own `delete_after_ms`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", try_from = "RawRecord")]
 pub struct CleanupRecord {
     #[serde(flatten)]
     pub state: CleanupState,
+    /// When Claude's run finished; 0 for NotRun.
     pub ran_at_ms: i64,
-    /// `ran_at_ms` plus RESTORE_DAYS; 0 for a failed run.
-    pub delete_after_ms: i64,
     pub removed: Vec<RemovedPicture>,
+}
+
+/// A record as it may sit on disk, including the one PR #30 wrote: a
+/// record-level `deleteAfterMs` and a `purged` state.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawRecord {
+    state: String,
+    #[serde(default)]
+    error: Option<String>,
+    #[serde(default)]
+    ran_at_ms: i64,
+    #[serde(default)]
+    delete_after_ms: i64,
+    #[serde(default)]
+    removed: Vec<RemovedPicture>,
+}
+
+impl TryFrom<RawRecord> for CleanupRecord {
+    type Error = String;
+
+    fn try_from(raw: RawRecord) -> Result<Self, String> {
+        let mut removed = raw.removed;
+        let state = match raw.state.as_str() {
+            "not_run" => CleanupState::NotRun,
+            "done" => CleanupState::Done,
+            "failed" => CleanupState::Failed { error: raw.error.unwrap_or_default() },
+            // PR #30 deleted `removed/` as a whole and kept this state: nothing is pending.
+            "purged" => {
+                removed.clear();
+                CleanupState::Done
+            }
+            other => return Err(format!("unknown cleanup state {}", other)),
+        };
+        for m in removed.iter_mut().filter(|m| m.delete_after_ms == 0) {
+            m.delete_after_ms = raw.delete_after_ms;
+        }
+        Ok(CleanupRecord { state, ran_at_ms: raw.ran_at_ms, removed })
+    }
 }
 
 /// What the meeting page header shows, worded here like `meeting_saved.rs`.
@@ -126,6 +175,8 @@ pub struct CleanupSummary {
     pub removed: u64,
     pub repeats: u64,
     pub not_useful: u64,
+    /// Removed by Joseph (reason ByYou) and not restored. Not in `removed`.
+    pub by_you: u64,
     pub bytes: u64,
     /// When removed pictures are deleted for good; 0 when not applicable.
     pub delete_after_ms: i64,
@@ -363,27 +414,97 @@ fn removed_path(file: &str) -> Option<String> {
     Some(format!("{}/{}/{}", dir, REMOVED_DIR, name))
 }
 
+
+/// One picture of the meeting, kept or removed, for the All pictures panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MeetingPicture {
+    /// Its place in the frames folder, relative to the meeting folder. The name
+    /// Remove, Restore and Undo take, also while it is removed.
+    pub file: String,
+    /// Where the picture is now: `file` when kept, its `removed/` path when removed.
+    pub shown_file: String,
+    /// Local capture time "HH:MM:SS", from the file name.
+    pub time: String,
+    pub bytes: u64,
+    /// True when it sits in `removed/` (removed and not restored).
+    pub removed: bool,
+    /// Why it was removed; None when kept.
+    pub reason: Option<Reason>,
+    pub caption: Option<String>,
+    /// For a repeat: the kept picture's file.
+    pub repeat_of: Option<String>,
+    /// When a removed picture is deleted for good; 0 when kept.
+    pub delete_after_ms: i64,
+}
+
+/// Every picture of a meeting in capture order, for the All pictures panel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AllPictures {
+    /// "44 pictures kept, 25 MB" (`meeting_saved::format_pictures` and `format_size`).
+    pub title: String,
+    pub kept: u64,
+    pub kept_bytes: u64,
+    /// Removed and not restored, by Claude or by Joseph.
+    pub removed: u64,
+    /// Kept and removed together, oldest first, by the time in the file name.
+    pub pictures: Vec<MeetingPicture>,
+}
+
+
+fn empty_record() -> CleanupRecord {
+    CleanupRecord { state: CleanupState::NotRun, ran_at_ms: 0, removed: Vec::new() }
+}
+
+/// Moves a kept picture to `dest_rel` inside its frames folder's `removed/`.
+/// Returns its size. Err when it is gone or cannot move.
+fn move_out(meeting_folder: &Path, file: &str, dest_rel: &str) -> std::io::Result<u64> {
+    let src = absolute(meeting_folder, file);
+    let dest = absolute(meeting_folder, dest_rel);
+    let bytes = std::fs::metadata(&src)?.len();
+    if let Some(dir) = dest.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    std::fs::rename(&src, &dest)?;
+    Ok(bytes)
+}
+
+/// Puts pictures this call moved back where they were.
+fn put_back(meeting_folder: &Path, moved: &[RemovedPicture]) {
+    for m in moved {
+        let _ = std::fs::rename(absolute(meeting_folder, &m.removed_file), absolute(meeting_folder, &m.file));
+    }
+}
+
+/// Adds `moved` to the record, replacing any earlier entry for the same file.
+fn add_entries(rec: &mut CleanupRecord, moved: &[RemovedPicture]) {
+    rec.removed.retain(|m| !moved.iter().any(|n| n.file == m.file));
+    rec.removed.extend(moved.iter().cloned());
+}
+
 /// Moves each removal's picture into `removed/` in its own frames folder and
-/// writes the record. Returns the record written.
+/// adds it to the record as it is now (Joseph's removals stay), then writes
+/// it. A picture already gone from its place (Joseph removed it while the run
+/// was out) is skipped. Returns the record written.
 pub fn apply(meeting_folder: &Path, pictures: &[Picture], removals: &[Removal], now_ms: i64) -> Result<CleanupRecord, String> {
     let lock = folder_lock(meeting_folder);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rec = load_locked(meeting_folder).unwrap_or_else(empty_record);
     let file_of = |id: &str| pictures.iter().find(|p| p.id == id).map(|p| p.file.clone());
     let mut moved: Vec<RemovedPicture> = Vec::new();
     for r in removals {
         let Some(pic) = pictures.iter().find(|p| p.id == r.id) else { continue };
         let Some(dest_rel) = removed_path(&pic.file) else { continue };
-        let src = absolute(meeting_folder, &pic.file);
-        let dest = absolute(meeting_folder, &dest_rel);
-        let Ok(meta) = std::fs::metadata(&src) else { continue }; // gone: skipped
-        let outcome = match dest.parent() {
-            Some(d) => std::fs::create_dir_all(d).and_then(|_| std::fs::rename(&src, &dest)),
-            None => Ok(()),
+        let bytes = match move_out(meeting_folder, &pic.file, &dest_rel) {
+            Ok(b) => b,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::NotFound {
+                    log::warn!("picture cleanup: could not move {}: {}", pic.file, e);
+                }
+                continue;
+            }
         };
-        if let Err(e) = outcome {
-            log::warn!("picture cleanup: could not move {}: {}", pic.file, e);
-            continue;
-        }
         moved.push(RemovedPicture {
             file: pic.file.clone(),
             removed_file: dest_rel,
@@ -391,33 +512,73 @@ pub fn apply(meeting_folder: &Path, pictures: &[Picture], removals: &[Removal], 
             reason: r.reason,
             caption: r.caption.clone(),
             repeat_of: r.repeat_of.as_deref().and_then(file_of),
-            bytes: meta.len(),
+            bytes,
             restored: false,
+            delete_after_ms: now_ms + RESTORE_DAYS * DAY_MS,
         });
     }
-    let rec = CleanupRecord {
-        state: CleanupState::Done,
-        ran_at_ms: now_ms,
-        delete_after_ms: now_ms + RESTORE_DAYS * DAY_MS,
-        removed: moved,
-    };
+    add_entries(&mut rec, &moved);
+    rec.state = CleanupState::Done;
+    rec.ran_at_ms = now_ms;
     if let Err(e) = write_record(meeting_folder, &rec) {
-        // Nothing may be lost without a record: put every picture back.
-        for m in &rec.removed {
-            let _ = std::fs::rename(absolute(meeting_folder, &m.removed_file), absolute(meeting_folder, &m.file));
+        // Nothing may be lost without a record: put this run's pictures back.
+        put_back(meeting_folder, &moved);
+        return Err(e);
+    }
+    Ok(rec)
+}
+
+/// Joseph removes kept pictures himself (their `file` values). Each moves into
+/// `removed/` in its own frames folder with reason ByYou and its own five-day
+/// clock from `now_ms`. Works with or without an earlier record, and never
+/// changes whether Claude's cleanup has run.
+pub fn remove_by_you(meeting_folder: &Path, files: &[String], now_ms: i64) -> Result<CleanupRecord, String> {
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let existing = load_locked(meeting_folder);
+    let kept: HashSet<String> = list_pictures(meeting_folder).into_iter().map(|p| p.file).collect();
+    let mut moved: Vec<RemovedPicture> = Vec::new();
+    for file in files {
+        if !kept.contains(file) || moved.iter().any(|m| &m.file == file) {
+            continue;
         }
+        let name = file.rsplit('/').next().unwrap_or(file);
+        let (Some(dest_rel), Some((_, time))) = (removed_path(file), stamp_of(name)) else { continue };
+        match move_out(meeting_folder, file, &dest_rel) {
+            Ok(bytes) => moved.push(RemovedPicture {
+                file: file.clone(),
+                removed_file: dest_rel,
+                time,
+                reason: Reason::ByYou,
+                caption: None,
+                repeat_of: None,
+                bytes,
+                restored: false,
+                delete_after_ms: now_ms + RESTORE_DAYS * DAY_MS,
+            }),
+            Err(e) => log::warn!("picture cleanup: could not move {}: {}", file, e),
+        }
+    }
+    let mut rec = existing.unwrap_or_else(empty_record);
+    if moved.is_empty() {
+        return Ok(rec);
+    }
+    add_entries(&mut rec, &moved);
+    if let Err(e) = write_record(meeting_folder, &rec) {
+        put_back(meeting_folder, &moved);
         return Err(e);
     }
     Ok(rec)
 }
 
 /// Moves the named pictures (their `file` values) back and updates the record.
-/// An empty list restores every removed picture.
+/// An empty list restores every pending picture; a name no entry lists is
+/// skipped. Err when there is no record or it has no entries.
 pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
     let lock = folder_lock(meeting_folder);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut rec = load_locked(meeting_folder).ok_or("there is no picture cleanup to restore from")?;
-    if rec.state != CleanupState::Done {
+    if rec.removed.is_empty() {
         return Err("there are no removed pictures to restore".to_string());
     }
     for m in rec.removed.iter_mut() {
@@ -435,27 +596,55 @@ pub fn restore(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord,
     Ok(rec)
 }
 
+/// Undo for Joseph's own Remove: moves each named picture (its `file` value)
+/// whose entry is ByYou and not restored back to its place and drops that
+/// entry, as if the Remove never happened. Names with no such entry are skipped.
+/// No record is Err.
+pub fn undo_remove(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
+    let lock = folder_lock(meeting_folder);
+    let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
+    let mut rec = load_locked(meeting_folder).ok_or("there is no picture cleanup to undo")?;
+    let before = rec.removed.len();
+    rec.removed.retain(|m| {
+        if m.restored || m.reason != Reason::ByYou || !files.contains(&m.file) {
+            return true;
+        }
+        let place = absolute(meeting_folder, &m.file);
+        // A kept picture already at its place is never overwritten: the entry goes and
+        // the copy in `removed/` stays for `load` to sort out.
+        if place.exists() {
+            return false;
+        }
+        match std::fs::rename(absolute(meeting_folder, &m.removed_file), &place) {
+            Ok(()) => false,
+            Err(e) => {
+                log::warn!("picture cleanup: could not undo the removal of {}: {}", m.file, e);
+                true
+            }
+        }
+    });
+    if rec.removed.len() != before {
+        write_record(meeting_folder, &rec)?;
+    }
+    Ok(rec)
+}
+
 /// Undo for `restore`: moves the named restored pictures (their `file`
-/// values) back into `removed/` and marks them removed again.
+/// values) back into `removed/` and marks them removed again, exactly as they
+/// were (reason, caption, `repeat_of` and date).
 pub fn remove_again(meeting_folder: &Path, files: &[String]) -> Result<CleanupRecord, String> {
     let lock = folder_lock(meeting_folder);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let mut rec = load_locked(meeting_folder).ok_or("there is no picture cleanup to undo")?;
-    if rec.state != CleanupState::Done {
+    if rec.removed.is_empty() {
         return Err("there are no removed pictures to undo".to_string());
     }
     for m in rec.removed.iter_mut() {
         if !m.restored || !files.contains(&m.file) {
             continue;
         }
-        let from = absolute(meeting_folder, &m.file);
-        let to = absolute(meeting_folder, &m.removed_file);
-        let moved = match to.parent() {
-            Some(d) => std::fs::create_dir_all(d).and_then(|_| std::fs::rename(&from, &to)),
-            None => Ok(()),
-        };
-        match moved {
-            Ok(()) => m.restored = false,
+        match move_out(meeting_folder, &m.file, &m.removed_file) {
+            Ok(_) => m.restored = false,
             Err(e) => log::warn!("picture cleanup: could not undo the restore of {}: {}", m.file, e),
         }
     }
@@ -463,16 +652,13 @@ pub fn remove_again(meeting_folder: &Path, files: &[String]) -> Result<CleanupRe
     Ok(rec)
 }
 
-/// Writes a failed record. Moves nothing.
+/// Marks Claude's run failed and keeps every entry. Moves nothing.
 pub fn record_failure(meeting_folder: &Path, error: &str, now_ms: i64) -> Result<CleanupRecord, String> {
     let lock = folder_lock(meeting_folder);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
-    let rec = CleanupRecord {
-        state: CleanupState::Failed { error: error.to_string() },
-        ran_at_ms: now_ms,
-        delete_after_ms: 0,
-        removed: Vec::new(),
-    };
+    let mut rec = load_locked(meeting_folder).unwrap_or_else(empty_record);
+    rec.state = CleanupState::Failed { error: error.to_string() };
+    rec.ran_at_ms = now_ms;
     write_record(meeting_folder, &rec)?;
     Ok(rec)
 }
@@ -496,7 +682,7 @@ fn load_locked(meeting_folder: &Path) -> Option<CleanupRecord> {
         std::fs::read_to_string(meeting_folder.join(RECORD_FILE)).ok().and_then(|t| serde_json::from_str(&t).ok());
     let mut changed = false;
     let mut listed: HashSet<String> = HashSet::new();
-    if let Some(r) = rec.as_mut().filter(|r| r.state == CleanupState::Done) {
+    if let Some(r) = rec.as_mut() {
         let before = r.removed.clone();
         r.removed.retain_mut(|m| {
             let in_removed = absolute(meeting_folder, &m.removed_file).is_file();
@@ -539,29 +725,49 @@ fn load_locked(meeting_folder: &Path) -> Option<CleanupRecord> {
     rec
 }
 
-/// Deletes `removed/` in each frames folder when the window has ended, and
-/// marks the record Purged. True when it deleted something.
+/// Deletes each removed picture whose own date has come and drops its entry;
+/// an expired restored entry is dropped too (its file is a kept picture). A
+/// delete that fails keeps that entry for the next sweep. Never changes the
+/// state. True when it deleted at least one file.
 pub fn purge_if_expired(meeting_folder: &Path, now_ms: i64) -> bool {
     let lock = folder_lock(meeting_folder);
     let _guard = lock.lock().unwrap_or_else(|e| e.into_inner());
     let Some(mut rec) = load_locked(meeting_folder) else { return false };
-    if rec.state != CleanupState::Done || now_ms < rec.delete_after_ms {
-        return false;
-    }
-    for dir in FRAME_DIRS {
-        let removed = meeting_folder.join(dir).join(REMOVED_DIR);
-        if let Err(e) = std::fs::remove_dir_all(&removed) {
-            if e.kind() != std::io::ErrorKind::NotFound {
-                log::warn!("picture cleanup: could not delete {}: {}", removed.display(), e);
-                return false; // keep the record Done so the next sweep retries
+    let mut deleted = 0usize;
+    let mut dropped = false;
+    rec.removed.retain(|m| {
+        if m.delete_after_ms > now_ms {
+            return true;
+        }
+        if m.restored {
+            dropped = true;
+            return false;
+        }
+        match std::fs::remove_file(absolute(meeting_folder, &m.removed_file)) {
+            Ok(()) => {
+                deleted += 1;
+                dropped = true;
+                false
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                dropped = true;
+                false
+            }
+            Err(e) => {
+                log::warn!("picture cleanup: could not delete {}: {}", m.removed_file, e);
+                true
             }
         }
+    });
+    if dropped {
+        if let Err(e) = write_record(meeting_folder, &rec) {
+            log::warn!("picture cleanup: {}", e);
+        }
+        for dir in FRAME_DIRS {
+            let _ = std::fs::remove_dir(meeting_folder.join(dir).join(REMOVED_DIR)); // only when empty
+        }
     }
-    rec.state = CleanupState::Purged;
-    if let Err(e) = write_record(meeting_folder, &rec) {
-        log::warn!("picture cleanup: {}", e);
-    }
-    true
+    deleted > 0
 }
 
 /// Whether Draft note should start a cleanup run for this meeting.
@@ -571,58 +777,138 @@ pub fn should_start(record: Option<&CleanupRecord>, run_in_flight: bool) -> bool
     }
     match record {
         None => true,
-        Some(r) => matches!(r.state, CleanupState::Failed { .. }),
+        Some(r) => !matches!(r.state, CleanupState::Done),
     }
 }
 
 /// The header numbers and line for the meeting page.
 pub fn summary(record: Option<&CleanupRecord>, now_ms: i64) -> CleanupSummary {
-    let _ = now_ms; // a Done record shows until the purge sweep marks it Purged
+    let _ = now_ms; // each picture's own date decides; the purge sweep drops it
     let mut out = CleanupSummary {
         line: None,
         failed: false,
         removed: 0,
         repeats: 0,
         not_useful: 0,
+        by_you: 0,
         bytes: 0,
         delete_after_ms: 0,
     };
     let Some(rec) = record else { return out };
-    match &rec.state {
-        CleanupState::Failed { .. } => {
-            out.failed = true;
-            out.line = Some("Picture cleanup did not finish.".to_string());
+    let mut claude_bytes = 0u64;
+    let mut by_you_bytes = 0u64;
+    for m in rec.removed.iter().filter(|m| !m.restored) {
+        out.bytes += m.bytes;
+        if out.delete_after_ms == 0 || m.delete_after_ms < out.delete_after_ms {
+            out.delete_after_ms = m.delete_after_ms;
         }
-        CleanupState::Purged => {}
-        CleanupState::Done => {
-            for m in rec.removed.iter().filter(|m| !m.restored) {
-                out.removed += 1;
-                out.bytes += m.bytes;
-                if m.reason == Reason::Repeat {
-                    out.repeats += 1;
-                } else {
-                    out.not_useful += 1;
-                }
+        match m.reason {
+            Reason::ByYou => {
+                out.by_you += 1;
+                by_you_bytes += m.bytes;
             }
-            if out.removed > 0 {
-                out.delete_after_ms = rec.delete_after_ms;
-                let mut parts = Vec::new();
-                if out.repeats > 0 {
-                    parts.push(format!("{} {}", out.repeats, if out.repeats == 1 { "repeat" } else { "repeats" }));
-                }
-                if out.not_useful > 0 {
-                    parts.push(format!("{} not useful", out.not_useful));
-                }
-                out.line = Some(format!(
-                    "Claude removed {} to free {}: {}.",
-                    crate::meeting_saved::format_pictures(out.removed),
-                    crate::meeting_saved::format_size(out.bytes),
-                    parts.join(", ")
-                ));
+            Reason::Repeat => {
+                out.removed += 1;
+                out.repeats += 1;
+                claude_bytes += m.bytes;
+            }
+            _ => {
+                out.removed += 1;
+                out.not_useful += 1;
+                claude_bytes += m.bytes;
             }
         }
     }
+    if matches!(rec.state, CleanupState::Failed { .. }) {
+        out.failed = true;
+        out.line = Some("Picture cleanup did not finish.".to_string());
+        return out;
+    }
+    let mut line = String::new();
+    if out.removed > 0 {
+        let mut parts = Vec::new();
+        if out.repeats > 0 {
+            parts.push(format!("{} {}", out.repeats, if out.repeats == 1 { "repeat" } else { "repeats" }));
+        }
+        if out.not_useful > 0 {
+            parts.push(format!("{} not useful", out.not_useful));
+        }
+        line = format!(
+            "Claude removed {} to free {}: {}.",
+            crate::meeting_saved::format_pictures(out.removed),
+            crate::meeting_saved::format_size(claude_bytes),
+            parts.join(", ")
+        );
+        if out.by_you > 0 {
+            line.push_str(&format!(" You removed {}.", out.by_you));
+        }
+    } else if out.by_you > 0 {
+        line = format!(
+            "You removed {} to free {}.",
+            crate::meeting_saved::format_pictures(out.by_you),
+            crate::meeting_saved::format_size(by_you_bytes)
+        );
+    }
+    out.line = (!line.is_empty()).then_some(line);
     out
+}
+
+/// The sort key of a picture: the time in its file name, so both frames
+/// folders interleave in capture order.
+fn capture_key(file: &str) -> (String, String) {
+    let name = file.rsplit('/').next().unwrap_or(file);
+    (stamp_of(name).map(|(k, _)| k).unwrap_or_default(), file.to_string())
+}
+
+/// Every picture of the meeting, kept and removed, after the same reconcile
+/// with the disk as `load`.
+pub fn all_pictures(meeting_folder: &Path) -> AllPictures {
+    let record = load(meeting_folder);
+    let mut rows: Vec<MeetingPicture> = Vec::new();
+    let mut kept_bytes = 0u64;
+    let mut kept = 0u64;
+    for p in list_pictures(meeting_folder) {
+        let bytes = std::fs::metadata(absolute(meeting_folder, &p.file)).map(|m| m.len()).unwrap_or(0);
+        kept += 1;
+        kept_bytes += bytes;
+        rows.push(MeetingPicture {
+            shown_file: p.file.clone(),
+            file: p.file,
+            time: p.time,
+            bytes,
+            removed: false,
+            reason: None,
+            caption: None,
+            repeat_of: None,
+            delete_after_ms: 0,
+        });
+    }
+    let mut removed = 0u64;
+    for m in record.iter().flat_map(|r| r.removed.iter()).filter(|m| !m.restored) {
+        removed += 1;
+        rows.push(MeetingPicture {
+            file: m.file.clone(),
+            shown_file: m.removed_file.clone(),
+            time: m.time.clone(),
+            bytes: m.bytes,
+            removed: true,
+            reason: Some(m.reason),
+            caption: m.caption.clone(),
+            repeat_of: m.repeat_of.clone(),
+            delete_after_ms: m.delete_after_ms,
+        });
+    }
+    rows.sort_by_cached_key(|p| capture_key(&p.file));
+    let title = if kept == 0 {
+        "No pictures kept".to_string()
+    } else {
+        format!(
+            "{} kept, {}",
+            crate::meeting_saved::format_pictures(kept),
+            crate::meeting_saved::format_size(kept_bytes)
+        )
+    };
+    AllPictures { title, kept, kept_bytes, removed, pictures: rows }
 }
 
 /// The absolute path of a record-relative file.
@@ -637,3 +923,11 @@ mod tests;
 #[cfg(test)]
 #[path = "tests/cleanup_round2.rs"]
 mod round2_tests;
+
+#[cfg(test)]
+#[path = "tests/cleanup_all_pictures.rs"]
+mod all_pictures_tests;
+
+#[cfg(test)]
+#[path = "tests/cleanup_undo_remove.rs"]
+mod undo_remove_tests;

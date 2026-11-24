@@ -2,7 +2,8 @@
 
 import { useCallback, useEffect, useState, type ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import { PictureCleanup } from './PictureCleanup';
+import { PictureCleanup, type PanelKind } from './PictureCleanup';
+import { seeAllLabel } from './allPictures';
 import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 
 // Shapes of api_get_meetings_saved / api_get_meeting_saved (src-tauri/src/meeting_saved.rs).
@@ -41,8 +42,8 @@ export function SavedTotals({ totals, meetingCount }: { totals?: string; meeting
 
 /**
  * Title, Brief and the "What was saved" line at the top of a meeting page, above the page body.
- * While the removed-pictures panel is open it takes the body's place, so both groups and their
- * restore links have the room; the body stays mounted underneath and comes back on Hide.
+ * While the removed-pictures panel or the All pictures panel is open (one at a time) it takes the
+ * body's place, so the thumbnails have the room; the body stays mounted underneath and comes back on Hide.
  * `reloadKey` changes when the meeting list reloads (the provider's `saved`), so a page
  * opened right after Stop picks up the finished numbers.
  */
@@ -55,7 +56,11 @@ export function MeetingSavedHeader({
   const { refreshSaved } = useSidebar();
   const onCleanupChanged = useCallback(() => { setVersion((n) => n + 1); refreshSaved(); }, [refreshSaved]);
   const [panelHost, setPanelHost] = useState<HTMLDivElement | null>(null);
-  const [panelOpen, setPanelOpen] = useState(false);
+  const [panel, setPanel] = useState<PanelKind>(null);
+  // Pictures removed and not restored, by Claude or by Joseph; PictureCleanup reports it.
+  const [pending, setPending] = useState(0);
+  useEffect(() => { setPanel(null); }, [meetingId]);
+  const panelOpen = panel !== null;
 
   useEffect(() => {
     let cancelled = false;
@@ -73,14 +78,36 @@ export function MeetingSavedHeader({
       <div className="flex-shrink-0 min-w-0 border-b border-gray-200 bg-white px-4 py-2">
         <h1 className="truncate text-sm font-semibold text-gray-900" title={title}>{title}</h1>
         <BriefLine brief={saved?.brief} />
-        {saved && <p className="text-xs text-gray-600">What was saved: {saved.line}</p>}
+        {saved && (
+          <p className="text-xs text-gray-600">
+            What was saved: {saved.line}
+            {(() => {
+              const label = seeAllLabel(saved.pictures, pending);
+              return label && (
+                <>
+                  {' '}
+                  <button
+                    type="button"
+                    onClick={() => setPanel(panel === 'all' ? null : 'all')}
+                    aria-expanded={panel === 'all'}
+                    className="text-[13px] font-medium text-blue-600 hover:underline"
+                  >
+                    {panel === 'all' ? 'Hide pictures' : label}
+                  </button>
+                </>
+              );
+            })()}
+          </p>
+        )}
         <PictureCleanup
           meetingId={meetingId}
           hasCleanup={saved?.cleanup}
           version={version}
           onChanged={onCleanupChanged}
           panelHost={panelHost}
-          onOpenChange={setPanelOpen}
+          panel={panel}
+          onPanelChange={setPanel}
+          onPendingChange={setPending}
         />
       </div>
       <div ref={setPanelHost} className={panelOpen ? 'min-h-0 min-w-0 flex-1 overflow-y-auto bg-white' : 'hidden'} />

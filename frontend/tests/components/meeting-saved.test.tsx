@@ -2,6 +2,7 @@ import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test';
 import { act, create, type ReactTestInstance, type ReactTestRenderer } from 'react-test-renderer';
 
 const originalCore = { ...await import('@tauri-apps/api/core') };
+const originalSidebar = { ...await import('../../src/components/Sidebar/SidebarProvider') };
 afterAll(() => {
   mock.module('@tauri-apps/api/core', () => originalCore);
 });
@@ -14,6 +15,18 @@ const invoke = mock(async (_command: string, _args?: Record<string, unknown>): P
   return reply;
 });
 mock.module('@tauri-apps/api/core', () => ({ invoke }));
+
+// MeetingSavedHeader calls useSidebar() to reload the sidebar totals (refreshSaved).
+// The real hook throws outside a SidebarProvider, so the hook alone is replaced and the
+// other exports of the module stay real. Restored afterwards so other test files see the real one.
+const refreshSaved = mock(async () => {});
+mock.module('../../src/components/Sidebar/SidebarProvider', () => ({
+  ...originalSidebar,
+  useSidebar: () => ({ refreshSaved }),
+}));
+afterAll(() => {
+  mock.module('../../src/components/Sidebar/SidebarProvider', () => originalSidebar);
+});
 const { BriefLine, MeetingSavedHeader, SavedTotals } = await import('../../src/components/MeetingSaved');
 
 const text = (node: ReactTestInstance | string): string =>
@@ -27,6 +40,7 @@ async function mountHeader(meetingId = 'm1', title = 'Sale planning') {
 
 beforeEach(() => {
   invoke.mockClear();
+  refreshSaved.mockClear();
   reply = undefined;
 });
 
@@ -39,7 +53,7 @@ describe('MeetingSavedHeader', () => {
     };
     await mountHeader();
     expect(invoke).toHaveBeenCalledWith('api_get_meeting_saved', { meetingId: 'm1' });
-    expect(pageText(renderer)).toBe('Sale planning|Plan the sale of the Elm St duplex|What was saved: 10:04 to 10:47, 43 min, 181 pictures, 165 MB');
+    expect(pageText(renderer)).toBe('Sale planning|Plan the sale of the Elm St duplex|What was saved: 10:04 to 10:47, 43 min, 181 pictures, 165 MB See all 181 pictures');
     const brief = renderer.root.findAllByType('p').find((p) => p.props.title);
     expect(brief?.props.title).toBe('Plan the sale of the Elm St duplex');
     expect(brief?.props.className).toContain('truncate');
