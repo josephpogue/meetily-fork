@@ -903,3 +903,7 @@ mod round2_tests;
 #[cfg(test)]
 #[path = "tests/cleanup_all_pictures.rs"]
 mod all_pictures_tests;
+
+#[cfg(test)]
+#[path = "tests/cleanup_undo_remove.rs"]
+mod undo_remove_tests;

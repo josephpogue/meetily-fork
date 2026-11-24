@@ -166,3 +166,4 @@ Update these with the new tests: `frontend/src-tauri/src/assistant/tests/cleanup
 - **`record_failure` on an existing record:** sets `ran_at_ms` to now_ms and keeps every entry.
 - **`remove_again` on an entry whose date has passed (not yet swept):** puts it back exactly as it was, same date; the next `purge_if_expired` deletes it.
 - **`restore` with a name no entry lists:** that name is skipped; the rest are restored; Ok.
+- **`undo_remove` with an empty list on an existing record:** Ok, nothing changes (Undo always names its pictures; an empty list never means all).
