@@ -141,6 +141,7 @@ export function NoteBar() {
               </label>
               <input
                 id="note-title"
+                aria-label="Meeting title"
                 type="text"
                 value={titleText}
                 onChange={(e) => setEditedTitle(e.target.value)}
