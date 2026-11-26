@@ -91,8 +91,11 @@ pub async fn assistant_save_note(
     handle: State<'_, AssistantHandle>,
     state: State<'_, AppState>,
     project: Option<String>,
+    title: Option<String>,
+    title_edited: bool,
 ) -> Result<core::SavedNote, String> {
-    core::save_note(handle.inner(), state.db_manager.pool(), project).await
+    let title = title.map(|text| core::TitleChoice { text, edited: title_edited });
+    core::save_note(handle.inner(), state.db_manager.pool(), project, title).await
 }
 
 /// Slugs of the vault's project pages, sorted.
@@ -108,8 +111,14 @@ pub async fn assistant_suggest_vault_project(handle: State<'_, AssistantHandle>)
 }
 
 #[tauri::command]
-pub async fn assistant_discard_note(handle: State<'_, AssistantHandle>) -> Result<(), String> {
-    core::discard_note(handle.inner()).await;
+pub async fn assistant_discard_note(
+    handle: State<'_, AssistantHandle>,
+    state: State<'_, AppState>,
+    title: Option<String>,
+    title_edited: bool,
+) -> Result<(), String> {
+    let title = title.map(|text| core::TitleChoice { text, edited: title_edited });
+    core::discard_note(handle.inner(), state.db_manager.pool(), title).await;
     Ok(())
 }
 

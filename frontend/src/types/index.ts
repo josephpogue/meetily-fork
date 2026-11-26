@@ -1,3 +1,4 @@
+import type { TitleSuggestions } from '@/components/AssistantPanel/noteTitle';
 export interface Message {
   id: string;
   content: string;
@@ -186,6 +187,8 @@ export interface AssistantNote {
   state: 'idle' | 'drafting' | 'ready' | 'saved' | 'failed';
   markdown: string;
   error: string | null;
+  /** What the Title box can show; null when the app has no title to offer. */
+  titles: TitleSuggestions | null;
 }
 
 export interface AssistantAskItem {

@@ -19,8 +19,7 @@ export type TitleSuggestions = {
  * text), else the suggestion for the pick.
  */
 export function titleBoxText(s: TitleSuggestions, choice: string, edited: string | null): string {
-  void s;
-  void choice;
-  void edited;
-  throw new Error('not implemented');
+  if (edited !== null) return edited;
+  if (s.keepCurrent) return s.current;
+  return s.byProject[choice] ?? s.noProject;
 }

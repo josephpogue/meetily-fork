@@ -21,9 +21,11 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use crate::audio::TranscriptUpdate;
 use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
 use crate::database::repositories::assistant_meta::AssistantMetaRepository;
+use crate::database::repositories::meeting::MeetingsRepository;
 
 use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut, ChatExchange, ChatLog};
 use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, FrameFeed, LaneConfig, Runner};
+use super::meeting_title::{self, TitleSuggestions};
 use super::note::{self, NoteDraft, NOTE_PROMPT};
 use super::settings::{self, AssistantSettings};
 use super::transcript::{AssemblerOut, Speaker, TranscriptLog};
@@ -84,6 +86,8 @@ pub struct NoteOut {
     state: &'static str,
     markdown: String,
     error: Option<String>,
+    /// What the note bar's Title box can show; None when there is no title to offer.
+    titles: Option<TitleSuggestions>,
 }
 
 pub struct AssistantCore {
@@ -150,6 +154,8 @@ pub struct AssistantCore {
 
     note_state: NoteState,
     note_draft: Option<NoteDraft>,
+    /// The Title box suggestions for the drafted note; Save and Discard read them.
+    note_titles: Option<TitleSuggestions>,
     note_markdown: String,
     note_error: Option<String>,
     session_transcript: String,
@@ -209,6 +215,7 @@ impl AssistantCore {
             brief_edited: false,
             note_state: NoteState::Idle,
             note_draft: None,
+            note_titles: None,
             note_markdown: String::new(),
             note_error: None,
             session_transcript: String::new(),
@@ -286,6 +293,7 @@ impl AssistantCore {
             state: self.note_state.label(),
             markdown: self.note_markdown.clone(),
             error: self.note_error.clone(),
+            titles: self.note_titles.clone(),
         });
     }
 }
@@ -1032,6 +1040,10 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
             core.lanes.draft_note(transcript_text, qa_log_text).await
         };
 
+        let titles = match &result {
+            Ok(raw) => title_suggestions(app.as_ref(), &history, raw, &projects).await,
+            Err(_) => None,
+        };
         let mut core = handle.0.lock().await;
         match result {
             Ok(raw) => match note::parse_note(&raw) {
@@ -1054,6 +1066,7 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
                     let deleted = core.history.lock().unwrap().deleted_ids();
                     core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
                     core.note_draft = Some(draft);
+                    core.note_titles = titles;
                     core.note_state = NoteState::Ready;
                     core.note_error = None;
                 }
@@ -1069,6 +1082,70 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
         }
         core.emit_note();
         return Ok(());
+    }
+}
+
+/// The meeting row's name, start and recording folder.
+async fn meeting_row(pool: &SqlitePool, id: &str) -> Option<(String, chrono::DateTime<chrono::Utc>, Option<String>)> {
+    sqlx::query_as("SELECT title, created_at, folder_path FROM meetings WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The Title box suggestions for a draft that just landed. None when the
+/// meeting is not in the database yet (Stop's save is still running): the
+/// note bar then shows no Title box and the meeting keeps its name.
+async fn title_suggestions(
+    app: Option<&AppHandle<Wry>>,
+    history: &super::history::HistoryHandle,
+    raw: &str,
+    projects: &[String],
+) -> Option<TitleSuggestions> {
+    let id = history.lock().unwrap().saved_meeting_id()?;
+    let state = app?.try_state::<crate::state::AppState>()?;
+    let (title, created_at, folder) = meeting_row(state.db_manager.pool(), &id).await?;
+    let window_name = folder.and_then(|f| meeting_title::window_name_in(std::path::Path::new(&f)));
+    Some(meeting_title::suggest(
+        &title,
+        window_name.as_deref(),
+        meeting_title::topic_from_reply(raw).as_deref(),
+        created_at.with_timezone(&chrono::Local).date_naive(),
+        projects,
+        &meeting_title::default_codes_file(),
+    ))
+}
+
+/// What the Title box held when Joseph pressed Save or Discard.
+#[derive(Debug, Clone)]
+pub struct TitleChoice {
+    pub text: String,
+    pub edited: bool,
+}
+
+/// Renames the meeting to the Title box's text when `name_to_apply` says so,
+/// against the name the database holds now. A failure is logged only.
+async fn apply_title(core: &AssistantCore, pool: &SqlitePool, choice: Option<&TitleChoice>) {
+    let (Some(choice), Some(suggestions)) = (choice, core.note_titles.as_ref()) else {
+        return;
+    };
+    let Some(id) = core.history.lock().unwrap().saved_meeting_id() else {
+        log::warn!("assistant: no saved meeting to rename");
+        return;
+    };
+    let Some((current, _, _)) = meeting_row(pool, &id).await else {
+        log::warn!("assistant: meeting {} not found, not renamed", id);
+        return;
+    };
+    let Some(name) = meeting_title::name_to_apply(suggestions, &choice.text, choice.edited, &current) else {
+        return;
+    };
+    match MeetingsRepository::update_meeting_title(pool, &id, &name).await {
+        Ok(true) => log::info!("assistant: meeting {} renamed to {}", id, name),
+        Ok(false) => log::warn!("assistant: meeting {} not found, not renamed", id),
+        Err(e) => log::warn!("assistant: could not rename meeting {}: {}", id, e),
     }
 }
 
@@ -1136,6 +1213,7 @@ pub async fn save_note(
     handle: &AssistantHandle,
     pool: &SqlitePool,
     project: Option<String>,
+    title: Option<TitleChoice>,
 ) -> Result<SavedNote, String> {
     let mut core = handle.0.lock().await;
     let Some(draft) = core.note_draft.clone() else {
@@ -1150,6 +1228,9 @@ pub async fn save_note(
     let dry_run = std::env::var("ASSISTANT_DRY_RUN").ok().as_deref() == Some("1");
     let transcript_text = core.session_transcript.clone();
     let history = core.history.clone();
+
+    // Rename first, so the vault note's heading and the project page line use the new title.
+    apply_title(&core, pool, title.as_ref()).await;
 
     let result = async {
         let facts = meeting_facts(pool, &history).await?;
@@ -1204,10 +1285,12 @@ pub async fn save_note(
     }
 }
 
-pub async fn discard_note(handle: &AssistantHandle) {
+pub async fn discard_note(handle: &AssistantHandle, pool: &SqlitePool, title: Option<TitleChoice>) {
     let mut core = handle.0.lock().await;
+    apply_title(&core, pool, title.as_ref()).await;
     core.note_state = NoteState::Idle;
     core.note_draft = None;
+    core.note_titles = None;
     core.note_markdown.clear();
     core.note_error = None;
     core.emit_note();
@@ -1403,6 +1486,7 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.chat_log.lock().unwrap().clear();
         core.note_state = NoteState::Idle;
         core.note_draft = None;
+        core.note_titles = None;
         core.note_markdown.clear();
         core.note_error = None;
         // The panel must not keep the last call's note state (a Saved note
@@ -3124,11 +3208,11 @@ mod tests {
         assert!(draft_note(&handle).await.is_ok());
 
         assert_eq!(list_vault_projects(&handle).await, vec!["mission-control"]);
-        let err = save_note(&handle, &pool, Some("../secret".to_string())).await.unwrap_err();
+        let err = save_note(&handle, &pool, Some("../secret".to_string()), None).await.unwrap_err();
         assert!(err.contains("not a project"), "{err}");
         assert_eq!(handle.0.lock().await.note_state, NoteState::Ready, "a refusal leaves the note to save again");
 
-        let saved = save_note(&handle, &pool, Some("mission-control".to_string())).await.unwrap();
+        let saved = save_note(&handle, &pool, Some("mission-control".to_string()), None).await.unwrap();
         assert_eq!(saved.project.as_deref(), Some("mission-control"));
         let note = std::fs::read_to_string(&saved.note_path).unwrap();
         assert!(note.starts_with("# t\n\n- Date: "), "title is the meeting's: {note}");

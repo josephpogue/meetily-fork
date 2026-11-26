@@ -2,10 +2,12 @@
 
 import { useEffect, useRef, useState } from 'react';
 import ReactMarkdown, { Components } from 'react-markdown';
-import { Check, ChevronsUpDown, FileText, FolderOpen, Loader2, X } from 'lucide-react';
+import { Check, ChevronsUpDown, FileText, FolderOpen, Loader2, Type, X } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { ScrollArea } from '@/components/ui/scroll-area';
+import { useSidebar } from '@/components/Sidebar/SidebarProvider';
 import { useAssistant } from '@/contexts/AssistantContext';
+import { titleBoxText } from './noteTitle';
 
 // Styled explicitly (not via the Tailwind typography plugin, whose availability
 // is ambiguous here: the repo carries both tailwind.config.js and .ts, and only
@@ -48,6 +50,10 @@ export function NoteBar() {
   // delete after Draft note) and resets only when the note goes back to idle.
   const [choice, setChoice] = useState('');
   const picked = useRef(false);
+  // Joseph's own Title text, or null while the box shows the suggestion. It
+  // survives a background redraft and resets when the note goes back to idle.
+  const [editedTitle, setEditedTitle] = useState<string | null>(null);
+  const { refetchMeetings } = useSidebar();
   const [loaded, setLoaded] = useState(false);
   const [listFailed, setListFailed] = useState(false);
 
@@ -57,6 +63,7 @@ export function NoteBar() {
     if (!idle) return;
     picked.current = false;
     setChoice('');
+    setEditedTitle(null);
   }, [idle]);
 
   useEffect(() => {
@@ -77,6 +84,19 @@ export function NoteBar() {
       cancelled = true;
     };
   }, [ready, listVaultProjects, suggestVaultProject]);
+
+  const titles = note.titles;
+  const titleText = titles ? titleBoxText(titles, choice, editedTitle) : '';
+  const titleInput = titles ? { text: titleText, edited: editedTitle !== null } : null;
+  // Save and Discard rename the meeting in the app; the sidebar list follows.
+  const saveAndRefresh = async () => {
+    await saveNote(choice === '' ? null : choice, titleInput);
+    void refetchMeetings();
+  };
+  const discardAndRefresh = async () => {
+    await discardNote(titleInput);
+    void refetchMeetings();
+  };
 
   const others = projects.filter((slug) => slug !== suggested);
   const hint = listFailed
@@ -110,6 +130,24 @@ export function NoteBar() {
           <ScrollArea className="h-40 rounded-md border border-gray-200 bg-white p-3">
             <ReactMarkdown components={markdownComponents}>{note.markdown}</ReactMarkdown>
           </ScrollArea>
+          {titles && (
+            <div className="flex items-center gap-2">
+              <label
+                htmlFor="note-title"
+                className="flex shrink-0 items-center gap-1.5 text-[13px] font-semibold text-gray-700"
+              >
+                <Type className="h-4 w-4 text-gray-400" />
+                Title
+              </label>
+              <input
+                id="note-title"
+                type="text"
+                value={titleText}
+                onChange={(e) => setEditedTitle(e.target.value)}
+                className="h-8 min-w-0 flex-1 rounded-md border border-gray-300 bg-white px-2.5 text-[13px] text-gray-900 hover:border-gray-400 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-blue-500"
+              />
+            </div>
+          )}
           <div>
             <div className="flex items-center gap-2">
               <label
@@ -157,12 +195,12 @@ export function NoteBar() {
               size="sm"
               className="flex-1"
               disabled={!loaded}
-              onClick={() => saveNote(choice === '' ? null : choice)}
+              onClick={saveAndRefresh}
             >
               <Check className="h-4 w-4" />
               Save
             </Button>
-            <Button variant="outline" size="sm" className="flex-1" onClick={discardNote}>
+            <Button variant="outline" size="sm" className="flex-1" onClick={discardAndRefresh}>
               <X className="h-4 w-4" />
               Discard
             </Button>

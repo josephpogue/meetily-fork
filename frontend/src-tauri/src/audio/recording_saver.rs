@@ -30,6 +30,10 @@ pub struct MeetingMetadata {
     pub version: String,
     pub meeting_id: Option<String>,
     pub meeting_name: Option<String>,
+    /// The name taken from the call window at Stop, kept so the app can tell
+    /// it from a name Joseph typed (the assistant's meeting title module).
+    #[serde(default)]
+    pub window_name: Option<String>,
     pub created_at: String,
     pub completed_at: Option<String>,
     pub duration_seconds: Option<f64>,
@@ -81,6 +85,7 @@ impl RecordingSaver {
         self.meeting_name = Some(new_name.clone());
         if let Some(metadata) = self.metadata.as_mut() {
             metadata.meeting_name = Some(new_name.clone());
+            metadata.window_name = Some(new_name.clone());
         }
         // stop_and_save can return before it writes metadata.json, so write it now.
         if let (Some(folder), Some(metadata)) = (&self.meeting_folder, &self.metadata) {
@@ -265,6 +270,7 @@ impl RecordingSaver {
             version: "1.0".to_string(),
             meeting_id: None,  // Will be set by backend
             meeting_name: Some(meeting_name.to_string()),
+            window_name: None,
             created_at: chrono::Utc::now().to_rfc3339(),
             completed_at: None,
             duration_seconds: None,
@@ -514,6 +520,7 @@ mod tests {
             version: "1.0".to_string(),
             meeting_id: None,
             meeting_name: Some(name.to_string()),
+            window_name: None,
             created_at: "2026-10-21T10:04:31Z".to_string(),
             completed_at: None,
             duration_seconds: None,

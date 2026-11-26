@@ -27,6 +27,7 @@ pub struct NoteDraft {
 }
 
 const SLUG_MARKER: &str = "=== SLUG ===";
+const TITLE_MARKER: &str = "=== TITLE ===";
 const PROJECT_MARKER: &str = "=== PROJECT ===";
 const NOTE_MARKER: &str = "=== NOTE ===";
 
@@ -44,7 +45,9 @@ pub fn parse_note(raw: &str) -> Result<NoteDraft, String> {
 
     // The project section sits between the slug and the note; elsewhere it is ignored.
     let project_pos = raw.find(PROJECT_MARKER).filter(|p| *p > slug_pos && *p < note_pos);
-    let slug_end = project_pos.unwrap_or(note_pos);
+    // The title section (read by `meeting_title`) also ends the slug.
+    let title_pos = raw.find(TITLE_MARKER).filter(|p| *p > slug_pos && *p < note_pos);
+    let slug_end = [title_pos, project_pos].into_iter().flatten().min().unwrap_or(note_pos);
     let project = project_pos
         .map(|p| raw[p + PROJECT_MARKER.len()..note_pos].trim())
         .filter(|p| !p.is_empty() && !p.eq_ignore_ascii_case("none"))

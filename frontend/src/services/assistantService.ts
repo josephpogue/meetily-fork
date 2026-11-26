@@ -19,6 +19,12 @@ import {
   AssistantClaudeProbe,
 } from '@/types';
 
+/** The Title box as Save or Discard sends it: its text and whether Joseph edited it. */
+export interface NoteTitleInput {
+  text: string;
+  edited: boolean;
+}
+
 /** What `assistant_save_note` returns: where the note went and under which project. */
 export interface SavedNote {
   notePath: string;
@@ -77,8 +83,8 @@ export class AssistantService {
   }
 
   /** Files the drafted note under `project` (a vault project slug) or, with null, under none. */
-  async saveNote(project: string | null): Promise<SavedNote> {
-    return invoke('assistant_save_note', { project });
+  async saveNote(project: string | null, title: NoteTitleInput | null): Promise<SavedNote> {
+    return invoke('assistant_save_note', { project, title: title?.text ?? null, titleEdited: title?.edited ?? false });
   }
 
   /** Slugs of the vault's project pages, sorted. */
@@ -91,8 +97,8 @@ export class AssistantService {
     return invoke('assistant_suggest_vault_project');
   }
 
-  async discardNote(): Promise<void> {
-    return invoke('assistant_discard_note');
+  async discardNote(title: NoteTitleInput | null): Promise<void> {
+    return invoke('assistant_discard_note', { title: title?.text ?? null, titleEdited: title?.edited ?? false });
   }
 
   async setBrief(text: string): Promise<void> {
