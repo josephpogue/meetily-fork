@@ -13,6 +13,7 @@ The build is not yours. You are handed the path of the built app. It comes from 
 - Open the app in it: `testenv exec <id> -- bash /Users/admin/launch-app.sh`
 - Commands run inside the test Mac use absolute paths under `/Users/admin/`, never `~`, because your own shell expands `~` to the wrong home.
 - The app takes a moment to start. Poll `testenv exec <id> -- node /Users/admin/testenv-ui/ui.mjs read` for up to a minute until it prints the first screen. Only after that does "the app does not answer" count as a failed step.
+- A fresh test Mac opens on the first-run setup. Get past it with `click "Get Started"`, `click "Let's Go"`, `click "Continue"`, then `click "I'll do this later"`, and the home screen with "Start recording" follows. Each screen slides in, so a click sent during the slide answers "nothing to click": wait a few seconds and send it again before you call the step failed.
 
 ## 3. Drive
 
