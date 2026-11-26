@@ -1071,6 +1071,7 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
                     core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
                     core.note_draft = Some(draft);
                     core.note_titles = titles;
+                    core.note_title_src = Some((meeting_title::topic_from_reply(&raw), projects.clone()));
                     core.note_state = NoteState::Ready;
                     core.note_error = None;
                 }
@@ -1110,23 +1111,54 @@ async fn title_suggestions(
 ) -> Option<TitleSuggestions> {
     let id = history.lock().unwrap().saved_meeting_id()?;
     let state = app?.try_state::<crate::state::AppState>()?;
-    let (title, created_at, folder) = meeting_row(state.db_manager.pool(), &id).await?;
+    build_titles(
+        state.db_manager.pool(),
+        &id,
+        meeting_title::topic_from_reply(raw).as_deref(),
+        projects,
+        &meeting_title::default_codes_file(),
+    )
+    .await
+}
+
+/// The suggestions for meeting `id` from its row. None when it has no row yet.
+async fn build_titles(
+    pool: &SqlitePool,
+    id: &str,
+    topic: Option<&str>,
+    projects: &[String],
+    codes_file: &std::path::Path,
+) -> Option<TitleSuggestions> {
+    let (title, created_at, folder) = meeting_row(pool, id).await?;
     let window_name = folder.and_then(|f| meeting_title::window_name_in(std::path::Path::new(&f)));
     Some(meeting_title::suggest(
         &title,
         window_name.as_deref(),
-        meeting_title::topic_from_reply(raw).as_deref(),
+        topic,
         created_at.with_timezone(&chrono::Local).date_naive(),
         projects,
-        &meeting_title::default_codes_file(),
+        codes_file,
     ))
 }
 
 /// Called once Stop's save has written the meeting row: a note that is Ready
 /// but landed without Title suggestions gets them now, and the panel is told.
 pub async fn note_titles_after_save(handle: &AssistantHandle, pool: &SqlitePool, codes_file: &std::path::Path) {
-    let _ = (handle, pool, codes_file);
-    todo!("not implemented")
+    let mut core = handle.0.lock().await;
+    if !matches!(core.note_state, NoteState::Ready) || core.note_titles.is_some() {
+        return;
+    }
+    let Some((topic, projects)) = core.note_title_src.clone() else {
+        return;
+    };
+    let Some(id) = core.history.lock().unwrap().saved_meeting_id() else {
+        return;
+    };
+    let Some(titles) = build_titles(pool, &id, topic.as_deref(), &projects, codes_file).await else {
+        return;
+    };
+    core.note_titles = Some(titles);
+    core.emit_note();
 }
 
 /// What the Title box held when Joseph pressed Save or Discard.
@@ -1153,7 +1185,12 @@ async fn apply_title(core: &AssistantCore, pool: &SqlitePool, choice: Option<&Ti
     let Some(name) = meeting_title::name_to_apply(suggestions, &choice.text, choice.edited, &current) else {
         return;
     };
-    match MeetingsRepository::update_meeting_title(pool, &id, &name).await {
+    rename_meeting(pool, &id, &name).await;
+}
+
+/// Renames a meeting through the title update path. A failure is logged only.
+async fn rename_meeting(pool: &SqlitePool, id: &str, name: &str) {
+    match MeetingsRepository::update_meeting_title(pool, id, name).await {
         Ok(true) => log::info!("assistant: meeting {} renamed to {}", id, name),
         Ok(false) => log::warn!("assistant: meeting {} not found, not renamed", id),
         Err(e) => log::warn!("assistant: could not rename meeting {}: {}", id, e),
@@ -1240,28 +1277,38 @@ pub async fn save_note(
     let transcript_text = core.session_transcript.clone();
     let history = core.history.clone();
 
-    // Rename first, so the vault note's heading and the project page line use the new title.
-    apply_title(&core, pool, title.as_ref()).await;
+    let suggestions = core.note_titles.clone();
 
     let result = async {
         let facts = meeting_facts(pool, &history).await?;
+        // The title being applied heads the filed note; the meeting is renamed
+        // only once filing has succeeded, so a failed Save leaves its name alone.
+        let new_name = match (&suggestions, &title) {
+            (Some(s), Some(c)) => {
+                meeting_title::name_to_apply(s, &c.text, c.edited, facts.title.as_deref().unwrap_or_default())
+            }
+            _ => None,
+        };
         let filed = note::save_note(note::SaveInput {
             vault_root: &vault_root,
             date: &date,
             draft: &draft,
-            title: facts.title.as_deref(),
+            title: new_name.as_deref().or(facts.title.as_deref()),
             brief: &facts.brief,
             rows: &facts.rows,
             transcript: &transcript_text,
             project: project.as_deref(),
             dry_run,
         })?;
-        Ok::<_, String>((filed, facts.saved_id))
+        Ok::<_, String>((filed, facts.saved_id, new_name))
     }
     .await;
 
     match result {
-        Ok((filed, saved_id)) => {
+        Ok((filed, saved_id, new_name)) => {
+            if let (Some(id), Some(name)) = (&saved_id, &new_name) {
+                rename_meeting(pool, id, name).await;
+            }
             if dry_run {
                 log::info!("assistant: dry-run, not written: {:?}", filed);
             } else {

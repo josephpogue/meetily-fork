@@ -747,9 +747,17 @@ pub async fn api_delete_api_key<R: Runtime>(
 pub async fn api_save_meeting_assistant(
     state: tauri::State<'_, AppState>,
     history: tauri::State<'_, crate::assistant::history::HistoryHandle>,
+    assistant: tauri::State<'_, crate::assistant::AssistantHandle>,
     meeting_id: String,
 ) -> Result<u32, String> {
-    crate::assistant::history::save_for_meeting(state.db_manager.pool(), &history, &meeting_id).await
+    let saved = crate::assistant::history::save_for_meeting(state.db_manager.pool(), &history, &meeting_id).await?;
+    // A note drafted before this row existed gets its Title box now. In the
+    // background: a draft still running holds the assistant lock for a while.
+    let (assistant, pool) = (assistant.inner().clone(), state.db_manager.pool().clone());
+    tauri::async_runtime::spawn(async move {
+        crate::assistant::core::note_titles_after_save(&assistant, &pool, &crate::assistant::meeting_title::default_codes_file()).await;
+    });
+    Ok(saved)
 }
 
 /// The meeting's saved assistant items in position order; empty when none.

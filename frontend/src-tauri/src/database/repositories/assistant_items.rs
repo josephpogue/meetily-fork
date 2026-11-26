@@ -175,7 +175,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, folder_path TEXT, created_at TEXT)")
+        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, folder_path TEXT, created_at TEXT, updated_at TEXT)")
             .execute(&pool)
             .await
             .unwrap();
