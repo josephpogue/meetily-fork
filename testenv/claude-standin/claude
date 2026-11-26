@@ -65,7 +65,7 @@ if [ "$ask_turn" = 1 ]; then
   esac
 else
 case "$system" in
-  *"=== SLUG ==="*) text=$'=== SLUG ===\ntest-mac-canned-note\n=== NOTE ===\n## Summary\n\nCanned note from the test Mac Claude stand-in.' ;; # note.rs parse_note
+  *"=== SLUG ==="*) text=$'=== SLUG ===\ntest-mac-canned-note\n=== TITLE ===\nStorage Discovery\n=== PROJECT ===\nbroadcom-pnc-bank\n=== NOTE ===\n## Summary\n\nCanned note from the test Mac Claude stand-in.' ;; # note.rs parse_note
   # cleanup_run.rs: the picture cleanup run asks for a JSON list of pictures to remove. P2 is skipped when there is no P3.
   *'"remove":['*) text='{"remove":[{"id":"P1","reason":"before_share","caption":"Canned removal from the test Mac stand-in"},{"id":"P2","reason":"repeat","repeat_of":"P3"}]}' ;;
   *"ASK:"*) text="NONE" ;;  # ask_list.rs parse: an empty gap list (the fork's standby turn has no CURRENT LIST)

@@ -175,7 +175,7 @@ pub(crate) mod tests {
             .await
             .unwrap();
         sqlx::query("PRAGMA foreign_keys = ON").execute(&pool).await.unwrap();
-        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, folder_path TEXT)")
+        sqlx::query("CREATE TABLE meetings (id TEXT PRIMARY KEY, title TEXT, folder_path TEXT, created_at TEXT)")
             .execute(&pool)
             .await
             .unwrap();
@@ -195,6 +195,18 @@ pub(crate) mod tests {
         sqlx::query("INSERT INTO meetings (id, title, folder_path) VALUES (?, 't', ?)")
             .bind(id)
             .bind(folder)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    /// A meeting row with its own title and start (RFC 3339, UTC).
+    pub(crate) async fn add_meeting_at(pool: &SqlitePool, id: &str, title: &str, folder: Option<&str>, created_at: &str) {
+        sqlx::query("INSERT INTO meetings (id, title, folder_path, created_at) VALUES (?, ?, ?, ?)")
+            .bind(id)
+            .bind(title)
+            .bind(folder)
+            .bind(created_at)
             .execute(pool)
             .await
             .unwrap();

@@ -156,6 +156,9 @@ pub struct AssistantCore {
     note_draft: Option<NoteDraft>,
     /// The Title box suggestions for the drafted note; Save and Discard read them.
     note_titles: Option<TitleSuggestions>,
+    /// What `title_suggestions` needs again when the draft landed before the
+    /// meeting row existed: the writer's topic and the project list.
+    note_title_src: Option<(Option<String>, Vec<String>)>,
     note_markdown: String,
     note_error: Option<String>,
     session_transcript: String,
@@ -216,6 +219,7 @@ impl AssistantCore {
             note_state: NoteState::Idle,
             note_draft: None,
             note_titles: None,
+            note_title_src: None,
             note_markdown: String::new(),
             note_error: None,
             session_transcript: String::new(),
@@ -1116,6 +1120,13 @@ async fn title_suggestions(
         projects,
         &meeting_title::default_codes_file(),
     ))
+}
+
+/// Called once Stop's save has written the meeting row: a note that is Ready
+/// but landed without Title suggestions gets them now, and the panel is told.
+pub async fn note_titles_after_save(handle: &AssistantHandle, pool: &SqlitePool, codes_file: &std::path::Path) {
+    let _ = (handle, pool, codes_file);
+    todo!("not implemented")
 }
 
 /// What the Title box held when Joseph pressed Save or Discard.
@@ -2120,7 +2131,7 @@ mod tests {
     }
     use crate::assistant::ask_lane::ASK_PROMPT;
 
-    fn test_lane_cfg() -> LaneConfig {
+    pub(super) fn test_lane_cfg() -> LaneConfig {
         LaneConfig {
             cwd: std::env::temp_dir(),
             fast_model: "fast".to_string(),
@@ -2167,7 +2178,7 @@ mod tests {
             .collect()
     }
 
-    async fn settle() {
+    pub(super) async fn settle() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
@@ -2800,7 +2811,7 @@ mod tests {
 
     /// Ask turns say ASK on the first refresh and DONE after; the note turn
     /// (its prompt starts with TRANSCRIPT:) returns a two-section note.
-    fn note_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
+    pub(super) fn note_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
         let ask_turns_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Arc::new(move |turn, _on_delta, _register| {
             let is_ask_turn = turn.append_system_prompt.as_deref().is_some_and(|p| p.starts_with(ASK_PROMPT))
@@ -3054,11 +3065,19 @@ mod tests {
 
     // ---- deleting items ----
 
+    /// Replaces the note emit with a capture of every note the panel is sent.
+    pub(super) async fn capture_notes(handle: &AssistantHandle) -> Arc<StdMutex<Vec<NoteOut>>> {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let sink = sent.clone();
+        handle.0.lock().await.note_emit = Arc::new(move |out: NoteOut| sink.lock().unwrap().push(out));
+        sent
+    }
+
     use crate::database::repositories::assistant_items::tests::{add_meeting, test_pool};
     use crate::database::repositories::assistant_items::AssistantItemsRepository;
 
     /// Wires the ask hook the way the app does, so every snapshot is collected.
-    async fn collect_asks(handle: &AssistantHandle) -> super::super::history::HistoryHandle {
+    pub(super) async fn collect_asks(handle: &AssistantHandle) -> super::super::history::HistoryHandle {
         let history = handle.0.lock().await.history_handle_for_test();
         let sink = history.clone();
         handle.0.lock().await.ask_hooks.emit = Arc::new(move |out| super::super::history::record_asks(&sink, &out));
@@ -3170,7 +3189,7 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), turns_before, "no turn ran");
     }
 
-    fn git_vault() -> tempfile::TempDir {
+    pub(super) fn git_vault() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             let st = std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap();
@@ -3235,7 +3254,7 @@ mod tests {
         assert!(note.contains("## Brief"), "the rest stays: {note}");
     }
 
-    fn settled_card(id: &str, question: &str) -> CardOut {
+    pub(super) fn settled_card(id: &str, question: &str) -> CardOut {
         CardOut {
             id: id.to_string(),
             kind: CardKind::Answer,
@@ -3249,7 +3268,7 @@ mod tests {
         }
     }
 
-    fn last_note_prompt(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> String {
+    pub(super) fn last_note_prompt(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> String {
         calls
             .lock()
             .unwrap()
@@ -3702,3 +3721,7 @@ mod tests {
         assert_eq!(meeting_facts(&pool, &h3).await.unwrap().brief, "Live brief");
     }
 }
+
+#[cfg(test)]
+#[path = "tests/note_title_wiring.rs"]
+mod note_title_wiring;
