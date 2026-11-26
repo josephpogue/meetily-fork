@@ -2,7 +2,7 @@
 
 import React, { createContext, useContext, useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { AssistantCard, AssistantStatus, AssistantVoice, AssistantNote, AssistantAsks } from '@/types';
-import { assistantService } from '@/services/assistantService';
+import { assistantService, type NoteTitleInput } from '@/services/assistantService';
 import { reconcileBrief, type BriefState } from '@/lib/ask-next';
 
 /**
@@ -27,7 +27,7 @@ const NO_IDS: ReadonlySet<string> = new Set();
 const INITIAL_CARDS: AssistantCard[] = [];
 
 const DEFAULT_VOICE: AssistantVoice = { state: 'off', heard: '' };
-const DEFAULT_NOTE: AssistantNote = { state: 'idle', markdown: '', error: null };
+const DEFAULT_NOTE: AssistantNote = { state: 'idle', markdown: '', error: null, titles: null };
 const DEFAULT_ASKS: AssistantAsks = {
   state: 'idle',
   asks: [],
@@ -72,7 +72,7 @@ interface AssistantContextType {
   voiceCancel: () => Promise<void>;
   draftNote: () => Promise<void>;
   /** Files the drafted note under the chosen vault project slug, or null for none. */
-  saveNote: (project: string | null) => Promise<void>;
+  saveNote: (project: string | null, title: NoteTitleInput | null) => Promise<void>;
   /** The project the note was last filed under: undefined before a save, null for none. */
   savedNoteProject: string | null | undefined;
   /** Why the last Save failed, or null. The note stays ready so Joseph can pick again. */
@@ -80,7 +80,7 @@ interface AssistantContextType {
   /** The vault's project slugs, or null when they could not be read. */
   listVaultProjects: () => Promise<string[] | null>;
   suggestVaultProject: () => Promise<string | null>;
-  discardNote: () => Promise<void>;
+  discardNote: (title: NoteTitleInput | null) => Promise<void>;
   setBrief: (text: string) => Promise<void>;
   /** The brief box's text, kept here so it survives the box unmounting. */
   briefDraft: string;
@@ -322,10 +322,10 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const saveNote = useCallback(async (project: string | null) => {
+  const saveNote = useCallback(async (project: string | null, title: NoteTitleInput | null) => {
     setSaveNoteError(null);
     try {
-      const saved = await assistantService.saveNote(project);
+      const saved = await assistantService.saveNote(project, title);
       setSavedNoteProject(saved.project);
     } catch (error) {
       console.error('[AssistantContext] assistant_save_note failed:', error);
@@ -351,9 +351,9 @@ export function AssistantProvider({ children }: { children: React.ReactNode }) {
     }
   }, []);
 
-  const discardNote = useCallback(async () => {
+  const discardNote = useCallback(async (title: NoteTitleInput | null) => {
     try {
-      await assistantService.discardNote();
+      await assistantService.discardNote(title);
     } catch (error) {
       console.error('[AssistantContext] assistant_discard_note failed:', error);
     }

@@ -18,16 +18,20 @@ Pictures of the Zoom or Teams meeting window may come with this turn. Draw on th
 
 ## Output contract
 
-Return exactly three sections, with these markers on their own lines.
+Return exactly four sections, with these markers on their own lines.
 
 ```
 === SLUG ===
 a-short-kebab-case-slug-for-the-filename
+=== TITLE ===
+a short topic for the meeting
 === PROJECT ===
 one slug from the VAULT PROJECTS list, or none
 === NOTE ===
 <the note body, in markdown>
 ```
+
+TITLE is the meeting's topic only, on one line: a few words naming what the meeting was about. No project code, no date, no company prefix; the app adds those. Match the style of Joseph's past titles: "VCF Design Workshop", "Sprint Planning Meeting", "Maikol Intro / Catch Up Call".
 
 PROJECT is the vault project this meeting belongs to, one slug copied exactly from the VAULT PROJECTS list at the end of the input. Go by what the meeting was about: who it was with and what for. THIS MEETING gives its title and Brief. The MEETINGS JOSEPH FILED BEFORE list shows how he filed similar meetings; follow it when a meeting looks like one of those. Write none when no project fits.
 

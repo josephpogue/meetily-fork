@@ -21,9 +21,11 @@ use tauri::{AppHandle, Emitter, Listener, Manager, Wry};
 use crate::audio::TranscriptUpdate;
 use crate::database::repositories::assistant_items::{AssistantItem, AssistantItemsRepository};
 use crate::database::repositories::assistant_meta::AssistantMetaRepository;
+use crate::database::repositories::meeting::MeetingsRepository;
 
 use super::ask_lane::{AskConfig, AskHooks, AskLane, AsksOut, ChatExchange, ChatLog};
 use super::lanes::{claude_runner, AnswerLanes, CardKind, CardOut, FrameFeed, LaneConfig, Runner};
+use super::meeting_title::{self, TitleSuggestions};
 use super::note::{self, NoteDraft, NOTE_PROMPT};
 use super::settings::{self, AssistantSettings};
 use super::transcript::{AssemblerOut, Speaker, TranscriptLog};
@@ -84,6 +86,8 @@ pub struct NoteOut {
     state: &'static str,
     markdown: String,
     error: Option<String>,
+    /// What the note bar's Title box can show; None when there is no title to offer.
+    titles: Option<TitleSuggestions>,
 }
 
 pub struct AssistantCore {
@@ -150,6 +154,11 @@ pub struct AssistantCore {
 
     note_state: NoteState,
     note_draft: Option<NoteDraft>,
+    /// The Title box suggestions for the drafted note; Save and Discard read them.
+    note_titles: Option<TitleSuggestions>,
+    /// What `title_suggestions` needs again when the draft landed before the
+    /// meeting row existed: the writer's topic and the project list.
+    note_title_src: Option<(Option<String>, Vec<String>)>,
     note_markdown: String,
     note_error: Option<String>,
     session_transcript: String,
@@ -209,6 +218,8 @@ impl AssistantCore {
             brief_edited: false,
             note_state: NoteState::Idle,
             note_draft: None,
+            note_titles: None,
+            note_title_src: None,
             note_markdown: String::new(),
             note_error: None,
             session_transcript: String::new(),
@@ -286,6 +297,7 @@ impl AssistantCore {
             state: self.note_state.label(),
             markdown: self.note_markdown.clone(),
             error: self.note_error.clone(),
+            titles: self.note_titles.clone(),
         });
     }
 }
@@ -1032,6 +1044,10 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
             core.lanes.draft_note(transcript_text, qa_log_text).await
         };
 
+        let titles = match &result {
+            Ok(raw) => title_suggestions(app.as_ref(), &history, raw, &projects).await,
+            Err(_) => None,
+        };
         let mut core = handle.0.lock().await;
         match result {
             Ok(raw) => match note::parse_note(&raw) {
@@ -1054,6 +1070,8 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
                     let deleted = core.history.lock().unwrap().deleted_ids();
                     core.note_markdown = note::with_answered(&draft.markdown, &answered_kept(&core.ask_lane, &deleted));
                     core.note_draft = Some(draft);
+                    core.note_titles = titles;
+                    core.note_title_src = Some((meeting_title::topic_from_reply(&raw), projects.clone()));
                     core.note_state = NoteState::Ready;
                     core.note_error = None;
                 }
@@ -1069,6 +1087,113 @@ async fn draft_note_gated(handle: &AssistantHandle, only_if_ready: bool) -> Resu
         }
         core.emit_note();
         return Ok(());
+    }
+}
+
+/// The meeting row's name, start and recording folder.
+async fn meeting_row(pool: &SqlitePool, id: &str) -> Option<(String, chrono::DateTime<chrono::Utc>, Option<String>)> {
+    sqlx::query_as("SELECT title, created_at, folder_path FROM meetings WHERE id = ?")
+        .bind(id)
+        .fetch_optional(pool)
+        .await
+        .ok()
+        .flatten()
+}
+
+/// The Title box suggestions for a draft that just landed. None when the
+/// meeting is not in the database yet (Stop's save is still running): the
+/// note bar then shows no Title box and the meeting keeps its name.
+async fn title_suggestions(
+    app: Option<&AppHandle<Wry>>,
+    history: &super::history::HistoryHandle,
+    raw: &str,
+    projects: &[String],
+) -> Option<TitleSuggestions> {
+    let id = history.lock().unwrap().saved_meeting_id()?;
+    let state = app?.try_state::<crate::state::AppState>()?;
+    build_titles(
+        state.db_manager.pool(),
+        &id,
+        meeting_title::topic_from_reply(raw).as_deref(),
+        projects,
+        &meeting_title::default_codes_file(),
+    )
+    .await
+}
+
+/// The suggestions for meeting `id` from its row. None when it has no row yet.
+async fn build_titles(
+    pool: &SqlitePool,
+    id: &str,
+    topic: Option<&str>,
+    projects: &[String],
+    codes_file: &std::path::Path,
+) -> Option<TitleSuggestions> {
+    let (title, created_at, folder) = meeting_row(pool, id).await?;
+    let window_name = folder.and_then(|f| meeting_title::window_name_in(std::path::Path::new(&f)));
+    Some(meeting_title::suggest(
+        &title,
+        window_name.as_deref(),
+        topic,
+        created_at.with_timezone(&chrono::Local).date_naive(),
+        projects,
+        codes_file,
+    ))
+}
+
+/// Called once Stop's save has written the meeting row: a note that is Ready
+/// but landed without Title suggestions gets them now, and the panel is told.
+pub async fn note_titles_after_save(handle: &AssistantHandle, pool: &SqlitePool, codes_file: &std::path::Path) {
+    let mut core = handle.0.lock().await;
+    if !matches!(core.note_state, NoteState::Ready) || core.note_titles.is_some() {
+        return;
+    }
+    let Some((topic, projects)) = core.note_title_src.clone() else {
+        return;
+    };
+    let Some(id) = core.history.lock().unwrap().saved_meeting_id() else {
+        return;
+    };
+    let Some(titles) = build_titles(pool, &id, topic.as_deref(), &projects, codes_file).await else {
+        return;
+    };
+    core.note_titles = Some(titles);
+    core.emit_note();
+}
+
+/// What the Title box held when Joseph pressed Save or Discard.
+#[derive(Debug, Clone)]
+pub struct TitleChoice {
+    pub text: String,
+    pub edited: bool,
+}
+
+/// Renames the meeting to the Title box's text when `name_to_apply` says so,
+/// against the name the database holds now. A failure is logged only.
+async fn apply_title(core: &AssistantCore, pool: &SqlitePool, choice: Option<&TitleChoice>) {
+    let (Some(choice), Some(suggestions)) = (choice, core.note_titles.as_ref()) else {
+        return;
+    };
+    let Some(id) = core.history.lock().unwrap().saved_meeting_id() else {
+        log::warn!("assistant: no saved meeting to rename");
+        return;
+    };
+    let Some((current, _, _)) = meeting_row(pool, &id).await else {
+        log::warn!("assistant: meeting {} not found, not renamed", id);
+        return;
+    };
+    let Some(name) = meeting_title::name_to_apply(suggestions, &choice.text, choice.edited, &current) else {
+        return;
+    };
+    rename_meeting(pool, &id, &name).await;
+}
+
+/// Renames a meeting through the title update path. A failure is logged only.
+async fn rename_meeting(pool: &SqlitePool, id: &str, name: &str) {
+    match MeetingsRepository::update_meeting_title(pool, id, name).await {
+        Ok(true) => log::info!("assistant: meeting {} renamed to {}", id, name),
+        Ok(false) => log::warn!("assistant: meeting {} not found, not renamed", id),
+        Err(e) => log::warn!("assistant: could not rename meeting {}: {}", id, e),
     }
 }
 
@@ -1136,6 +1261,7 @@ pub async fn save_note(
     handle: &AssistantHandle,
     pool: &SqlitePool,
     project: Option<String>,
+    title: Option<TitleChoice>,
 ) -> Result<SavedNote, String> {
     let mut core = handle.0.lock().await;
     let Some(draft) = core.note_draft.clone() else {
@@ -1151,25 +1277,38 @@ pub async fn save_note(
     let transcript_text = core.session_transcript.clone();
     let history = core.history.clone();
 
+    let suggestions = core.note_titles.clone();
+
     let result = async {
         let facts = meeting_facts(pool, &history).await?;
+        // The title being applied heads the filed note; the meeting is renamed
+        // only once filing has succeeded, so a failed Save leaves its name alone.
+        let new_name = match (&suggestions, &title) {
+            (Some(s), Some(c)) => {
+                meeting_title::name_to_apply(s, &c.text, c.edited, facts.title.as_deref().unwrap_or_default())
+            }
+            _ => None,
+        };
         let filed = note::save_note(note::SaveInput {
             vault_root: &vault_root,
             date: &date,
             draft: &draft,
-            title: facts.title.as_deref(),
+            title: new_name.as_deref().or(facts.title.as_deref()),
             brief: &facts.brief,
             rows: &facts.rows,
             transcript: &transcript_text,
             project: project.as_deref(),
             dry_run,
         })?;
-        Ok::<_, String>((filed, facts.saved_id))
+        Ok::<_, String>((filed, facts.saved_id, new_name))
     }
     .await;
 
     match result {
-        Ok((filed, saved_id)) => {
+        Ok((filed, saved_id, new_name)) => {
+            if let (Some(id), Some(name)) = (&saved_id, &new_name) {
+                rename_meeting(pool, id, name).await;
+            }
             if dry_run {
                 log::info!("assistant: dry-run, not written: {:?}", filed);
             } else {
@@ -1204,10 +1343,12 @@ pub async fn save_note(
     }
 }
 
-pub async fn discard_note(handle: &AssistantHandle) {
+pub async fn discard_note(handle: &AssistantHandle, pool: &SqlitePool, title: Option<TitleChoice>) {
     let mut core = handle.0.lock().await;
+    apply_title(&core, pool, title.as_ref()).await;
     core.note_state = NoteState::Idle;
     core.note_draft = None;
+    core.note_titles = None;
     core.note_markdown.clear();
     core.note_error = None;
     core.emit_note();
@@ -1403,6 +1544,7 @@ async fn open_session_in(handle: &AssistantHandle, force_enabled: Option<bool>, 
         core.chat_log.lock().unwrap().clear();
         core.note_state = NoteState::Idle;
         core.note_draft = None;
+        core.note_titles = None;
         core.note_markdown.clear();
         core.note_error = None;
         // The panel must not keep the last call's note state (a Saved note
@@ -2036,7 +2178,7 @@ mod tests {
     }
     use crate::assistant::ask_lane::ASK_PROMPT;
 
-    fn test_lane_cfg() -> LaneConfig {
+    pub(super) fn test_lane_cfg() -> LaneConfig {
         LaneConfig {
             cwd: std::env::temp_dir(),
             fast_model: "fast".to_string(),
@@ -2083,7 +2225,7 @@ mod tests {
             .collect()
     }
 
-    async fn settle() {
+    pub(super) async fn settle() {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
@@ -2716,7 +2858,7 @@ mod tests {
 
     /// Ask turns say ASK on the first refresh and DONE after; the note turn
     /// (its prompt starts with TRANSCRIPT:) returns a two-section note.
-    fn note_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
+    pub(super) fn note_runner(calls: Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> Runner {
         let ask_turns_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         Arc::new(move |turn, _on_delta, _register| {
             let is_ask_turn = turn.append_system_prompt.as_deref().is_some_and(|p| p.starts_with(ASK_PROMPT))
@@ -2970,11 +3112,19 @@ mod tests {
 
     // ---- deleting items ----
 
+    /// Replaces the note emit with a capture of every note the panel is sent.
+    pub(super) async fn capture_notes(handle: &AssistantHandle) -> Arc<StdMutex<Vec<NoteOut>>> {
+        let sent = Arc::new(StdMutex::new(Vec::new()));
+        let sink = sent.clone();
+        handle.0.lock().await.note_emit = Arc::new(move |out: NoteOut| sink.lock().unwrap().push(out));
+        sent
+    }
+
     use crate::database::repositories::assistant_items::tests::{add_meeting, test_pool};
     use crate::database::repositories::assistant_items::AssistantItemsRepository;
 
     /// Wires the ask hook the way the app does, so every snapshot is collected.
-    async fn collect_asks(handle: &AssistantHandle) -> super::super::history::HistoryHandle {
+    pub(super) async fn collect_asks(handle: &AssistantHandle) -> super::super::history::HistoryHandle {
         let history = handle.0.lock().await.history_handle_for_test();
         let sink = history.clone();
         handle.0.lock().await.ask_hooks.emit = Arc::new(move |out| super::super::history::record_asks(&sink, &out));
@@ -3086,7 +3236,7 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), turns_before, "no turn ran");
     }
 
-    fn git_vault() -> tempfile::TempDir {
+    pub(super) fn git_vault() -> tempfile::TempDir {
         let dir = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             let st = std::process::Command::new("git").arg("-C").arg(dir.path()).args(args).status().unwrap();
@@ -3124,11 +3274,11 @@ mod tests {
         assert!(draft_note(&handle).await.is_ok());
 
         assert_eq!(list_vault_projects(&handle).await, vec!["mission-control"]);
-        let err = save_note(&handle, &pool, Some("../secret".to_string())).await.unwrap_err();
+        let err = save_note(&handle, &pool, Some("../secret".to_string()), None).await.unwrap_err();
         assert!(err.contains("not a project"), "{err}");
         assert_eq!(handle.0.lock().await.note_state, NoteState::Ready, "a refusal leaves the note to save again");
 
-        let saved = save_note(&handle, &pool, Some("mission-control".to_string())).await.unwrap();
+        let saved = save_note(&handle, &pool, Some("mission-control".to_string()), None).await.unwrap();
         assert_eq!(saved.project.as_deref(), Some("mission-control"));
         let note = std::fs::read_to_string(&saved.note_path).unwrap();
         assert!(note.starts_with("# t\n\n- Date: "), "title is the meeting's: {note}");
@@ -3151,7 +3301,7 @@ mod tests {
         assert!(note.contains("## Brief"), "the rest stays: {note}");
     }
 
-    fn settled_card(id: &str, question: &str) -> CardOut {
+    pub(super) fn settled_card(id: &str, question: &str) -> CardOut {
         CardOut {
             id: id.to_string(),
             kind: CardKind::Answer,
@@ -3165,7 +3315,7 @@ mod tests {
         }
     }
 
-    fn last_note_prompt(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> String {
+    pub(super) fn last_note_prompt(calls: &Arc<StdMutex<Vec<crate::assistant::claude_cli::ClaudeTurn>>>) -> String {
         calls
             .lock()
             .unwrap()
@@ -3618,3 +3768,7 @@ mod tests {
         assert_eq!(meeting_facts(&pool, &h3).await.unwrap().brief, "Live brief");
     }
 }
+
+#[cfg(test)]
+#[path = "tests/note_title_wiring.rs"]
+mod note_title_wiring;
